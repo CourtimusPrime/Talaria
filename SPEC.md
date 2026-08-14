@@ -97,6 +97,7 @@ Servo wins because it already solves the hard, invisible core of building a brow
 - Dev machine (Linux ThinkPad, 20 cores/31GB) builds with Rust 1.95; system deps installed 2026-08-15 (clang, fontconfig/freetype/dbus dev headers).
 - **Build gotcha:** fresh resolution against servo 0.4.0 pulls `primeorder 0.14.0` (final), which breaks `p256/p384/p521 0.14.0-rc.14` (E0277, RustCrypto pre-release drift). Fix: `cargo update -p primeorder --precise 0.14.0-rc.14` (matches servo's own Cargo.lock). Pin lives in our committed Cargo.lock — don't blindly `cargo update`.
 - **Feasibility spike PASSED 2026-08-15:** `charon-shell` (winit + servo 0.4.0) builds and renders example.com correctly under Xvfb (software GL). Binary 155MB release/unstripped.
+- **Baseline adequacy gate — first pass 2026-08-15, partial:** accounts.google.com sign-in (JS-heavy dynamic form) and news.ycombinator.com both render essentially perfectly in the spike shell. Remaining before gate closes: an actual authenticated login flow, a Cloudflare-challenge page, one banking site, one SaaS dashboard — needs interactive session, not headless screenshots.
 
 ## TODOs — decisions still needed
 
