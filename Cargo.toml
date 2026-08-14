@@ -23,6 +23,26 @@ url = "2.5"
 webrender_api = "0.69"
 rustls = "0.23"
 tracing = "0.1"
+# Chrome UI — versions must match servo's own workspace (shared glow context type).
+egui = "0.34.3"
+egui-winit = "0.34.3"
+egui_glow = { version = "0.34.3", features = ["winit"] }
+glow = "0.17"
+# Shell plumbing
+talaria-protocol = { path = "crates/talaria-protocol" }
+tokio = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+png = "0.17"
+dirs = "5"
+ureq = "2"
+chacha20poly1305 = "0.10"
+keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
+rand = "0.8"
+hex = "0.4"
+rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["server", "macros", "stdio"] }
+async-trait = "0.1"
 
 [profile.release]
 lto = "thin"

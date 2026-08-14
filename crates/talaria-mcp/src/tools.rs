@@ -1,0 +1,161 @@
+//! MCP tool surface — minimal core primitives per SPEC: tab management,
+//! navigate, evaluate (arbitrary in-page JS — the interaction primitive),
+//! screenshot, cookies.read (credential vault), download.
+
+use rust_mcp_sdk::macros::{mcp_tool, JsonSchema};
+use rust_mcp_sdk::schema::schema_utils::CallToolError;
+use rust_mcp_sdk::schema::{CallToolResult, TextContent};
+use rust_mcp_sdk::tool_box;
+use serde_json::json;
+use talaria_protocol::{Command, Outcome, ResultPayload};
+
+use crate::socket::ShellConnection;
+
+#[mcp_tool(
+    name = "tabs_list",
+    description = "List all open browser tabs (both the user's and agent-owned), with tab_id, url, title, and owner."
+)]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct TabsListTool {}
+
+#[mcp_tool(
+    name = "tabs_open",
+    description = "Open a new browser tab owned by this agent session at the given URL. Returns the new tab's tab_id."
+)]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct TabsOpenTool {
+    /// Absolute URL to open (e.g. "https://example.com").
+    pub url: String,
+}
+
+#[mcp_tool(name = "tabs_close", description = "Close a browser tab by tab_id.")]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct TabsCloseTool {
+    pub tab_id: u64,
+}
+
+#[mcp_tool(
+    name = "tabs_focus",
+    description = "Make a tab the active one in its view (Me or Agents) so it is rendered and receives input."
+)]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct TabsFocusTool {
+    pub tab_id: u64,
+}
+
+#[mcp_tool(name = "navigate", description = "Navigate an existing tab to a URL.")]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct NavigateTool {
+    pub tab_id: u64,
+    pub url: String,
+}
+
+#[mcp_tool(
+    name = "evaluate",
+    description = "Run arbitrary JavaScript in a tab's page and return the result as JSON. This is the primary interaction primitive: query the DOM, click elements, fill and submit forms, extract data — write the whole interaction as one script instead of many small tool calls."
+)]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct EvaluateTool {
+    pub tab_id: u64,
+    /// JavaScript source. The value of the final expression is returned.
+    pub script: String,
+}
+
+#[mcp_tool(
+    name = "screenshot",
+    description = "Capture a PNG screenshot of a tab's viewport. Returns an image."
+)]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct ScreenshotTool {
+    pub tab_id: u64,
+}
+
+#[mcp_tool(
+    name = "cookies_read",
+    description = "Read stored credential-vault entries (username/password/cookies) matching a domain, for reusing the user's existing sessions. Not for performing fresh logins — ask the user to take over in the browser for those."
+)]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct CookiesReadTool {
+    /// Domain to match, e.g. "github.com" (subdomains match too).
+    pub domain: String,
+}
+
+#[mcp_tool(
+    name = "download",
+    description = "Download a URL to the user's downloads directory under the given filename."
+)]
+#[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
+pub struct DownloadTool {
+    pub url: String,
+    /// Plain filename, no directory components.
+    pub filename: String,
+}
+
+tool_box!(
+    TalariaTools,
+    [
+        TabsListTool,
+        TabsOpenTool,
+        TabsCloseTool,
+        TabsFocusTool,
+        NavigateTool,
+        EvaluateTool,
+        ScreenshotTool,
+        CookiesReadTool,
+        DownloadTool
+    ]
+);
+
+pub async fn dispatch(
+    connection: &ShellConnection,
+    client: &str,
+    tool: TalariaTools,
+) -> Result<CallToolResult, CallToolError> {
+    let command = match &tool {
+        TalariaTools::TabsListTool(_) => Command::TabsList,
+        TalariaTools::TabsOpenTool(t) => Command::TabsOpen { url: t.url.clone() },
+        TalariaTools::TabsCloseTool(t) => Command::TabsClose { tab_id: t.tab_id },
+        TalariaTools::TabsFocusTool(t) => Command::TabsFocus { tab_id: t.tab_id },
+        TalariaTools::NavigateTool(t) => Command::Navigate { tab_id: t.tab_id, url: t.url.clone() },
+        TalariaTools::EvaluateTool(t) => Command::Evaluate { tab_id: t.tab_id, script: t.script.clone() },
+        TalariaTools::ScreenshotTool(t) => Command::Screenshot { tab_id: t.tab_id },
+        TalariaTools::CookiesReadTool(t) => Command::CookiesRead { domain: t.domain.clone() },
+        TalariaTools::DownloadTool(t) => Command::Download { url: t.url.clone(), filename: t.filename.clone() },
+    };
+
+    let outcome = connection
+        .request(client, command)
+        .await
+        .map_err(|message| CallToolError::from_message(message))?;
+
+    let result = match outcome {
+        Outcome::Error { message } => return Err(CallToolError::from_message(message)),
+        Outcome::Ok { result } => result,
+    };
+
+    Ok(match result {
+        ResultPayload::Screenshot { png_base64, width, height } => {
+            let mut meta = serde_json::Map::new();
+            meta.insert("width".into(), json!(width));
+            meta.insert("height".into(), json!(height));
+            CallToolResult::image_content(vec![rust_mcp_sdk::schema::ImageContent::new(
+                png_base64,
+                "image/png".into(),
+                None,
+                Some(meta),
+            )])
+        },
+        ResultPayload::Tabs { tabs } => text_result(&json!({ "tabs": tabs })),
+        ResultPayload::Tab { tab } => text_result(&json!({ "tab": tab })),
+        ResultPayload::Value { value } => text_result(&json!({ "value": value })),
+        ResultPayload::Credentials { entries } => text_result(&json!({ "entries": entries })),
+        ResultPayload::Download { path, bytes } => {
+            text_result(&json!({ "path": path, "bytes": bytes }))
+        },
+        ResultPayload::Empty {} => text_result(&json!({ "ok": true })),
+    })
+}
+
+fn text_result(value: &serde_json::Value) -> CallToolResult {
+    CallToolResult::text_content(vec![TextContent::from(value.to_string())])
+}

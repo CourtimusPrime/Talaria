@@ -1,0 +1,18 @@
+[package]
+name = "talaria-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stdio MCP server proxying tool calls to a running Talaria browser"
+
+[[bin]]
+name = "talaria-mcp"
+path = "src/main.rs"
+
+[dependencies]
+talaria-protocol = { workspace = true }
+rust-mcp-sdk = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

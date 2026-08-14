@@ -18,3 +18,21 @@ url = { workspace = true }
 webrender_api = { workspace = true }
 rustls = { workspace = true }
 tracing = { workspace = true }
+
+egui = { workspace = true }
+egui-winit = { workspace = true }
+egui_glow = { workspace = true }
+glow = { workspace = true }
+
+talaria-protocol = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros", "time"] }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+png = { workspace = true }
+dirs = { workspace = true }
+ureq = { workspace = true }
+chacha20poly1305 = { workspace = true }
+keyring = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+log = "0.4"
