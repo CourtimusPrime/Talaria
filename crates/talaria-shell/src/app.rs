@@ -503,6 +503,12 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                     tab.webview.reload();
                 }
             },
+            UiAction::ReloadCrashed(id) => {
+                if let Some(tab) = state.tabs.borrow_mut().get_mut(id) {
+                    tab.crashed = false;
+                    tab.webview.reload();
+                }
+            },
         }
     }
 }
@@ -537,6 +543,12 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             .get(tab_id)
             .map(|t| t.webview.clone())
             .ok_or(Outcome::Error { message: format!("no tab {tab_id}") })
+    };
+
+    // Crashed tabs reject page-level commands with a tool error (per SPEC's
+    // crash-recovery decision); `navigate` recovers the tab instead.
+    let crashed = |tab_id: u64| -> bool {
+        state.tabs.borrow().get(tab_id).is_some_and(|t| t.crashed)
     };
 
     match command {
@@ -600,6 +612,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                     if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
                         tab.location = url.to_string();
                         tab.location_dirty = false;
+                        tab.crashed = false;
                     }
                     webview.load(url);
                     let _ = reply.send(Outcome::Ok { result: ResultPayload::Empty {} });
@@ -613,6 +626,26 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
         },
         Command::Evaluate { tab_id, script } => {
+            // Test hook: lets e2e tests exercise the crash-recovery path
+            // without needing a real WebContent crash.
+            if script == "__talaria_sim_crash__"
+                && std::env::var("TALARIA_TEST_HOOKS").as_deref() == Ok("1")
+            {
+                if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
+                    tab.crashed = true;
+                    state.window.request_redraw();
+                    let _ = reply.send(Outcome::Ok { result: ResultPayload::Empty {} });
+                } else {
+                    let _ = reply.send(Outcome::Error { message: format!("no tab {tab_id}") });
+                }
+                return;
+            }
+            if crashed(tab_id) {
+                let _ = reply.send(Outcome::Error {
+                    message: format!("tab {tab_id} crashed — navigate it to recover"),
+                });
+                return;
+            }
             match webview_for(tab_id) {
                 Ok(webview) => {
                     webview.evaluate_javascript(script, move |result| {
@@ -631,6 +664,12 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
         },
         Command::Screenshot { tab_id } => {
+            if crashed(tab_id) {
+                let _ = reply.send(Outcome::Error {
+                    message: format!("tab {tab_id} crashed — navigate it to recover"),
+                });
+                return;
+            }
             match webview_for(tab_id) {
                 Ok(webview) => {
                     // The shared offscreen framebuffer holds the displayed

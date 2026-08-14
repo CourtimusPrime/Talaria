@@ -30,6 +30,8 @@ pub enum UiAction {
     Back,
     Forward,
     Reload,
+    /// Reload a crashed tab: clears the crashed flag and reloads the page.
+    ReloadCrashed(u64),
 }
 
 pub struct Gui {
@@ -197,8 +199,31 @@ impl Gui {
             shared.toolbar_height.set(available.min.y);
             let scale = ctx.pixels_per_point();
 
-            let displayed = tabs.displayed().map(|tab| tab.webview.clone());
+            let crashed_tab = tabs
+                .displayed()
+                .filter(|tab| tab.crashed)
+                .map(|tab| tab.id);
+            let displayed = tabs
+                .displayed()
+                .filter(|tab| !tab.crashed)
+                .map(|tab| tab.webview.clone());
             drop(tabs);
+
+            if let Some(tab_id) = crashed_tab {
+                // Crashed state replaces the page (same shape as "Aw, Snap").
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() * 0.35);
+                        ui.heading("💥 This tab crashed");
+                        ui.label("The page's rendering process went away.");
+                        ui.add_space(8.0);
+                        if ui.button("Reload").clicked() {
+                            actions.push(UiAction::ReloadCrashed(tab_id));
+                        }
+                    });
+                });
+            }
+
             if let Some(webview) = displayed {
                 let width = (available.width() * scale).round().max(1.0) as u32;
                 let height = (available.height() * scale).round().max(1.0) as u32;
