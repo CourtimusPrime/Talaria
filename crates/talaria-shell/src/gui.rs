@@ -109,17 +109,21 @@ impl Gui {
                     ui.separator();
 
                     let has_tab = tabs.displayed().is_some();
-                    if ui.add_enabled(has_tab, egui::Button::new("<")).clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new("<")).on_hover_text("Back").clicked() {
                         actions.push(UiAction::Back);
                     }
-                    if ui.add_enabled(has_tab, egui::Button::new(">")).clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new(">")).on_hover_text("Forward").clicked() {
                         actions.push(UiAction::Forward);
                     }
-                    if ui.add_enabled(has_tab, egui::Button::new("R")).clicked() {
+                    if ui
+                        .add_enabled(has_tab, egui::Button::new("R"))
+                        .on_hover_text("Reload (Ctrl+R)")
+                        .clicked()
+                    {
                         actions.push(UiAction::Reload);
                     }
 
-                    let new_tab = ui.button("+").clicked();
+                    let new_tab = ui.button("+").on_hover_text("New tab (Ctrl+T)").clicked();
                     if new_tab {
                         actions.push(UiAction::NewTab);
                     }
@@ -166,10 +170,14 @@ impl Gui {
                             if tab.crashed {
                                 label = format!("💥 {label}");
                             }
-                            if ui.selectable_label(active == Some(tab.id), label).clicked() {
+                            if ui
+                                .selectable_label(active == Some(tab.id), label)
+                                .on_hover_text(&tab.location)
+                                .clicked()
+                            {
                                 actions.push(UiAction::SelectTab(tab.id));
                             }
-                            if ui.small_button("x").clicked() {
+                            if ui.small_button("x").on_hover_text("Close tab").clicked() {
                                 actions.push(UiAction::CloseTab(tab.id));
                             }
                             ui.separator();
@@ -196,11 +204,14 @@ impl Gui {
                                 if tab.crashed {
                                     label = format!("💥 {label}");
                                 }
-                                if ui.selectable_label(active == Some(tab.id), label).clicked()
+                                if ui
+                                    .selectable_label(active == Some(tab.id), label)
+                                    .on_hover_text(&tab.location)
+                                    .clicked()
                                 {
                                     actions.push(UiAction::SelectTab(tab.id));
                                 }
-                                if ui.small_button("x").clicked() {
+                                if ui.small_button("x").on_hover_text("Close tab").clicked() {
                                     actions.push(UiAction::CloseTab(tab.id));
                                 }
                                 ui.separator();
