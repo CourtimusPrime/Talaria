@@ -564,6 +564,19 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
     }
 }
 
+/// Agent-supplied URLs: accept scheme-less hosts ("example.com") by assuming
+/// https, but never fall back to a search query — an agent that meant to
+/// search should do so explicitly.
+fn parse_agent_url(input: &str) -> Result<Url, url::ParseError> {
+    match Url::parse(input) {
+        Ok(url) => Ok(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) if !input.contains(' ') => {
+            Url::parse(&format!("https://{input}"))
+        },
+        Err(error) => Err(error),
+    }
+}
+
 /// Omnibox behavior: URL if it parses (or looks like a host), search query
 /// otherwise.
 pub fn resolve_location(input: &str) -> Url {
@@ -620,7 +633,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             let _ = reply.send(Outcome::Ok { result: ResultPayload::Tabs { tabs: infos } });
         },
         Command::TabsOpen { url } => {
-            match Url::parse(&url) {
+            match parse_agent_url(&url) {
                 Ok(url) => {
                     let id = state.open_tab(url, TabOwner::Agent { session_id, client });
                     let tabs = state.tabs.borrow();
@@ -658,7 +671,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
         },
         Command::Navigate { tab_id, url } => {
-            match (webview_for(tab_id), Url::parse(&url)) {
+            match (webview_for(tab_id), parse_agent_url(&url)) {
                 (Ok(webview), Ok(url)) => {
                     if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
                         tab.location = url.to_string();
