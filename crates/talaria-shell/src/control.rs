@@ -117,9 +117,29 @@ async fn handle_connection(
                 if proxy.send_event(AppEvent::Agent(request)).is_err() {
                     break; // Event loop is gone; shell is shutting down.
                 }
-                let outcome = rx.await.unwrap_or(Outcome::Error {
-                    message: "shell dropped the request".into(),
-                });
+                // Commands that never complete (e.g. `evaluate` of a script
+                // that never terminates — servo never fires the callback)
+                // must not hang the agent forever.
+                let timeout_secs = std::env::var("TALARIA_COMMAND_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30);
+                let outcome = match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    rx,
+                )
+                .await
+                {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(_)) => Outcome::Error {
+                        message: "shell dropped the request".into(),
+                    },
+                    Err(_) => Outcome::Error {
+                        message: format!(
+                            "timed out after {timeout_secs}s (script still running?)"
+                        ),
+                    },
+                };
                 (id, outcome)
             },
             Ok(ClientMessage::Hello { .. }) => {
