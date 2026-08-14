@@ -205,7 +205,21 @@ impl ApplicationHandler<AppEvent> for App {
             window_rendering_context.offscreen_context(window.inner_size()),
         );
 
+        // Persistent engine profile (localStorage, indexeddb, cookies…).
+        // The default is a temp dir, which both discards session state on
+        // exit and failed to initialize ClientStorage's sqlite at all.
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("talaria")
+            .join("servo");
+        let _ = std::fs::create_dir_all(&config_dir);
+        let opts = servo::Opts {
+            config_dir: Some(config_dir),
+            ..Default::default()
+        };
+
         let servo = ServoBuilder::default()
+            .opts(opts)
             .event_loop_waker(Box::new(waker.clone()))
             .build();
         servo.setup_logging();
