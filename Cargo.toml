@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/charon-shell"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/court/charon"
+
+[workspace.dependencies]
+# Servo engine (libservo, published on crates.io as `servo`).
+# Versions below track servo v0.4.0's own workspace pins.
+servo = "0.4.0"
+embedder_traits = { package = "servo-embedder-traits", version = "=0.4.0" }
+winit = "0.30.13"
+euclid = "0.22"
+url = "2.5"
+webrender_api = "0.69"
+rustls = "0.23"
+tracing = "0.1"
+
+[profile.release]
+lto = "thin"
+
+# Servo's own recommendation: optimize deps even in dev builds,
+# otherwise debug-build page rendering is unusably slow.
+[profile.dev.package."*"]
+opt-level = 2

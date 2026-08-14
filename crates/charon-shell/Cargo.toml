@@ -1,0 +1,20 @@
+[package]
+name = "charon-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Charon — a lightweight, lightning-fast web browser for humans and agents"
+
+[[bin]]
+name = "charon"
+path = "src/main.rs"
+
+[dependencies]
+servo = { workspace = true }
+embedder_traits = { workspace = true }
+winit = { workspace = true }
+euclid = { workspace = true }
+url = { workspace = true }
+webrender_api = { workspace = true }
+rustls = { workspace = true }
+tracing = { workspace = true }
