@@ -109,21 +109,28 @@ impl Gui {
                     ui.separator();
 
                     let has_tab = tabs.displayed().is_some();
-                    if ui.add_enabled(has_tab, egui::Button::new("←")).clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new("<")).clicked() {
                         actions.push(UiAction::Back);
                     }
-                    if ui.add_enabled(has_tab, egui::Button::new("→")).clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new(">")).clicked() {
                         actions.push(UiAction::Forward);
                     }
-                    if ui.add_enabled(has_tab, egui::Button::new("⟳")).clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new("R")).clicked() {
                         actions.push(UiAction::Reload);
                     }
 
-                    let new_tab = ui.button("＋").clicked();
+                    let new_tab = ui.button("+").clicked();
                     if new_tab {
                         actions.push(UiAction::NewTab);
                     }
 
+                    if let Some(tab) = tabs.displayed() {
+                        if tab.webview.load_status() != servo::LoadStatus::Complete
+                            && !tab.crashed
+                        {
+                            ui.spinner();
+                        }
+                    }
                     if let Some(tab) = tabs.displayed_mut() {
                         let response = ui.add_sized(
                             ui.available_size(),
@@ -162,7 +169,7 @@ impl Gui {
                             if ui.selectable_label(active == Some(tab.id), label).clicked() {
                                 actions.push(UiAction::SelectTab(tab.id));
                             }
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("x").clicked() {
                                 actions.push(UiAction::CloseTab(tab.id));
                             }
                             ui.separator();
@@ -193,7 +200,7 @@ impl Gui {
                                 {
                                     actions.push(UiAction::SelectTab(tab.id));
                                 }
-                                if ui.small_button("✕").clicked() {
+                                if ui.small_button("x").clicked() {
                                     actions.push(UiAction::CloseTab(tab.id));
                                 }
                                 ui.separator();
