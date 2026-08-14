@@ -39,7 +39,7 @@ try:
         print("TALARIA DIED EARLY, exit", talaria.returncode)
         sys.exit(2)
     shot("chrome-me")
-    rc = subprocess.run([sys.executable, os.path.join(T, "e2e.py"), T]).returncode
+    rc = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "control_socket_test.py"), T]).returncode
     print("e2e exit:", rc)
     # Agent tab open during e2e was closed at the end; reopen one so the
     # Agents view has content, then click the Agents toggle and screenshot.

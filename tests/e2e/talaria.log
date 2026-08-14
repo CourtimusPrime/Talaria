@@ -1,7 +1,16 @@
 libEGL warning: DRI3 error: Could not get DRI3 device
 libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
-[2026-08-14T21:54:56Z WARN  talaria::vault] could not store vault key in keychain; falling back to key file
-[2026-08-14T21:54:56Z WARN  paint::webview_renderer] Empty hit test result for input event, ignoring.
-[2026-08-14T21:54:56Z WARN  servo_constellation::constellation] Pipeline(1,1): Visibility change for closed pipeline
-[2026-08-14T21:54:56Z WARN  script::timers] Resuming an already resumed timer.
-[2026-08-14T21:54:56Z WARN  script::network_listener] Ignoring InitiatorType::Other resource "https://servo.org/img/home-gradient.png"
+[2026-08-14T21:55:45Z WARN  storage::client_storage] Failed to initialize ClientStorage engine into storage dir: SqliteFailure(Error { code: CannotOpen, extended_code: 14 }, Some("unable to open database file: /tmp/.tmpCsCGed/clientstorage/default_v1/reg.sqlite"))
+[2026-08-14T21:55:45Z WARN  talaria::vault] could not store vault key in keychain; falling back to key file
+[2026-08-14T21:55:45Z WARN  paint::webview_renderer] Empty hit test result for input event, ignoring.
+[2026-08-14T21:55:45Z WARN  servo_constellation::constellation] Pipeline(1,1): Visibility change for closed pipeline
+[2026-08-14T21:55:45Z WARN  script::timers] Resuming an already resumed timer.
+[2026-08-14T21:55:46Z WARN  script::network_listener] Ignoring InitiatorType::Other resource "https://servo.org/img/home-gradient.png"
+[2026-08-14T21:55:57Z WARN  servo_constellation::constellation] Pipeline(1,2): Visibility change for closed pipeline
+[2026-08-14T21:55:57Z WARN  script::timers] Resuming an already resumed timer.
+[2026-08-14T21:56:05Z WARN  servo_constellation::constellation] Pipeline(1,3): Visibility change for closed pipeline
+[2026-08-14T21:56:05Z WARN  script::navigation] Failed to send network message to pipeline (1,3): "SendError(..)"
+[2026-08-14T21:56:05Z WARN  script::navigation] Failed to send network message to pipeline (1,3): "SendError(..)"
+[2026-08-14T21:56:05Z WARN  script::navigation] Failed to send network message to pipeline (1,3): "SendError(..)"
+[2026-08-14T21:56:05Z WARN  servo_constellation::constellation] Pipeline(1,4): Visibility change for closed pipeline
+[2026-08-14T21:56:05Z WARN  script::timers] Resuming an already resumed timer.
