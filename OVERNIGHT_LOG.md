@@ -4,15 +4,19 @@ Branch: `overnight/2026-08-15`. Started 01:39 +04. Hard stop: 8 hours (~09:40) o
 
 ## Needs your call
 
-*(judgment calls surfaced during the loop land here — none yet)*
+1. **Screen-reader support (accesskit)** — egui supports it, but wiring requires creating the window hidden, `init_accesskit`, then showing it, and I can't verify the result headlessly (no AT-SPI client here). Deferred rather than shipping unverified accessibility claims. Decide whether to wire it next session with manual verification.
+2. **Crash events over the control socket** — SPEC says a tab crash "surfaces as MCP tool error/event". Tool errors are done; unsolicited `Event::TabCrashed` pushes need a per-session event channel in the shell. Straightforward but touches the control-connection architecture — worth a deliberate design pass, not a 3am one.
+3. **Background-capture flicker** — capturing a non-displayed tab swaps it into the framebuffer briefly (usually <30ms, worst-case 1.5s). Invisible in practice at measured latencies; a real fix needs per-webview offscreen buffers (servo-side capability). Accept or pursue upstream?
+4. **Toolbar icon font** — buttons are ASCII (`< > R + x`) because egui's default font lacks glyph coverage. Bundling an icon font is a design decision (which font, license).
 
 - **Note, not a bug:** the mission brief says "Tauri-shelled" with "React chrome". The current build is a winit shell with egui chrome, per SPEC's own dependency-status finding (tauri-runtime-verso dormant since 2025-10; custom winit embedder until the 16-weeks-out re-check). Accessibility work below targets the egui chrome accordingly. Not redesigning this tonight.
 
 ## Summary
 
-- Issues found: (running)
-- Fixed: (running)
+- Iterations: 17 (12 fix/build iterations, 5 clean audits/measurements)
+- Issues found & fixed: 14 (2 core: takeover display was silently broken, link clicks never navigated; plus engine-profile persistence, background screenshots, evaluate hangs, crash recovery, keyboard access, URL leniency, JSON ergonomics, chrome legibility, e2e infra x2, logger double-init, spinner)
 - Reverted: 0
+- Clean audits: concurrency (2 agents interleaved), resize/empty-state, 60-cycle tab soak (7MB growth, plateaus — no leak), perf baseline (21ms socket, 219ms page load, 4-6ms displayed capture), background capture latency (5-16ms static / 22-30ms animated — SPEC's 200-500ms passive and 30-60ms takeover targets beaten by ~10x)
 
 ## Log
 
@@ -32,3 +36,5 @@ Branch: `overnight/2026-08-15`. Started 01:39 +04. Hard stop: 8 hours (~09:40) o
 13. [stability] Robustness audit, no fixes needed: window resizes (800x600→1500x950→1000x700) track the viewport exactly and don't crash; closing the last Me tab leaves a stable "No tab open" chrome and Ctrl+T recovers; shell stays alive throughout → verified live via xdotool + control socket.
 14. [accessibility] No keyboard way to move between tabs → added Ctrl+Tab / Ctrl+Shift+Tab cycling within the current view → verified: focused tab id cycles 2→1→2→1 via xdotool.
 15. [agent-use/docs] README had no agent wiring instructions → added Claude Desktop mcpServers snippet, tool list with the evaluate-first note, Agents-view/takeover explanation, and the keyboard map.
+16. [stability] 60-cycle tab open/evaluate/close soak: RSS 304→311MB, plateaus after ~10 cycles (119KB/cycle amortized, all early) — no tab-lifecycle leak; shell healthy, tab list clean at end.
+17. [speed] Background-tab capture latency (post-fix path): 5–16ms on a static page, 22–30ms on an animated WebGL page — the frame-ready wait almost never approaches the 1.5s fallback. SPEC's distributed-viewing targets (~200–500ms passive, ~30–60ms takeover) hold with an order of magnitude of headroom at the capture layer.
