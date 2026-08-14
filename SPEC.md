@@ -95,6 +95,8 @@ Servo wins because it already solves the hard, invisible core of building a brow
 - **libservo is published on crates.io as the `servo` crate, v0.4.0** (not "libservo", and well past the 0.1.0 noted above). MPL-2.0, requires Rust ≥ 1.88, default features `baked-in-resources + clipboard + js_jit`. GStreamer/media is opt-in, not default. Embedding surface confirmed real: `ServoBuilder`/`WebViewBuilder`/`WebViewDelegate` + `WindowRenderingContext`, with an official `winit_minimal.rs` example in-tree at v0.4.0.
 - **tauri-runtime-verso: not archived but dormant** — last push 2025-10-03 (~10 months stale as of this check), 132 stars. Readiness-checklist item (1) answered: the Tauri–Servo integration path is currently unhealthy. Plan accordingly: build the shell as a custom winit-based libservo embedder (servoshell pattern) first; treat Tauri/WRY chrome as an open question to re-verify at the 16-weeks-out checkpoint rather than a working assumption.
 - Dev machine (Linux ThinkPad, 20 cores/31GB) builds with Rust 1.95; system deps installed 2026-08-15 (clang, fontconfig/freetype/dbus dev headers).
+- **Build gotcha:** fresh resolution against servo 0.4.0 pulls `primeorder 0.14.0` (final), which breaks `p256/p384/p521 0.14.0-rc.14` (E0277, RustCrypto pre-release drift). Fix: `cargo update -p primeorder --precise 0.14.0-rc.14` (matches servo's own Cargo.lock). Pin lives in our committed Cargo.lock — don't blindly `cargo update`.
+- **Feasibility spike PASSED 2026-08-15:** `charon-shell` (winit + servo 0.4.0) builds and renders example.com correctly under Xvfb (software GL). Binary 155MB release/unstripped.
 
 ## TODOs — decisions still needed
 
