@@ -9,6 +9,7 @@ import sys
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 T = os.environ.get("TALARIA_E2E_OUT", "/tmp/talaria-e2e")
+os.makedirs(T, exist_ok=True)
 
 proc = subprocess.Popen(
     [os.path.join(REPO, "target/release/talaria-mcp")],

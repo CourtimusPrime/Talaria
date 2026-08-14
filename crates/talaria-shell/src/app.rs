@@ -68,18 +68,69 @@ pub struct Shared {
     /// Last cursor position relative to the webview viewport, device pixels.
     pub webview_point: Cell<euclid::Point2D<f32, DevicePixel>>,
     pub modifiers: Cell<ModifiersState>,
-    /// (hide, show) pairs queued by screenshot captures; applied on the next
-    /// event-loop turn because servo callbacks run inside a painter borrow
-    /// where hide()/show() would re-enter and panic.
-    pub pending_visibility: RefCell<Vec<(WebView, WebView)>>,
+    /// Screenshot requests for tabs that are not currently displayed: the
+    /// target must be shown and produce a fresh frame before its pixels exist
+    /// in the shared framebuffer. Serviced from the event loop (never inside
+    /// servo callbacks, which run under a painter borrow).
+    pub pending_captures: RefCell<Vec<PendingCapture>>,
+}
+
+pub struct PendingCapture {
+    pub webview: WebView,
+    /// The tab to re-show once the capture is done (the displayed tab).
+    pub restore: Option<WebView>,
+    pub reply: tokio::sync::oneshot::Sender<Outcome>,
+    /// Set by notify_new_frame_ready once the target has painted a frame.
+    pub ready: bool,
+    pub deadline: std::time::Instant,
 }
 
 impl Shared {
-    pub fn apply_pending_visibility(&self) {
-        for (hide, show) in self.pending_visibility.borrow_mut().drain(..) {
-            hide.hide();
-            show.show();
+    /// Capture the shared framebuffer as this webview's screenshot: paint it,
+    /// read the pixels back, then restore the previously-displayed tab.
+    pub fn capture_now(&self, webview: &WebView, restore: Option<WebView>) -> Outcome {
+        webview.paint();
+        let size = self.rendering_context.size2d().to_i32();
+        let rect = euclid::Box2D::from_origin_and_size(
+            euclid::Point2D::origin(),
+            euclid::Size2D::new(size.width, size.height),
+        );
+        let image = self.rendering_context.read_to_image(rect);
+        if let Some(displayed) = restore {
+            webview.hide();
+            displayed.show();
         }
+        match image {
+            Some(image) => encode_screenshot(image),
+            None => Outcome::Error { message: "framebuffer read failed".into() },
+        }
+    }
+
+    /// Service queued background-tab captures whose frame is ready (or whose
+    /// wait timed out — a static page may never produce a new frame).
+    pub fn process_pending_captures(&self) {
+        let mut due = Vec::new();
+        {
+            let mut pending = self.pending_captures.borrow_mut();
+            let now = std::time::Instant::now();
+            let mut index = 0;
+            while index < pending.len() {
+                if pending[index].ready || pending[index].deadline <= now {
+                    due.push(pending.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        for capture in due {
+            let outcome = self.capture_now(&capture.webview, capture.restore);
+            let _ = capture.reply.send(outcome);
+        }
+    }
+
+    /// Earliest deadline among queued captures, for WaitUntil scheduling.
+    pub fn next_capture_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_captures.borrow().iter().map(|c| c.deadline).min()
     }
 }
 
@@ -175,16 +226,23 @@ impl ApplicationHandler<AppEvent> for App {
             last_cursor: Cell::new(None),
             webview_point: Cell::new(euclid::Point2D::zero()),
             modifiers: Cell::new(ModifiersState::empty()),
-            pending_visibility: RefCell::new(Vec::new()),
+            pending_captures: RefCell::new(Vec::new()),
         });
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
         *self = App::Running(state);
     }
 
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        if let Some(state) = self.state() {
+            state.process_pending_captures();
+            set_wait(event_loop, state);
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         if let Some(state) = self.state() {
-            state.apply_pending_visibility();
+            state.process_pending_captures();
             match event {
                 AppEvent::Wake => {},
                 AppEvent::SessionStarted { session_id, client } => {
@@ -201,8 +259,8 @@ impl ApplicationHandler<AppEvent> for App {
                 },
             }
             state.servo.spin_event_loop();
+            set_wait(event_loop, state);
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
     }
 
     fn window_event(
@@ -214,7 +272,7 @@ impl ApplicationHandler<AppEvent> for App {
         let Some(state) = self.state().cloned() else {
             return;
         };
-        state.apply_pending_visibility();
+        state.process_pending_captures();
 
         let over_toolbar = |state: &Shared| {
             state
@@ -298,8 +356,17 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         state.servo.spin_event_loop();
-        event_loop.set_control_flow(ControlFlow::Wait);
+        set_wait(event_loop, &state);
     }
+}
+
+/// Sleep until the next queued capture deadline, or indefinitely if none.
+fn set_wait(event_loop: &ActiveEventLoop, state: &Rc<Shared>) {
+    let flow = match state.next_capture_deadline() {
+        Some(deadline) => ControlFlow::WaitUntil(deadline),
+        None => ControlFlow::Wait,
+    };
+    event_loop.set_control_flow(flow);
 }
 
 fn forward_mouse_move(state: &Shared, position: PhysicalPosition<f64>) {
@@ -566,42 +633,37 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
         Command::Screenshot { tab_id } => {
             match webview_for(tab_id) {
                 Ok(webview) => {
-                    // All webviews share one offscreen framebuffer, and
-                    // `WebView::take_screenshot` reads whatever was composited
-                    // last (i.e. the displayed tab). Instead: un-hide the
-                    // target, paint it into the framebuffer, read the pixels
-                    // back synchronously, then restore the displayed tab.
-                    // No servo callback involved, so no painter re-entrancy.
+                    // The shared offscreen framebuffer holds the displayed
+                    // tab's pixels. A displayed tab can be captured
+                    // immediately; a background tab must first be shown and
+                    // paint a fresh frame (its pipeline is throttled while
+                    // hidden), so it goes through the pending-capture queue
+                    // and is serviced on notify_new_frame_ready or timeout.
                     let restore = state
                         .tabs
                         .borrow()
                         .displayed()
                         .map(|t| t.webview.clone())
                         .filter(|displayed| *displayed != webview);
-                    if restore.is_some() {
-                        webview.show();
+                    match restore {
+                        None => {
+                            let outcome = state.capture_now(&webview, None);
+                            let _ = reply.send(outcome);
+                        },
+                        Some(displayed) => {
+                            displayed.hide();
+                            webview.show();
+                            state.pending_captures.borrow_mut().push(PendingCapture {
+                                webview,
+                                restore: Some(displayed),
+                                reply,
+                                ready: false,
+                                deadline: std::time::Instant::now()
+                                    + std::time::Duration::from_millis(1500),
+                            });
+                            state.window.request_redraw();
+                        },
                     }
-                    webview.paint();
-                    let size = state.rendering_context.size2d().to_i32();
-                    let rect = euclid::Box2D::from_origin_and_size(
-                        euclid::Point2D::origin(),
-                        euclid::Size2D::new(size.width, size.height),
-                    );
-                    let image = state.rendering_context.read_to_image(rect);
-                    // KNOWN ISSUE: for a tab that is not currently displayed,
-                    // this still captures the displayed tab's pixels — a
-                    // hidden webview's paint() appears not to reach the shared
-                    // framebuffer. Screenshots of the *displayed* tab are
-                    // correct. Tracked in OVERNIGHT_LOG.md.
-                    if let Some(displayed) = restore {
-                        webview.hide();
-                        displayed.show();
-                    }
-                    let outcome = match image {
-                        Some(image) => encode_screenshot(image),
-                        None => Outcome::Error { message: "framebuffer read failed".into() },
-                    };
-                    let _ = reply.send(outcome);
                 },
                 Err(outcome) => {
                     let _ = reply.send(outcome);
@@ -696,7 +758,14 @@ fn download(url: &str, filename: &str) -> Outcome {
 }
 
 impl servo::WebViewDelegate for Shared {
-    fn notify_new_frame_ready(&self, _webview: WebView) {
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        // Runs inside servo's painter borrow: only mark state, never paint
+        // or toggle visibility here.
+        if let Ok(mut pending) = self.pending_captures.try_borrow_mut() {
+            for capture in pending.iter_mut().filter(|c| c.webview == webview) {
+                capture.ready = true;
+            }
+        }
         self.window.request_redraw();
     }
 
