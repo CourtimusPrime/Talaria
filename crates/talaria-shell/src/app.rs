@@ -812,9 +812,15 @@ fn js_value_to_json(value: servo::JSValue) -> serde_json::Value {
     match value {
         servo::JSValue::Undefined | servo::JSValue::Null => Value::Null,
         servo::JSValue::Boolean(b) => Value::Bool(b),
-        servo::JSValue::Number(n) => serde_json::Number::from_f64(n)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        servo::JSValue::Number(n) => {
+            // Integral doubles serialize as integers ("42", not "42.0") so
+            // agents comparing against JSON integers aren't surprised.
+            if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
+                Value::Number(serde_json::Number::from(n as i64))
+            } else {
+                serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null)
+            }
+        },
         servo::JSValue::String(s) => Value::String(s),
         servo::JSValue::Element(s) => Value::String(format!("[element {s}]")),
         servo::JSValue::ShadowRoot(s) => Value::String(format!("[shadow-root {s}]")),
