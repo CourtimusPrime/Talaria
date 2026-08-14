@@ -195,6 +195,27 @@ impl TabManager {
         self.tabs.iter()
     }
 
+    /// Cycle the active tab within the current view (Ctrl+Tab / Ctrl+Shift+Tab).
+    pub fn cycle(&mut self, forward: bool) {
+        let ids: Vec<u64> = match self.mode {
+            ViewMode::Me => self.me_tabs().map(|t| t.id).collect(),
+            ViewMode::Agents => self.agent_tabs().map(|t| t.id).collect(),
+        };
+        if ids.len() < 2 {
+            return;
+        }
+        let current = self.active_id(self.mode);
+        let position = current
+            .and_then(|id| ids.iter().position(|&i| i == id))
+            .unwrap_or(0);
+        let next = if forward {
+            (position + 1) % ids.len()
+        } else {
+            (position + ids.len() - 1) % ids.len()
+        };
+        self.set_active(ids[next]);
+    }
+
     pub fn me_tabs(&self) -> impl Iterator<Item = &Tab> {
         self.tabs.iter().filter(|t| !t.owner.is_agent())
     }

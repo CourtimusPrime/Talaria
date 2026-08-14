@@ -422,6 +422,12 @@ fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEven
             _ => None,
         },
         WinitKey::Named(WinitNamedKey::F5) => Some(UiAction::Reload),
+        WinitKey::Named(WinitNamedKey::Tab) if ctrl => {
+            let forward = !state.modifiers.get().shift_key();
+            state.tabs.borrow_mut().cycle(forward);
+            state.window.request_redraw();
+            return true;
+        },
         _ => None,
     };
     match action {
