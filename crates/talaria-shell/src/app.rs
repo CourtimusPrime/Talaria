@@ -295,6 +295,12 @@ impl ApplicationHandler<AppEvent> for App {
             },
             WindowEvent::ModifiersChanged(modifiers) => {
                 state.modifiers.set(modifiers.state());
+                // egui tracks modifiers from this event too.
+                GUI.with_borrow_mut(|gui| {
+                    if let Some(gui) = gui.as_mut() {
+                        gui.on_window_event(&state.window, &event);
+                    }
+                });
             },
             WindowEvent::CursorMoved { position, .. } => {
                 state.last_cursor.set(Some(*position));
@@ -321,6 +327,8 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::MouseWheel { delta, .. } if !over_toolbar(&state) => {
                 forward_wheel(&state, *delta);
             },
+            WindowEvent::KeyboardInput { event: key_event, .. }
+                if handle_browser_shortcut(&state, key_event) => {},
             WindowEvent::KeyboardInput { event: key_event, .. }
                 if !GUI.with_borrow(|gui| {
                     gui.as_ref().is_some_and(|gui| gui.has_keyboard_focus())
@@ -367,6 +375,49 @@ fn set_wait(event_loop: &ActiveEventLoop, state: &Rc<Shared>) {
         None => ControlFlow::Wait,
     };
     event_loop.set_control_flow(flow);
+}
+
+/// Standard browser keyboard shortcuts, intercepted before both egui and the
+/// page: Ctrl+L (focus URL bar), Ctrl+T (new tab), Ctrl+W (close tab),
+/// Ctrl+R / F5 (reload). Returns true when the event was consumed.
+fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEvent) -> bool {
+    use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamedKey};
+
+    if key_event.state != ElementState::Pressed {
+        return false;
+    }
+    let ctrl = state.modifiers.get().control_key();
+    let action = match &key_event.logical_key {
+        WinitKey::Character(c) if ctrl => match c.to_lowercase().as_str() {
+            "l" => {
+                GUI.with_borrow_mut(|gui| {
+                    if let Some(gui) = gui.as_mut() {
+                        gui.focus_location_bar();
+                    }
+                });
+                state.window.request_redraw();
+                return true;
+            },
+            "t" => Some(UiAction::NewTab),
+            "w" => state
+                .tabs
+                .borrow()
+                .displayed()
+                .map(|tab| UiAction::CloseTab(tab.id)),
+            "r" => Some(UiAction::Reload),
+            _ => None,
+        },
+        WinitKey::Named(WinitNamedKey::F5) => Some(UiAction::Reload),
+        _ => None,
+    };
+    match action {
+        Some(action) => {
+            apply_ui_actions(state, vec![action]);
+            state.window.request_redraw();
+            true
+        },
+        None => false,
+    }
 }
 
 fn forward_mouse_move(state: &Shared, position: PhysicalPosition<f64>) {

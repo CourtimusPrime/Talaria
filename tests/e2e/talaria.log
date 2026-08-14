@@ -1,0 +1,7 @@
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+[2026-08-14T21:54:56Z WARN  talaria::vault] could not store vault key in keychain; falling back to key file
+[2026-08-14T21:54:56Z WARN  paint::webview_renderer] Empty hit test result for input event, ignoring.
+[2026-08-14T21:54:56Z WARN  servo_constellation::constellation] Pipeline(1,1): Visibility change for closed pipeline
+[2026-08-14T21:54:56Z WARN  script::timers] Resuming an already resumed timer.
+[2026-08-14T21:54:56Z WARN  script::network_listener] Ignoring InitiatorType::Other resource "https://servo.org/img/home-gradient.png"

@@ -67,6 +67,13 @@ impl Gui {
         self.context.egui_ctx.memory(|memory| memory.focused().is_some())
     }
 
+    /// Focus the URL bar (Ctrl+L) and select its contents.
+    pub fn focus_location_bar(&self) {
+        self.context.egui_ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new("location-bar"));
+        });
+    }
+
     pub fn surrender_focus(&self) {
         self.context.egui_ctx.memory_mut(|memory| {
             if let Some(id) = memory.focused() {
@@ -121,6 +128,7 @@ impl Gui {
                         let response = ui.add_sized(
                             ui.available_size(),
                             egui::TextEdit::singleline(&mut tab.location)
+                                .id(egui::Id::new("location-bar"))
                                 .hint_text("Search or enter address"),
                         );
                         if response.changed() {
