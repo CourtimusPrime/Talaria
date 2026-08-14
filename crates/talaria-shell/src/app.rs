@@ -520,11 +520,8 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
             UiAction::SwitchMode(mode) => {
                 let mut tabs = state.tabs.borrow_mut();
                 tabs.mode = mode;
-                let shown = tabs.active_id(mode);
+                tabs.sync_visibility();
                 drop(tabs);
-                if let Some(id) = shown {
-                    state.tabs.borrow_mut().set_active(id);
-                }
                 state.window.request_redraw();
             },
             UiAction::Go(input) => {
@@ -881,6 +878,16 @@ fn download(url: &str, filename: &str) -> Outcome {
 }
 
 impl servo::WebViewDelegate for Shared {
+    fn request_navigation(
+        &self,
+        _webview: WebView,
+        navigation_request: servo::NavigationRequest,
+    ) {
+        // The default delegate drops the request, which blocks link-click
+        // navigation entirely. Talaria is not a policy layer: allow all.
+        navigation_request.allow();
+    }
+
     fn notify_new_frame_ready(&self, webview: WebView) {
         // Runs inside servo's painter borrow: only mark state, never paint
         // or toggle visibility here.
