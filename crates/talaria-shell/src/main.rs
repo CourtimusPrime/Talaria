@@ -4,7 +4,7 @@
  *
  * Derived from Servo's `winit_minimal.rs` embedding example (servo v0.4.0),
  * so this file carries the MPL 2.0 header per its file-level copyleft.
- * Charon's original code is licensed MIT OR Apache-2.0. */
+ * Talaria's original code is licensed MIT OR Apache-2.0. */
 
 use std::cell::RefCell;
 use std::error::Error;
@@ -57,8 +57,8 @@ impl servo::WebViewDelegate for AppState {
 
     fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {
         let title = match title {
-            Some(title) if !title.is_empty() => format!("{title} — Charon"),
-            _ => "Charon".to_owned(),
+            Some(title) if !title.is_empty() => format!("{title} — Talaria"),
+            _ => "Talaria".to_owned(),
         };
         self.window.set_title(&title);
     }
@@ -82,7 +82,7 @@ impl ApplicationHandler<WakerEvent> for App {
                 .display_handle()
                 .expect("Failed to get display handle");
             let window = event_loop
-                .create_window(Window::default_attributes().with_title("Charon"))
+                .create_window(Window::default_attributes().with_title("Talaria"))
                 .expect("Failed to create winit Window");
             let window_handle = window.window_handle().expect("Failed to get window handle");
 

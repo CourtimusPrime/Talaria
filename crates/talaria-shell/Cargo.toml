@@ -1,12 +1,12 @@
 [package]
-name = "charon-shell"
+name = "talaria-shell"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Charon — a lightweight, lightning-fast web browser for humans and agents"
+description = "Talaria — a lightweight, lightning-fast web browser for humans and agents"
 
 [[bin]]
-name = "charon"
+name = "talaria"
 path = "src/main.rs"
 
 [dependencies]

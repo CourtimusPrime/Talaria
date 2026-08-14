@@ -1,12 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/charon-shell"]
+members = [
+    "crates/talaria-shell",
+    "crates/talaria-protocol",
+    "crates/talaria-mcp",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/court/charon"
+repository = "https://github.com/court/talaria"
 
 [workspace.dependencies]
 # Servo engine (libservo, published on crates.io as `servo`).
