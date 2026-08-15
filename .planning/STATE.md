@@ -8,11 +8,11 @@ status: planning
 stopped_at: Phase 2 context gathered
 last_updated: "2026-08-15T09:45:37.144Z"
 last_activity: 2026-08-15
-last_activity_desc: Project initialized; brief reconciled against verified working tree
+last_activity_desc: Phase 2 context captured (29 decisions auto-selected from the codebase audit)
 progress:
-  total_phases: 1
-  completed_phases: 0
-  total_plans: 0
+  total_phases: 7
+  completed_phases: 1
+  total_plans: 24
   completed_plans: 0
 ---
 
@@ -30,7 +30,7 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 Phase: 2 of 7 (Harden the Agent Surface)
 Plan: 0 of 8 in current phase
 Status: Ready to plan
-Last activity: 2026-08-15 — Project initialized; brief reconciled against verified working tree
+Last activity: 2026-08-15 — Phase 2 context captured; 29 decisions locked from the codebase audit
 
 Progress: [░░░░░░░░░░] 0%
 
