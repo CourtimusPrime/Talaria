@@ -11,10 +11,23 @@ login or a Cloudflare challenge), then let the agent continue in the same sessio
 
 See [SPEC.md](SPEC.md) for the full set of product and architecture decisions.
 
+## Architecture
+
+- **Engine**: Servo via libservo (crates.io `servo`), compiled in — content pane only.
+- **Shell/chrome**: a custom winit embedder with **egui** chrome (the servoshell
+  pattern) — decided architecture, not a stopgap. egui draws directly into the same GL
+  context as Servo's compositor, so chrome rendering needs no webview at all and takes
+  no dependency on the experimental Servo-WRY backend. Icons: egui-phosphor.
+- **Agent surface**: a local control socket (`talaria-protocol`) driven by the
+  `talaria-mcp` stdio MCP server; the same envelope schema later carries distributed
+  mode over Tailscale.
+
 ## Status
 
-Early feasibility stage. Current milestone: prove the Servo-based content pane builds and
-renders real pages on the target machines (`crates/talaria-shell`, a minimal winit shell).
+Working single-window browser: multi-tab Me/Agents views with live takeover, MCP tool
+surface (evaluate-centric), encrypted credential vault, crash recovery, persistent
+engine profile. Soak-tested 4h under Xvfb. See `SPEC.md` for decisions and
+`OVERNIGHT_LOG.md` for the latest test-and-fix run.
 
 ## Building
 
