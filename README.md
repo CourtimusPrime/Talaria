@@ -54,7 +54,10 @@ stdio server. Claude Desktop example (`claude_desktop_config.json`):
 
 Tools: `tabs_list`, `tabs_open`, `tabs_close`, `tabs_focus`, `navigate`,
 `evaluate` (arbitrary in-page JS — the primary interaction primitive),
-`screenshot`, `cookies_read`, `download`. Tabs opened by an agent appear in
+`screenshot`, `cookies_read`, `download`. `tabs_open` and `navigate` wait for
+the page to load before returning (`loading: true` in the reply means it gave
+up waiting after ~20s), so a following `evaluate` acts on the page you asked
+for. Tabs opened by an agent appear in
 the browser's **Agents** view, labeled by the client's MCP identity; switch
 to that view to watch the session live or take it over directly (e.g. to
 complete a login), then let the agent continue.

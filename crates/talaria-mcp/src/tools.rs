@@ -20,7 +20,7 @@ pub struct TabsListTool {}
 
 #[mcp_tool(
     name = "tabs_open",
-    description = "Open a new browser tab owned by this agent session at the given URL. Returns the new tab's tab_id."
+    description = "Open a new browser tab owned by this agent session at the given URL. Waits for the page to finish loading (up to ~20s) and returns the tab (tab_id, final url, title, loading flag) — if `loading` is still true the page was slow; poll tabs_list before acting."
 )]
 #[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
 pub struct TabsOpenTool {
@@ -43,7 +43,10 @@ pub struct TabsFocusTool {
     pub tab_id: u64,
 }
 
-#[mcp_tool(name = "navigate", description = "Navigate an existing tab to a URL.")]
+#[mcp_tool(
+    name = "navigate",
+    description = "Navigate an existing tab to a URL. Waits for the new page to finish loading (up to ~20s) and returns the tab (final url, title, loading flag), so a following evaluate runs in the new page."
+)]
 #[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
 pub struct NavigateTool {
     pub tab_id: u64,

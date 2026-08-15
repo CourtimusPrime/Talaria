@@ -100,6 +100,12 @@ pub struct TabInfo {
     pub owner: String,
     pub focused: bool,
     pub crashed: bool,
+    /// True while the tab's page is still loading (`document.readyState`
+    /// != complete). `tabs_open` / `navigate` normally reply only once this
+    /// is false; a slow page can make them give up waiting and reply with
+    /// `loading: true`, in which case poll `tabs_list`.
+    #[serde(default)]
+    pub loading: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

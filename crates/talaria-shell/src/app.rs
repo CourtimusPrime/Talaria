@@ -82,6 +82,28 @@ pub struct Shared {
     /// in the shared framebuffer. Serviced from the event loop (never inside
     /// servo callbacks, which run under a painter borrow).
     pub pending_captures: RefCell<Vec<PendingCapture>>,
+    /// `tabs_open` / `navigate` replies waiting for the new page to finish
+    /// loading (Playwright `goto` semantics), so an agent's next `evaluate`
+    /// runs in the page it asked for rather than the previous one — or in
+    /// no document at all, which Servo reports as an opaque InternalError.
+    pub pending_loads: RefCell<Vec<PendingLoad>>,
+}
+
+/// How long `tabs_open` / `navigate` wait for LoadStatus::Complete before
+/// replying anyway with `loading: true`. Well under the 30s command timeout.
+pub const LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+pub struct PendingLoad {
+    pub tab_id: u64,
+    pub reply: tokio::sync::oneshot::Sender<Outcome>,
+    pub deadline: std::time::Instant,
+    /// The page was already Complete when the navigation was requested, so
+    /// a Complete notification only counts after a Started/HeadParsed one
+    /// (otherwise it is the *old* page's).
+    pub needs_start: bool,
+    pub started: bool,
+    /// Set by notify_load_status_changed; serviced from the event loop.
+    pub ready: bool,
 }
 
 pub struct PendingCapture {
@@ -140,11 +162,63 @@ impl Shared {
             let outcome = self.capture_now(&capture.webview, &capture.context, true);
             let _ = capture.reply.send(outcome);
         }
+        self.process_pending_loads();
     }
 
-    /// Earliest deadline among queued captures, for WaitUntil scheduling.
+    /// Reply to `tabs_open` / `navigate` requests whose page finished loading,
+    /// timed out waiting, or whose tab went away meanwhile.
+    fn process_pending_loads(&self) {
+        let mut due = Vec::new();
+        {
+            let mut pending = self.pending_loads.borrow_mut();
+            let tabs = self.tabs.borrow();
+            let now = std::time::Instant::now();
+            let mut index = 0;
+            while index < pending.len() {
+                let load = &pending[index];
+                if load.ready || load.deadline <= now || tabs.get(load.tab_id).is_none() {
+                    due.push(pending.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        for load in due {
+            let tabs = self.tabs.borrow();
+            let outcome = match tabs.get(load.tab_id) {
+                Some(tab) => Outcome::Ok {
+                    result: ResultPayload::Tab { tab: tab_info(&tabs, tab) },
+                },
+                None => Outcome::Error {
+                    message: format!("tab {} was closed while loading", load.tab_id),
+                },
+            };
+            let _ = load.reply.send(outcome);
+        }
+    }
+
+    /// Queue a reply for when `tab_id`'s current navigation completes.
+    pub fn reply_after_load(
+        &self,
+        tab_id: u64,
+        needs_start: bool,
+        reply: tokio::sync::oneshot::Sender<Outcome>,
+    ) {
+        self.pending_loads.borrow_mut().push(PendingLoad {
+            tab_id,
+            reply,
+            deadline: std::time::Instant::now() + LOAD_WAIT,
+            needs_start,
+            started: false,
+            ready: false,
+        });
+    }
+
+    /// Earliest deadline among queued captures/loads, for WaitUntil scheduling.
     pub fn next_capture_deadline(&self) -> Option<std::time::Instant> {
-        self.pending_captures.borrow().iter().map(|c| c.deadline).min()
+        let captures = self.pending_captures.borrow().iter().map(|c| c.deadline).min();
+        let loads = self.pending_loads.borrow().iter().map(|l| l.deadline).min();
+        [captures, loads].into_iter().flatten().min()
     }
 
     /// Push an unsolicited event to every connected control client.
@@ -265,6 +339,7 @@ impl ApplicationHandler<AppEvent> for App {
             webview_point: Cell::new(euclid::Point2D::zero()),
             modifiers: Cell::new(ModifiersState::empty()),
             pending_captures: RefCell::new(Vec::new()),
+            pending_loads: RefCell::new(Vec::new()),
         });
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
@@ -643,6 +718,21 @@ pub fn resolve_location(input: &str) -> Url {
 }
 
 
+/// Agent-facing snapshot of one tab.
+fn tab_info(tabs: &TabManager, tab: &crate::tabs::Tab) -> TabInfo {
+    let focused = tabs.active_id(ViewMode::Me) == Some(tab.id)
+        || tabs.active_id(ViewMode::Agents) == Some(tab.id);
+    TabInfo {
+        tab_id: tab.id,
+        url: tab.webview.url().map(|u| u.to_string()).unwrap_or_else(|| tab.location.clone()),
+        title: tab.webview.page_title().unwrap_or_default(),
+        owner: tab.owner.label(),
+        focused,
+        crashed: tab.crashed,
+        loading: tab.webview.load_status() != servo::LoadStatus::Complete,
+    }
+}
+
 fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
     let AgentRequest { session_id, client, command, reply } = request;
 
@@ -664,35 +754,17 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
     match command {
         Command::TabsList => {
             let tabs = state.tabs.borrow();
-            let infos: Vec<TabInfo> = tabs.iter().map(|t| {
-                let focused = tabs.active_id(ViewMode::Me) == Some(t.id)
-                    || tabs.active_id(ViewMode::Agents) == Some(t.id);
-                TabInfo {
-                    tab_id: t.id,
-                    url: t.webview.url().map(|u| u.to_string()).unwrap_or_else(|| t.location.clone()),
-                    title: t.webview.page_title().unwrap_or_default(),
-                    owner: t.owner.label(),
-                    focused,
-                    crashed: t.crashed,
-                }
-            }).collect();
+            let infos: Vec<TabInfo> = tabs.iter().map(|t| tab_info(&tabs, t)).collect();
             let _ = reply.send(Outcome::Ok { result: ResultPayload::Tabs { tabs: infos } });
         },
         Command::TabsOpen { url } => {
             match parse_agent_url(&url) {
                 Ok(url) => {
                     let id = state.open_tab(url, TabOwner::Agent { session_id, client });
-                    let tabs = state.tabs.borrow();
-                    let tab = tabs.get(id).expect("just opened");
-                    let info = TabInfo {
-                        tab_id: tab.id,
-                        url: tab.location.clone(),
-                        title: String::new(),
-                        owner: tab.owner.label(),
-                        focused: tabs.active_id(ViewMode::Agents) == Some(id),
-                        crashed: false,
-                    };
-                    let _ = reply.send(Outcome::Ok { result: ResultPayload::Tab { tab: info } });
+                    // A fresh webview has no document yet: reply once the
+                    // page has loaded so the agent's next call has something
+                    // to act on.
+                    state.reply_after_load(id, false, reply);
                 },
                 Err(error) => {
                     let _ = reply.send(Outcome::Error { message: format!("bad url: {error}") });
@@ -727,8 +799,9 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                         tab.location_dirty = false;
                         tab.crashed = false;
                     }
+                    let needs_start = webview.load_status() == servo::LoadStatus::Complete;
                     webview.load(url);
-                    let _ = reply.send(Outcome::Ok { result: ResultPayload::Empty {} });
+                    state.reply_after_load(tab_id, needs_start, reply);
                 },
                 (Err(outcome), _) => {
                     let _ = reply.send(outcome);
@@ -767,7 +840,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                             Ok(value) => Outcome::Ok {
                                 result: ResultPayload::Value { value: js_value_to_json(value) },
                             },
-                            Err(error) => Outcome::Error { message: format!("{error:?}") },
+                            Err(error) => Outcome::Error { message: describe_js_error(error) },
                         };
                         let _ = reply.send(outcome);
                     });
@@ -834,6 +907,31 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                 let outcome = download(&url, &filename);
                 let _ = reply.send(outcome);
             });
+        },
+    }
+}
+
+/// Agent-readable evaluate failures: the thrown error's message for script
+/// errors, and a "not ready, retry" hint for the engine-side states that
+/// only mean the page has no usable document yet.
+fn describe_js_error(error: servo::JavaScriptEvaluationError) -> String {
+    use servo::JavaScriptEvaluationError as E;
+    match error {
+        E::EvaluationFailure(Some(info)) => {
+            let mut message = format!("script threw: {}", info.message);
+            if info.line_number > 0 {
+                message.push_str(&format!(" (line {}:{})", info.line_number, info.column));
+            }
+            message
+        },
+        E::EvaluationFailure(None) => "script threw".into(),
+        E::CompilationFailure => "script failed to compile".into(),
+        E::DocumentNotFound | E::WebViewNotReady | E::InternalError => format!(
+            "page not ready ({error:?}) — the tab is still loading or navigating; \
+             wait for tabs_list to report loading:false and retry"
+        ),
+        E::SerializationError(inner) => {
+            format!("result could not be serialized: {inner:?} — return plain data (strings, numbers, arrays, objects)")
         },
     }
 }
@@ -933,6 +1031,28 @@ impl servo::WebViewDelegate for Shared {
                 capture.ready = true;
             }
         }
+        self.window.request_redraw();
+    }
+
+    fn notify_load_status_changed(&self, webview: WebView, status: servo::LoadStatus) {
+        // Only mark state here; replies are built from the event loop.
+        let tab_id = self.tabs.try_borrow().ok().and_then(|tabs| tabs.find_by_webview(&webview));
+        if let (Some(tab_id), Ok(mut pending)) = (tab_id, self.pending_loads.try_borrow_mut()) {
+            for load in pending.iter_mut().filter(|l| l.tab_id == tab_id) {
+                match status {
+                    servo::LoadStatus::Started | servo::LoadStatus::HeadParsed => {
+                        load.started = true;
+                    },
+                    servo::LoadStatus::Complete => {
+                        if load.started || !load.needs_start {
+                            load.ready = true;
+                        }
+                    },
+                }
+            }
+        }
+        // Wakes the loop so pending loads get serviced; also refreshes the
+        // spinner.
         self.window.request_redraw();
     }
 

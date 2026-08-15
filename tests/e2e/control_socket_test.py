@@ -53,8 +53,10 @@ r = rpc("tabs_open", url="https://example.com/")
 print("TABS_OPEN:", json.dumps(r)[:200])
 assert r["outcome"] == "ok"
 tab_id = r["result"]["tab"]["tab_id"]
-
-time.sleep(8)  # let it load
+# tabs_open replies once the page has loaded: title known, loading false,
+# and an immediate evaluate runs in the loaded document (no InternalError).
+assert r["result"]["tab"]["title"] == "Example Domain", r
+assert r["result"]["tab"]["loading"] is False, r
 
 r = rpc("evaluate", tab_id=tab_id, script="document.title")
 print("EVALUATE title:", json.dumps(r)[:200])
@@ -90,6 +92,16 @@ assert owners == ["e2e-test", "me"], owners
 r = rpc("navigate", tab_id=tab_id, url="https://servo.org/")
 print("NAVIGATE:", json.dumps(r)[:150])
 assert r["outcome"] == "ok"
+# navigate also waits for the load, and returns the tab as it now is.
+assert r["result"]["tab"]["url"] == "https://servo.org/", r
+assert r["result"]["tab"]["loading"] is False, r
+r = rpc("evaluate", tab_id=tab_id, script="location.href")
+assert r["outcome"] == "ok" and r["result"]["value"] == "https://servo.org/", r
+print("EVALUATE right after navigate sees the new page")
+r = rpc("evaluate", tab_id=tab_id, script="throw new Error('boom')")
+assert r["outcome"] == "error" and "boom" in r["message"], r
+print("EVALUATE error carries the script's message")
+
 
 r = rpc("tabs_close", tab_id=tab_id)
 print("TABS_CLOSE:", json.dumps(r)[:150])
