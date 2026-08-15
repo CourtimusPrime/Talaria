@@ -879,7 +879,11 @@ fn tab_info(tabs: &TabManager, tab: &crate::tabs::Tab) -> TabInfo {
         owner: tab.owner.label(),
         focused,
         crashed: tab.crashed,
-        loading: tab.webview.load_status() != servo::LoadStatus::Complete,
+        // An adopted popup's blank starting document reports Complete before
+        // the navigation its opener asked for begins; keep it "loading" over
+        // that gap so agents don't script the document about to be replaced.
+        loading: tab.webview.load_status() != servo::LoadStatus::Complete
+            || tab.initial_blank_until.is_some_and(|until| std::time::Instant::now() < until),
     }
 }
 
@@ -1275,6 +1279,49 @@ impl servo::WebViewDelegate for Shared {
         navigation_request.allow();
     }
 
+    fn request_create_new(
+        &self,
+        parent_webview: WebView,
+        request: servo::CreateNewWebViewRequest,
+    ) {
+        // window.open / target=_blank: a new tab in the parent's view with the
+        // parent's owner (an agent's popups stay that agent's). No popup
+        // blocking — Talaria isn't a policy layer.
+        let Ok(mut tabs) = self.tabs.try_borrow_mut() else {
+            log::warn!("dropping popup request: tab table busy");
+            return;
+        };
+        let Some(parent_id) = tabs.find_by_webview(&parent_webview) else {
+            return;
+        };
+        let owner = tabs.get(parent_id).map(|t| t.owner.clone()).expect("just found");
+        // A popup fronts its own view when its opener was the active tab
+        // there (browser behaviour), and stays behind an opener that was
+        // already in the background. Which view is *displayed* is irrelevant:
+        // an agent's popup must not drag the human out of the Me view.
+        let parent_active = tabs.active_id(owner.view()) == Some(parent_id);
+        let rendering_context =
+            Rc::new(self.window_rendering_context.offscreen_context(self.window.inner_size()));
+        let webview = request
+            .builder(rendering_context.clone())
+            .hidpi_scale_factor(euclid::Scale::new(self.hidpi_scale()))
+            .delegate(parent_webview.delegate())
+            .build();
+        // The popup's real URL arrives via notify_url_changed; until then the
+        // URL bar shows what a `window.open()` with no argument keeps forever.
+        let id = tabs.register(
+            webview,
+            rendering_context,
+            owner,
+            "about:blank".into(),
+            parent_active,
+            true,
+        );
+        drop(tabs);
+        log::info!("popup from tab {parent_id} opened as tab {id}");
+        self.window.request_redraw();
+    }
+
     fn notify_new_frame_ready(&self, webview: WebView) {
         // Runs inside servo's painter borrow: only mark state, never paint
         // or toggle visibility here.
@@ -1318,6 +1365,14 @@ impl servo::WebViewDelegate for Shared {
             if let Some(tab) = tabs.find_by_webview_mut(&webview) {
                 if !tab.location_dirty {
                     tab.location = url.to_string();
+                }
+                // The navigation an adopted popup was waiting for has begun,
+                // so its blank grace window is over and `load_status` alone
+                // tells the truth from here. Servo runs a whole
+                // Started→Complete cycle on the popup's *own* blank document
+                // first, which is why load status can't be that signal.
+                if url.as_str() != "about:blank" {
+                    tab.initial_blank_until = None;
                 }
             }
         }

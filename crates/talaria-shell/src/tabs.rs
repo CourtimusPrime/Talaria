@@ -3,6 +3,7 @@
 //! input); the top-left toggle switches which view is shown.
 
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use euclid::Scale;
 use servo::{
@@ -10,6 +11,12 @@ use servo::{
     WindowRenderingContext,
 };
 use url::Url;
+
+/// How long an adopted popup keeps reporting as loading while waiting for the
+/// navigation its opener asked for. Long enough to cover the round trip from
+/// `window.open` to the first `LoadStatus::Started`, short enough that a
+/// `window.open()` with no URL — which never navigates — settles promptly.
+const ADOPTED_BLANK_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabOwner {
@@ -28,6 +35,11 @@ impl TabOwner {
     pub fn is_agent(&self) -> bool {
         matches!(self, TabOwner::Agent { .. })
     }
+
+    /// The view a tab with this owner lives in.
+    pub fn view(&self) -> ViewMode {
+        if self.is_agent() { ViewMode::Agents } else { ViewMode::Me }
+    }
 }
 
 pub struct Tab {
@@ -43,6 +55,14 @@ pub struct Tab {
     /// True while the user is editing the URL bar, so page-driven URL updates
     /// don't clobber their typing.
     pub location_dirty: bool,
+    /// Popups only. A `window.open` webview is handed over already "loaded" —
+    /// its blank starting document is Complete — and only *then* navigates to
+    /// the requested URL, so an agent that lists tabs in that window is told
+    /// the tab is ready just before the page it asked for replaces it. Until
+    /// this instant passes (or the real navigation starts, whichever comes
+    /// first) the tab reports as loading. A `window.open()` with no URL never
+    /// navigates, so this has to time out rather than wait forever.
+    pub initial_blank_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,28 +106,48 @@ impl TabManager {
             .hidpi_scale_factor(Scale::new(hidpi_scale))
             .delegate(delegate)
             .build();
+        // A new tab becomes active in its own view, but opening an agent tab
+        // never yanks the human out of the Me view — and never steals the
+        // agent view from a tab that agent is already working in.
+        let activate = !owner.is_agent() || self.active_agent.is_none();
+        // Built with its URL, so there is no blank document to wait past.
+        self.register(webview, rendering_context, owner, url.to_string(), activate, false)
+    }
 
+    /// Adopt an already-built webview as a tab. `activate` makes it the active
+    /// tab of its own view — true for a popup whose opener was active, the way
+    /// a popup fronts its window in every browser; false leaves it behind the
+    /// tab the user (or agent) is looking at. `adopted` marks a webview handed
+    /// over on a blank document (see [`Tab::initial_blank_until`]).
+    pub fn register(
+        &mut self,
+        webview: WebView,
+        rendering_context: Rc<OffscreenRenderingContext>,
+        owner: TabOwner,
+        location: String,
+        activate: bool,
+        adopted: bool,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let is_agent = owner.is_agent();
         self.tabs.push(Tab {
             id,
             webview,
             rendering_context,
             owner,
             crashed: false,
-            location: url.to_string(),
+            location,
             location_dirty: false,
+            initial_blank_until: adopted.then(|| Instant::now() + ADOPTED_BLANK_GRACE),
         });
 
-        // Newly opened tabs become active within their own view, but opening
-        // an agent tab never yanks the human out of the Me view.
-        if is_agent {
-            if self.active_agent.is_none() {
-                self.set_active(id);
-            }
-        } else {
+        // Either way the show/hide invariant is re-established, so the new
+        // webview starts hidden rather than merely un-shown (set_active syncs
+        // on its own).
+        if activate {
             self.set_active(id);
+        } else {
+            self.sync_visibility();
         }
         id
     }
