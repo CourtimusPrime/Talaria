@@ -7,9 +7,13 @@ import json, os, socket, subprocess, sys, time
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 subprocess.run(["pkill", "-f", "[X]vfb :99"], check=False)
 subprocess.run(["pkill", "-x", "talaria"], check=False)
-time.sleep(0.5)
+time.sleep(2)  # let a previous Xvfb fully release :99
 xvfb = subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x800x24"], stderr=subprocess.DEVNULL)
-time.sleep(1)
+for _ in range(20):  # wait until the display actually accepts connections
+    if subprocess.run(["xdpyinfo", "-display", ":99"], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode == 0:
+        break
+    time.sleep(0.5)
 env = dict(os.environ, DISPLAY=":99", RUST_LOG="error")
 tal = subprocess.Popen([os.path.join(REPO, "target/release/talaria"), "https://servo.org"],
                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -35,8 +39,15 @@ try:
 
     tid = rpc("tabs_open", url="https://example.com/")["result"]["tab"]["tab_id"]
     time.sleep(6)
-    wid = subprocess.run(["xdotool", "search", "--name", "Talaria"], env=X,
-                         capture_output=True, text=True).stdout.split()[0]
+    wid = None
+    for _ in range(15):
+        out = subprocess.run(["xdotool", "search", "--name", "Talaria"], env=X,
+                             capture_output=True, text=True).stdout.split()
+        if out:
+            wid = out[0]
+            break
+        time.sleep(1)
+    assert wid, "Talaria window never appeared"
     subprocess.run(["xdotool", "windowfocus", "--sync", wid], env=X)
     subprocess.run(["xdotool", "mousemove", "65", "11", "click", "1"], env=X)
     time.sleep(3)
