@@ -5,7 +5,7 @@ Baseline: main after the four close-outs (crash-event push, per-webview framebuf
 
 ## Needs your call
 
-*(none yet)*
+1. **In-flight working-tree changes found mid-loop (~11:20)** — repo dir renamed open-browser→talaria, and `talaria-protocol/src/lib.rs` has an uncommitted `loading: bool` field on TabInfo (with block-until-loaded semantics sketched in its doc comment), shell side not yet implemented — the shell won't compile until that lands. Looks like your (or another session's) work in progress, so the loop did NOT touch, finish, or revert it, and stopped rebuilding the shell from this point; remaining loop activity uses the already-built binary (soak + final e2e regression are unaffected). Also present: `.claude/HANDOFF-KzpAG.md` deleted in the working tree and a `.README.md.swp` vim swap — left alone.
 
 ## Summary
 
