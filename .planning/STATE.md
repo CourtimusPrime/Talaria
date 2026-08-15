@@ -5,10 +5,10 @@ milestone_name: milestone
 current_phase: 2
 current_phase_name: Harden the Agent Surface
 status: planning
-stopped_at: Phase 2 context gathered
-last_updated: "2026-08-15T09:45:37.144Z"
+stopped_at: Phase 2 planned — 11 plans, 8 waves, checker passed (0 blockers)
+last_updated: "2026-08-15T10:40:31.687Z"
 last_activity: 2026-08-15
-last_activity_desc: Phase 2 context captured (29 decisions auto-selected from the codebase audit)
+last_activity_desc: Phase 2 planned — 11 plans in 8 waves, plan-checker passed with 0 blockers
 progress:
   total_phases: 7
   completed_phases: 1
@@ -28,9 +28,9 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 2 of 7 (Harden the Agent Surface)
-Plan: 0 of 8 in current phase
-Status: Ready to plan
-Last activity: 2026-08-15 — Phase 2 context captured; 29 decisions locked from the codebase audit
+Plan: 0 of 11 in current phase
+Status: Ready to execute
+Last activity: 2026-08-15 — Phase 2 planned; 11 plans in 8 waves, checker passed
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -85,6 +85,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-15T09:45:37.139Z
-Stopped at: Phase 2 context gathered
-Resume file: .planning/phases/02-harden-the-agent-surface/02-CONTEXT.md
+Last session: 2026-08-15T10:40:31.677Z
+Stopped at: Phase 2 planned — 11 plans, 8 waves, checker passed (0 blockers)
+Resume file: .planning/phases/02-harden-the-agent-surface/02-01-PLAN.md
