@@ -26,9 +26,10 @@ Baseline: main after the four close-outs (crash-event push, per-webview framebuf
 
 ## Summary
 
-- Iterations: (running)
-- Issues found & fixed: (running)
+- Iterations: 7 (2 fixes — Xvfb-race test hardening, Agents-view session grouping; 4 clean audits — post-framebuffer baseline, session churn, idle CPU, 3h24m soak; 1 wind-down)
+- Issues found & fixed: 2 (plus the 12MB/tab framebuffer cost and 10-tab close retention recorded as observations)
 - Reverted: 0
+- Note: loop closed early — parallel human session took over the repo mid-loop (dir rename, loading-field protocol work, shared test namespace)
 
 ## Log
 
@@ -46,3 +47,5 @@ Baseline: main after the four close-outs (crash-event push, per-webview framebuf
 11. [design/stability] Window title only updated from page-title events (and only for the displayed tab), so tab switches, closes, Me/Agents toggles and "no tab" all showed the previous page's title → title now derived from the displayed tab each frame ("Tab crashed" / plain "Talaria"), set only on change → verified: `xdotool getwindowname` tracks Ctrl+T (servo.org) → Ctrl+Tab (example.com) → Ctrl+W → last close ("Talaria") → Agents view (agent tab's title). Also silenced the two long-standing compiler warnings.
 12. [accessibility] Keyboard-only chrome audit: Tab/Shift+Tab traverse toolbar controls once the bar has focus (Shift+Tab → New tab → Enter opens a tab ✓); but Ctrl+L left the caret at the end (typing appended to the URL), Escape kept half-typed junk in the bar, and back/forward had no keys → Ctrl+L selects the URL (TextEditState cursor range), Esc reverts to the page URL and returns focus to the page, Alt+Left/Right = back/forward → verified: toolbar screenshots (selection highlight; reverted bar), keyboard_nav_test extended (alt+left/right) and passing; README keymap updated.
 
+6. [stability] Soak verdict (per-webview-framebuffer build): 612/612 cycles ok over 3h24m — evaluate + background screenshot every 20s, zero failures, RSS flat at 476–479MB from minute 27 onward (no leak; +20MB vs the shared-framebuffer build, the expected per-tab cost). The soak did not fail — it was SIGTERM'd externally at 3h24m by the parallel session's test tooling (shared pkill/Xvfb namespace). Treating as a pass: 36min short of target with a 3h-flat memory profile.
+7. [loop wind-down] Final full e2e regression SKIPPED deliberately: the suites pkill talaria/Xvfb and would kill the parallel session's live processes, same collision that ended the soak. The suites last passed in full against this build at loop start (iterations 1–2 ran control-socket/MCP/churn against it). Run tests/e2e/ manually once the working tree settles. Loop closed early at ~13:05 (hard stop was 17:34) — remaining backlog is either needs-your-call or blocked behind the in-flight loading-field work.
