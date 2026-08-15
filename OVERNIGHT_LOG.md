@@ -13,7 +13,7 @@ Branch: `overnight/2026-08-15`. Started 01:39 +04. Hard stop: 8 hours (~09:40) o
 
 ## Summary
 
-- Iterations: 17 (12 fix/build iterations, 5 clean audits/measurements)
+- Iterations: 20 (13 fix/build iterations, 7 clean audits/measurements incl. a 4h/719-cycle soak — see #20)
 - Issues found & fixed: 14 (2 core: takeover display was silently broken, link clicks never navigated; plus engine-profile persistence, background screenshots, evaluate hangs, crash recovery, keyboard access, URL leniency, JSON ergonomics, chrome legibility, e2e infra x2, logger double-init, spinner)
 - Reverted: 0
 - Clean audits: concurrency (2 agents interleaved), resize/empty-state, 60-cycle tab soak (7MB growth, plateaus — no leak), perf baseline (21ms socket, 219ms page load, 4-6ms displayed capture), background capture latency (5-16ms static / 22-30ms animated — SPEC's 200-500ms passive and 30-60ms takeover targets beaten by ~10x)
@@ -39,3 +39,5 @@ Branch: `overnight/2026-08-15`. Started 01:39 +04. Hard stop: 8 hours (~09:40) o
 16. [stability] 60-cycle tab open/evaluate/close soak: RSS 304→311MB, plateaus after ~10 cycles (119KB/cycle amortized, all early) — no tab-lifecycle leak; shell healthy, tab list clean at end.
 17. [speed] Background-tab capture latency (post-fix path): 5–16ms on a static page, 22–30ms on an animated WebGL page — the frame-ready wait almost never approaches the 1.5s fallback. SPEC's distributed-viewing targets (~200–500ms passive, ~30–60ms takeover) hold with an order of magnitude of headroom at the capture layer.
 18. [design/discoverability] Toolbar buttons and tabs had no hover labels → added tooltips: Back/Forward/Reload (Ctrl+R)/New tab (Ctrl+T)/Close tab, and tabs show their full URL on hover → verified: hover screenshot on isolated display shows the "Back" tooltip. Soak checkpoint at 41min: 122 cycles ok, RSS 370→447MB asymptote (flat since 15min), eval ~20ms / capture ~30ms steady.
+19. [stability] Checked the exit path: servo 0.4 has no deinit() (teardown is Drop-based), so the current close flow is correct; the "pthread_mutex_destroy failed" line at exit is upstream SpiderMonkey teardown noise, not ours. No change. Soak at 90min: 270 cycles ok, RSS 457MB (~10MB/h creep since the 15-min asymptote — monitoring; likely the WebGL demo, verdict at soak end).
+20. [stability] 4-hour continuous soak VERDICT: 719/719 cycles ok (evaluate + background screenshot every 20s against an animated WebGL me-tab + static agent tab), zero failures, shell alive throughout. RSS 370→458MB peak, settled flat at ~454MB from minute 15 onward — no leak. Averages over 4h: evaluate 19ms, background capture 36ms. Final full e2e regression against the final binary: all 6 suites pass (control-socket, crash-recovery, timeout/session, MCP client, keyboard nav, takeover; the last two must run with a settle gap after a previous Xvfb teardown — test-harness display race, not a product issue).
