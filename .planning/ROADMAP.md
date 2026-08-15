@@ -54,17 +54,20 @@ it depends on adding an HTTP transport that doesn't exist yet.
   4. A tab crash or close arrives at a connected MCP client as a notification without the client polling
   5. A user can save a credential in Talaria and have it offered back by domain match on a later visit, with no plaintext credential file left on disk
   6. CI runs build, clippy, unit tests, and the e2e suite on every push, and is green
-**Plans**: TBD
+**Plans**: 11 plans in 8 waves
 
 Plans:
-- [ ] 02-01: `file://` (and other non-web scheme) allowlist enforcement on `navigate` and `evaluate`, with e2e coverage
-- [ ] 02-02: Replace `ShellConnection`'s single mutex with per-tab or request-multiplexed dispatch so one wedged call can't stall others
-- [ ] 02-03: Per-tab `evaluate` isolation/bounding on top of the existing blanket command timeout
-- [ ] 02-04: Control-socket peer-UID authentication, incl. the `/tmp/talaria-$UID.sock` fallback path
-- [ ] 02-05: Bound `download` — size cap and overwrite protection
-- [ ] 02-06: Bridge control-socket events (`TabCrashed`, `TabClosed`) into MCP notifications instead of discarding them in the proxy
-- [ ] 02-07: Vault write/capture path, plaintext-import cleanup, and domain-matched autofill in the shell UI
-- [ ] 02-08: CI pipeline — build, clippy, Rust unit tests, Xvfb e2e suite
+- [ ] 02-01-PLAN.md — Green e2e baseline for HEAD + overnight-lock PID liveness and a pre-commit gate (wave 1)
+- [ ] 02-02-PLAN.md — Scheme allowlist on `parse_agent_url`, refusal naming the scheme, human omnibox untouched (wave 2)
+- [ ] 02-03-PLAN.md — Control-socket peer-UID check, 0600 socket inside a 0700 per-UID dir, Python path alignment (wave 2)
+- [ ] 02-04-PLAN.md — Bound `download`: byte cap, uniquifying create, request timeout and cancellation (wave 3)
+- [ ] 02-05-PLAN.md — Pipeline both sides of the control socket and fix the retry that can re-execute a command (wave 3)
+- [ ] 02-06-PLAN.md — Per-tab `evaluate` in-flight tracking with instant busy refusal; takeover route stays open (wave 4)
+- [ ] 02-07-PLAN.md — Owner-addressed event queue + deferred tab-work queue; no silent drops in delegate callbacks (wave 5)
+- [ ] 02-08-PLAN.md — Surface tab crash/close to MCP clients as notifications, owner-scoped (wave 6)
+- [ ] 02-09-PLAN.md — Vault write API, verified plaintext-import cleanup, checked key permissions, user notices (wave 6)
+- [ ] 02-10-PLAN.md — Credentials panel and domain-matched toolbar autofill suggestion in the chrome (wave 7)
+- [ ] 02-11-PLAN.md — CI pipeline (build, clippy, unit tests, Xvfb e2e) plus a scheduled lockfile-drift audit (wave 8)
 
 ### Phase 3: Table-Stakes Browsing
 **Goal**: Talaria is usable as an actual daily-driver browser, not just an agent automation surface.
@@ -153,7 +156,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation & Core Engine | — | ✅ Complete | 2026-08-15 |
-| 2. Harden the Agent Surface | 0/8 | Not started | - |
+| 2. Harden the Agent Surface | 0/11 | Planned | - |
 | 3. Table-Stakes Browsing | 0/4 | Not started | - |
 | 4. Authenticated Remote Transport | 0/3 | Not started | - |
 | 5. Distributed Mode | 0/4 | Not started | - |
