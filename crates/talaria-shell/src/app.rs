@@ -77,6 +77,9 @@ pub struct Shared {
     /// Last cursor position relative to the webview viewport, device pixels.
     pub webview_point: Cell<euclid::Point2D<f32, DevicePixel>>,
     pub modifiers: Cell<ModifiersState>,
+    /// Last window title we set, so the per-frame refresh only touches the
+    /// window when the displayed tab's title actually changes.
+    pub window_title: RefCell<String>,
     /// Screenshot requests for tabs that are not currently displayed: the
     /// target must be shown and produce a fresh frame before its pixels exist
     /// in the shared framebuffer. Serviced from the event loop (never inside
@@ -345,6 +348,20 @@ impl Shared {
         [captures, loads, evals].into_iter().flatten().min()
     }
 
+    /// Keep the window title in step with whatever tab is displayed (tab
+    /// switches, closes and view toggles included — not just page-title
+    /// events). Called from the chrome update; cheap when nothing changed.
+    pub fn refresh_window_title(&self, title: Option<String>) {
+        let title = match title {
+            Some(title) if !title.is_empty() => format!("{title} — Talaria"),
+            _ => "Talaria".to_owned(),
+        };
+        if *self.window_title.borrow() != title {
+            self.window.set_title(&title);
+            *self.window_title.borrow_mut() = title;
+        }
+    }
+
     /// Push an unsolicited event to every connected control client.
     /// Non-blocking (unbounded channel), so this is safe to call from servo
     /// delegate callbacks.
@@ -462,6 +479,7 @@ impl ApplicationHandler<AppEvent> for App {
             last_cursor: Cell::new(None),
             webview_point: Cell::new(euclid::Point2D::zero()),
             modifiers: Cell::new(ModifiersState::empty()),
+            window_title: RefCell::new(String::new()),
             pending_captures: RefCell::new(Vec::new()),
             pending_loads: RefCell::new(Vec::new()),
             pending_evals: RefCell::new(Vec::new()),
@@ -542,7 +560,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // egui tracks modifiers from this event too.
                 GUI.with_borrow_mut(|gui| {
                     if let Some(gui) = gui.as_mut() {
-                        gui.on_window_event(&state.window, &event);
+                        let _ = gui.on_window_event(&state.window, &event);
                     }
                 });
             },
@@ -1286,20 +1304,8 @@ impl servo::WebViewDelegate for Shared {
         self.window.request_redraw();
     }
 
-    fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
-        let is_displayed = self
-            .tabs
-            .try_borrow()
-            .ok()
-            .and_then(|tabs| tabs.displayed().map(|t| t.webview == webview))
-            .unwrap_or(false);
-        if is_displayed {
-            let title = match title {
-                Some(title) if !title.is_empty() => format!("{title} — Talaria"),
-                _ => "Talaria".to_owned(),
-            };
-            self.window.set_title(&title);
-        }
+    fn notify_page_title_changed(&self, _webview: WebView, _title: Option<String>) {
+        // The chrome refresh picks the title up from the displayed tab.
         self.window.request_redraw();
     }
 

@@ -197,7 +197,7 @@ impl Gui {
                             // "disconnected" group (tabs outlive sessions by
                             // design).
                             let active = tabs.active_id(ViewMode::Agents);
-                            let mut render_tab = |ui: &mut egui::Ui,
+                            let render_tab = |ui: &mut egui::Ui,
                                                   tab: &crate::tabs::Tab,
                                                   actions: &mut Vec<UiAction>| {
                                 let mut title = tab
@@ -266,6 +266,12 @@ impl Gui {
 
             let available = ctx.available_rect();
             shared.toolbar_height.set(available.min.y);
+            shared.refresh_window_title(
+                tabs.displayed().map(|tab| match tab.crashed {
+                    true => "Tab crashed".to_owned(),
+                    false => tab.webview.page_title().unwrap_or_default(),
+                }),
+            );
             let scale = ctx.pixels_per_point();
 
             let crashed_tab = tabs
