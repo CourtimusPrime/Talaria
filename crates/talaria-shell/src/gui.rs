@@ -192,20 +192,25 @@ impl Gui {
                                 "No agents connected — point an MCP client at talaria-mcp",
                             );
                         } else {
-                            ui.label(format!("{} connected", sessions.len()));
-                            ui.separator();
+                            // Tabs grouped by owning session; sessions that
+                            // disconnected leave their tabs under a
+                            // "disconnected" group (tabs outlive sessions by
+                            // design).
                             let active = tabs.active_id(ViewMode::Agents);
-                            for tab in tabs.agent_tabs() {
+                            let mut render_tab = |ui: &mut egui::Ui,
+                                                  tab: &crate::tabs::Tab,
+                                                  actions: &mut Vec<UiAction>| {
                                 let mut title = tab
                                     .webview
                                     .page_title()
                                     .filter(|t| !t.is_empty())
                                     .unwrap_or_else(|| tab.location.clone());
                                 title.truncate(24);
-                                let mut label = format!("{} {} · {title}", egui_phosphor::regular::ROBOT, tab.owner.label());
-                                if tab.crashed {
-                                    label = format!("💥 {label}");
-                                }
+                                let label = if tab.crashed {
+                                    format!("💥 {title}")
+                                } else {
+                                    title
+                                };
                                 if ui
                                     .selectable_label(active == Some(tab.id), label)
                                     .on_hover_text(&tab.location)
@@ -213,8 +218,44 @@ impl Gui {
                                 {
                                     actions.push(UiAction::SelectTab(tab.id));
                                 }
-                                if ui.small_button(egui_phosphor::regular::X).on_hover_text("Close tab").clicked() {
+                                if ui
+                                    .small_button(egui_phosphor::regular::X)
+                                    .on_hover_text("Close tab")
+                                    .clicked()
+                                {
                                     actions.push(UiAction::CloseTab(tab.id));
+                                }
+                            };
+                            for (session_id, session) in sessions.iter() {
+                                ui.label(format!(
+                                    "{} {}",
+                                    egui_phosphor::regular::ROBOT,
+                                    session.client
+                                ));
+                                for tab in tabs.agent_tabs().filter(|t| {
+                                    matches!(&t.owner,
+                                        crate::tabs::TabOwner::Agent { session_id: sid, .. }
+                                            if sid == session_id)
+                                }) {
+                                    render_tab(ui, tab, &mut actions);
+                                }
+                                ui.separator();
+                            }
+                            let orphaned: Vec<_> = tabs
+                                .agent_tabs()
+                                .filter(|t| {
+                                    matches!(&t.owner,
+                                        crate::tabs::TabOwner::Agent { session_id: sid, .. }
+                                            if !sessions.contains_key(sid))
+                                })
+                                .collect();
+                            if !orphaned.is_empty() {
+                                ui.label(format!(
+                                    "{} disconnected",
+                                    egui_phosphor::regular::PLUGS
+                                ));
+                                for tab in orphaned {
+                                    render_tab(ui, tab, &mut actions);
                                 }
                                 ui.separator();
                             }
