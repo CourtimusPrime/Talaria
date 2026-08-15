@@ -11,7 +11,7 @@ use talaria_protocol::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use winit::event_loop::EventLoopProxy;
 
 use crate::app::AppEvent;
@@ -95,11 +95,24 @@ async fn handle_connection(
     };
 
     let session_id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+    // Outbound messages (replies AND unsolicited events, e.g. tab_crashed)
+    // funnel through one channel so a dedicated writer task can interleave
+    // them safely on the socket.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let _ = proxy.send_event(AppEvent::SessionStarted {
         session_id,
         client: client.clone(),
+        events: out_tx.clone(),
     });
     write_line(&mut write_half, &ServerMessage::HelloAck { session_id }).await?;
+
+    let writer = tokio::spawn(async move {
+        while let Some(message) = out_rx.recv().await {
+            if write_line(&mut write_half, &message).await.is_err() {
+                break;
+            }
+        }
+    });
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -147,10 +160,14 @@ async fn handle_connection(
             },
             Err(error) => (0, Outcome::Error { message: format!("bad request: {error}") }),
         };
-        write_line(&mut write_half, &ServerMessage::Reply { id, outcome }).await?;
+        if out_tx.send(ServerMessage::Reply { id, outcome }).is_err() {
+            break; // Writer is gone; connection is dead.
+        }
     }
 
     let _ = proxy.send_event(AppEvent::SessionEnded { session_id });
+    drop(out_tx);
+    writer.abort();
     Ok(())
 }
 

@@ -66,7 +66,10 @@ pub enum ServerMessage {
     },
     /// Unsolicited event, e.g. a tab's WebContent process crashed (surfaced
     /// to agents per SPEC's crash-recovery decision).
-    Event { event: Event },
+    Event {
+        #[serde(flatten)]
+        event: Event,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

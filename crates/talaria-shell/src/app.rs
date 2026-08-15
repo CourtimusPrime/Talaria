@@ -39,9 +39,19 @@ use crate::vault::Vault;
 #[derive(Debug)]
 pub enum AppEvent {
     Wake,
-    SessionStarted { session_id: u64, client: String },
+    SessionStarted {
+        session_id: u64,
+        client: String,
+        events: tokio::sync::mpsc::UnboundedSender<talaria_protocol::ServerMessage>,
+    },
     SessionEnded { session_id: u64 },
     Agent(AgentRequest),
+}
+
+/// A connected control-socket client: display label + its event channel.
+pub struct Session {
+    pub client: String,
+    pub events: tokio::sync::mpsc::UnboundedSender<talaria_protocol::ServerMessage>,
 }
 
 impl std::fmt::Debug for AgentRequest {
@@ -59,7 +69,7 @@ pub struct Shared {
     pub window_rendering_context: Rc<WindowRenderingContext>,
     pub rendering_context: Rc<OffscreenRenderingContext>,
     pub tabs: RefCell<TabManager>,
-    pub sessions: RefCell<BTreeMap<u64, String>>,
+    pub sessions: RefCell<BTreeMap<u64, Session>>,
     pub vault: RefCell<Vault>,
     /// Bottom of the chrome strip, in logical points.
     pub toolbar_height: Cell<f32>,
@@ -131,6 +141,19 @@ impl Shared {
     /// Earliest deadline among queued captures, for WaitUntil scheduling.
     pub fn next_capture_deadline(&self) -> Option<std::time::Instant> {
         self.pending_captures.borrow().iter().map(|c| c.deadline).min()
+    }
+
+    /// Push an unsolicited event to every connected control client.
+    /// Non-blocking (unbounded channel), so this is safe to call from servo
+    /// delegate callbacks.
+    pub fn broadcast_event(&self, event: talaria_protocol::Event) {
+        if let Ok(sessions) = self.sessions.try_borrow() {
+            for session in sessions.values() {
+                let _ = session
+                    .events
+                    .send(talaria_protocol::ServerMessage::Event { event: event.clone() });
+            }
+        }
     }
 }
 
@@ -259,8 +282,11 @@ impl ApplicationHandler<AppEvent> for App {
             state.process_pending_captures();
             match event {
                 AppEvent::Wake => {},
-                AppEvent::SessionStarted { session_id, client } => {
-                    state.sessions.borrow_mut().insert(session_id, client);
+                AppEvent::SessionStarted { session_id, client, events } => {
+                    state
+                        .sessions
+                        .borrow_mut()
+                        .insert(session_id, Session { client, events });
                     state.window.request_redraw();
                 },
                 AppEvent::SessionEnded { session_id } => {
@@ -547,7 +573,9 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                 state.open_tab(url, TabOwner::Me);
             },
             UiAction::CloseTab(id) => {
-                state.tabs.borrow_mut().close(id);
+                if state.tabs.borrow_mut().close(id) {
+                    state.broadcast_event(talaria_protocol::Event::TabClosed { tab_id: id });
+                }
             },
             UiAction::SelectTab(id) => {
                 state.tabs.borrow_mut().set_active(id);
@@ -672,6 +700,9 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
         },
         Command::TabsClose { tab_id } => {
             let closed = state.tabs.borrow_mut().close(tab_id);
+            if closed {
+                state.broadcast_event(talaria_protocol::Event::TabClosed { tab_id });
+            }
             let _ = reply.send(if closed {
                 Outcome::Ok { result: ResultPayload::Empty {} }
             } else {
@@ -715,6 +746,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                 if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
                     tab.crashed = true;
                     state.window.request_redraw();
+                    state.broadcast_event(talaria_protocol::Event::TabCrashed { tab_id });
                     let _ = reply.send(Outcome::Ok { result: ResultPayload::Empty {} });
                 } else {
                     let _ = reply.send(Outcome::Error { message: format!("no tab {tab_id}") });
@@ -935,10 +967,15 @@ impl servo::WebViewDelegate for Shared {
 
     fn notify_crashed(&self, webview: WebView, reason: String, backtrace: Option<String>) {
         log::error!("tab crashed: {reason} {backtrace:?}");
+        let mut crashed_tab = None;
         if let Ok(mut tabs) = self.tabs.try_borrow_mut() {
             if let Some(tab) = tabs.find_by_webview_mut(&webview) {
                 tab.crashed = true;
+                crashed_tab = Some(tab.id);
             }
+        }
+        if let Some(tab_id) = crashed_tab {
+            self.broadcast_event(talaria_protocol::Event::TabCrashed { tab_id });
         }
         self.window.request_redraw();
     }
@@ -948,7 +985,10 @@ impl servo::WebViewDelegate for Shared {
             if let Some(id) = tabs.find_by_webview(&webview) {
                 drop(tabs);
                 if let Ok(mut tabs) = self.tabs.try_borrow_mut() {
-                    tabs.close(id);
+                    if tabs.close(id) {
+                        drop(tabs);
+                        self.broadcast_event(talaria_protocol::Event::TabClosed { tab_id: id });
+                    }
                 }
             }
         }
