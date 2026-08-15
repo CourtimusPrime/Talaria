@@ -1,29 +1,18 @@
 #!/usr/bin/env python3
 """Orchestrate: Xvfb + talaria + control-socket e2e + chrome screenshots."""
 import os
-import signal
 import subprocess
 import sys
 import time
 
 T = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-DISPLAY = ":99"
+sys.path.insert(0, T)
+import harness
 
-subprocess.run(["pkill", "-f", "[X]vfb :99"], check=False)
-subprocess.run(["pkill", "-x", "talaria"], check=False)
-time.sleep(0.5)
-
-xvfb = subprocess.Popen(["Xvfb", DISPLAY, "-screen", "0", "1280x800x24"],
-                        stderr=subprocess.DEVNULL)
-time.sleep(1)
-
-env = dict(os.environ, DISPLAY=DISPLAY, RUST_LOG="warn")
+DISPLAY = harness.DISPLAY
+xvfb = harness.start_xvfb(settle=0.5)
 tal_log = open(os.path.join(T, "talaria.log"), "w")
-talaria = subprocess.Popen([os.path.join(REPO, "target/release/talaria"),
-                            "https://servo.org"], env=env,
-                           stdout=tal_log, stderr=tal_log)
-time.sleep(12)
+talaria = harness.start_shell("https://servo.org", log=tal_log, rust_log="warn", wait=12)
 
 def shot(name):
     xwd = os.path.join(T, name + ".xwd")
@@ -46,7 +35,7 @@ try:
     if rc == 0:
         import base64, json, socket
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock")
+        s.connect(harness.SOCK)
         f = s.makefile("rw")
         def send(o):
             f.write(json.dumps(o) + "\n"); f.flush()
@@ -62,10 +51,7 @@ try:
         time.sleep(2)
         shot("chrome-agents")
 finally:
-    talaria.send_signal(signal.SIGTERM)
-    time.sleep(1)
-    talaria.kill()
-    xvfb.kill()
+    harness.stop(talaria, xvfb)
     tal_log.close()
 
 print("tail of talaria.log:")

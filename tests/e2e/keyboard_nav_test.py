@@ -3,28 +3,19 @@
 Standalone: starts its own Xvfb + talaria."""
 import os, subprocess, time, socket, json, sys
 
-REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-subprocess.run(["pkill", "-f", "[X]vfb :99"], check=False)
-subprocess.run(["pkill", "-x", "talaria"], check=False)
-time.sleep(2)  # let a previous Xvfb fully release :99
-xvfb = subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x800x24"], stderr=subprocess.DEVNULL)
-for _ in range(20):  # wait until the display actually accepts connections
-    if subprocess.run(["xdpyinfo", "-display", ":99"], stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL).returncode == 0:
-        break
-    time.sleep(0.5)
-env = dict(os.environ, DISPLAY=":99", RUST_LOG="error")
-tal = subprocess.Popen([os.path.join(REPO, "target/release/talaria"), "https://example.com"],
-                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-time.sleep(8)
-X = dict(os.environ, DISPLAY=":99")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import harness
+
+xvfb = harness.start_xvfb()
+tal = harness.start_shell("https://example.com")
+X = harness.x_env()
 
 def key(*args):
     subprocess.run(["xdotool"] + list(args), env=X)
 
 def tabs():
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock")
+    s.connect(harness.SOCK)
     f = s.makefile("rw")
     f.write(json.dumps({"type": "hello", "client": "kbd-test"}) + "\n"); f.flush(); f.readline()
     f.write(json.dumps({"type": "request", "id": 1, "command": "tabs_list"}) + "\n"); f.flush()
@@ -57,4 +48,4 @@ try:
     print("ctrl+w closes the tab")
     print("KEYBOARD NAV CHECKS PASSED")
 finally:
-    tal.terminate(); time.sleep(1); tal.kill(); xvfb.kill()
+    harness.stop(tal, xvfb)

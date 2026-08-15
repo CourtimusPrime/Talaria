@@ -9,10 +9,23 @@ Require a built `target/release/talaria` (+ `talaria-mcp`) and Xvfb.
   initialize, tools/list, and every tool called end-to-end (expects the shell
   already running with `DISPLAY` set, e.g. started by the runner above).
 
+- `run_all.py` — the whole regression: one shell for the socket-driven suites
+  (control_socket, crash_recovery, crash_event, timeout_session, mcp_client),
+  then the standalone keyboard_nav and takeover suites.
+
 ```sh
 cargo build --release
-python3 tests/e2e/run_control_socket_e2e.py
+python3 tests/e2e/run_all.py
 ```
+
+To run next to a shell you don't want disturbed (e.g. a soak on `:99`), give
+the suites their own display and control socket:
+
+```sh
+TALARIA_E2E_DISPLAY=:98 XDG_RUNTIME_DIR=/tmp/talaria-e2e-rt python3 tests/e2e/run_all.py
+```
+
+Launchers only kill Talaria processes attached to their own display.
 
 ## Manual accessibility check (not automated)
 
