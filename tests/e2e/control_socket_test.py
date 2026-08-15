@@ -102,6 +102,42 @@ r = rpc("evaluate", tab_id=tab_id, script="throw new Error('boom')")
 assert r["outcome"] == "error" and "boom" in r["message"], r
 print("EVALUATE error carries the script's message")
 
+# Promises are awaited; top-level await works in both single-expression and
+# multi-statement (return) forms; rejections become errors.
+r = rpc("evaluate", tab_id=tab_id, script="new Promise(res => setTimeout(() => res(41 + 1), 150))")
+assert r["outcome"] == "ok" and r["result"]["value"] == 42, r
+r = rpc("evaluate", tab_id=tab_id, script="await fetch(location.href).then(x => x.status)")
+assert r["outcome"] == "ok" and r["result"]["value"] == 200, r
+r = rpc("evaluate", tab_id=tab_id, script="const x = await Promise.resolve(2); return x * 21")
+assert r["outcome"] == "ok" and r["result"]["value"] == 42, r
+r = rpc("evaluate", tab_id=tab_id, script="Promise.reject(new Error('nope'))")
+assert r["outcome"] == "error" and "nope" in r["message"], r
+r = rpc("evaluate", tab_id=tab_id, script="var __persist = 5; __persist")
+r = rpc("evaluate", tab_id=tab_id, script="__persist")
+assert r["outcome"] == "ok" and r["result"]["value"] == 5, r
+print("EVALUATE awaits promises / top-level await / globals persist")
+
+# A page whose CSP forbids eval still evaluates (raw fallback).
+import http.server, threading
+class CspPage(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"<!doctype html><title>csp page</title><h1 id=h>hello csp</h1>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Security-Policy", "script-src 'self'; default-src 'self'")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+csp_server = http.server.HTTPServer(("127.0.0.1", 0), CspPage)
+threading.Thread(target=csp_server.serve_forever, daemon=True).start()
+r = rpc("navigate", tab_id=tab_id, url=f"http://127.0.0.1:{csp_server.server_address[1]}/")
+assert r["outcome"] == "ok" and r["result"]["tab"]["title"] == "csp page", r
+r = rpc("evaluate", tab_id=tab_id, script="document.getElementById('h').textContent")
+assert r["outcome"] == "ok" and r["result"]["value"] == "hello csp", r
+print("EVALUATE works on a CSP page that forbids eval")
+csp_server.shutdown()
 
 r = rpc("tabs_close", tab_id=tab_id)
 print("TABS_CLOSE:", json.dumps(r)[:150])

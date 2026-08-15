@@ -87,6 +87,30 @@ pub struct Shared {
     /// runs in the page it asked for rather than the previous one — or in
     /// no document at all, which Servo reports as an opaque InternalError.
     pub pending_loads: RefCell<Vec<PendingLoad>>,
+    /// `evaluate` follow-ups that must be issued from the event loop: a
+    /// promise result being polled until it settles, or a raw re-run when
+    /// the page's CSP forbids the eval-based wrapper. Servo invokes evaluate
+    /// callbacks while its evaluator is mutably borrowed, so a follow-up
+    /// evaluate can never be started from inside a callback.
+    pub pending_evals: RefCell<Vec<PendingEval>>,
+}
+
+pub struct PendingEval {
+    pub webview: WebView,
+    pub step: EvalStep,
+    pub reply: tokio::sync::oneshot::Sender<Outcome>,
+    /// Give up polling a promise after this (just under the command timeout).
+    pub deadline: std::time::Instant,
+    /// Earliest time to issue the next evaluate.
+    pub next: std::time::Instant,
+}
+
+pub enum EvalStep {
+    /// Poll `window.__talaria_async[slot]` until the promise settles.
+    Poll { slot: u64 },
+    /// Run the agent's script unwrapped (CSP blocked eval): promises are not
+    /// awaited on such pages.
+    RunRaw { script: String },
 }
 
 /// How long `tabs_open` / `navigate` wait for LoadStatus::Complete before
@@ -165,6 +189,104 @@ impl Shared {
         self.process_pending_loads();
     }
 
+    /// Issue due evaluate follow-ups (see [`PendingEval`]).
+    pub fn process_pending_evals(self: &Rc<Self>) {
+        let now = std::time::Instant::now();
+        let due: Vec<PendingEval> = {
+            let mut pending = self.pending_evals.borrow_mut();
+            let mut due = Vec::new();
+            let mut index = 0;
+            while index < pending.len() {
+                if pending[index].next <= now {
+                    due.push(pending.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            due
+        };
+        for eval in due {
+            if eval.deadline <= now {
+                let _ = eval.reply.send(Outcome::Error {
+                    message: format!(
+                        "promise did not settle within {}s",
+                        promise_wait().as_secs()
+                    ),
+                });
+                continue;
+            }
+            let state = self.clone();
+            let PendingEval { webview, step, reply, deadline, .. } = eval;
+            match step {
+                EvalStep::Poll { slot } => {
+                    let poll_webview = webview.clone();
+                    webview.evaluate_javascript(poll_script(slot), move |result| {
+                        match result {
+                            Ok(servo::JSValue::Object(mut map)) => {
+                                if map.contains_key("__talaria_pending") {
+                                    state.pending_evals.borrow_mut().push(PendingEval {
+                                        webview: poll_webview,
+                                        step: EvalStep::Poll { slot },
+                                        reply,
+                                        deadline,
+                                        next: std::time::Instant::now()
+                                            + std::time::Duration::from_millis(50),
+                                    });
+                                    state.window.request_redraw();
+                                    return;
+                                }
+                                let settled = match map.remove("state") {
+                                    Some(servo::JSValue::String(s)) => s,
+                                    _ => String::new(),
+                                };
+                                let outcome = if settled == "ok" {
+                                    Outcome::Ok {
+                                        result: ResultPayload::Value {
+                                            value: map
+                                                .remove("value")
+                                                .map(js_value_to_json)
+                                                .unwrap_or(serde_json::Value::Null),
+                                        },
+                                    }
+                                } else {
+                                    let message = match map.remove("message") {
+                                        Some(servo::JSValue::String(m)) => m,
+                                        _ => "unknown".into(),
+                                    };
+                                    Outcome::Error { message: format!("promise rejected: {message}") }
+                                };
+                                let _ = reply.send(outcome);
+                            },
+                            Ok(_) => {
+                                let _ = reply.send(Outcome::Error {
+                                    message: "promise poll returned an unexpected shape".into(),
+                                });
+                            },
+                            Err(error) => {
+                                let _ = reply.send(Outcome::Error {
+                                    message: format!(
+                                        "page went away before the promise settled ({})",
+                                        describe_js_error(error)
+                                    ),
+                                });
+                            },
+                        }
+                    });
+                },
+                EvalStep::RunRaw { script } => {
+                    webview.evaluate_javascript(script, move |result| {
+                        let _ = reply.send(match result {
+                            Ok(value) => Outcome::Ok {
+                                result: ResultPayload::Value { value: js_value_to_json(value) },
+                            },
+                            Err(error) => Outcome::Error { message: describe_js_error(error) },
+                        });
+                    });
+                },
+            }
+        }
+    }
+
     /// Reply to `tabs_open` / `navigate` requests whose page finished loading,
     /// timed out waiting, or whose tab went away meanwhile.
     fn process_pending_loads(&self) {
@@ -214,11 +336,13 @@ impl Shared {
         });
     }
 
-    /// Earliest deadline among queued captures/loads, for WaitUntil scheduling.
+    /// Earliest deadline among queued captures/loads/evals, for WaitUntil
+    /// scheduling.
     pub fn next_capture_deadline(&self) -> Option<std::time::Instant> {
         let captures = self.pending_captures.borrow().iter().map(|c| c.deadline).min();
         let loads = self.pending_loads.borrow().iter().map(|l| l.deadline).min();
-        [captures, loads].into_iter().flatten().min()
+        let evals = self.pending_evals.borrow().iter().map(|e| e.next).min();
+        [captures, loads, evals].into_iter().flatten().min()
     }
 
     /// Push an unsolicited event to every connected control client.
@@ -340,6 +464,7 @@ impl ApplicationHandler<AppEvent> for App {
             modifiers: Cell::new(ModifiersState::empty()),
             pending_captures: RefCell::new(Vec::new()),
             pending_loads: RefCell::new(Vec::new()),
+            pending_evals: RefCell::new(Vec::new()),
         });
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
@@ -349,6 +474,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
         if let Some(state) = self.state() {
             state.process_pending_captures();
+            state.process_pending_evals();
             set_wait(event_loop, state);
         }
     }
@@ -356,6 +482,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         if let Some(state) = self.state() {
             state.process_pending_captures();
+            state.process_pending_evals();
             match event {
                 AppEvent::Wake => {},
                 AppEvent::SessionStarted { session_id, client, events } => {
@@ -389,6 +516,7 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         };
         state.process_pending_captures();
+        state.process_pending_evals();
 
         let over_toolbar = |state: &Shared| {
             state
@@ -834,17 +962,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                 return;
             }
             match webview_for(tab_id) {
-                Ok(webview) => {
-                    webview.evaluate_javascript(script, move |result| {
-                        let outcome = match result {
-                            Ok(value) => Outcome::Ok {
-                                result: ResultPayload::Value { value: js_value_to_json(value) },
-                            },
-                            Err(error) => Outcome::Error { message: describe_js_error(error) },
-                        };
-                        let _ = reply.send(outcome);
-                    });
-                },
+                Ok(webview) => start_evaluate(state, webview, script, reply),
                 Err(outcome) => {
                     let _ = reply.send(outcome);
                 },
@@ -909,6 +1027,105 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             });
         },
     }
+}
+
+/// How long a returned promise may take to settle: just under the control
+/// socket's command timeout, so the agent gets our message rather than a
+/// generic timeout.
+fn promise_wait() -> std::time::Duration {
+    let timeout_secs: u64 = std::env::var("TALARIA_COMMAND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    std::time::Duration::from_secs(timeout_secs.saturating_sub(2).max(1))
+}
+
+/// Wrap an agent script so that (a) a returned promise/thenable is parked in
+/// `window.__talaria_async[slot]` and polled to settlement, (b) top-level
+/// `await` works: a single expression is returned as-is, a multi-statement
+/// script runs inside an async function and needs `return`,
+/// (c) a page whose CSP forbids eval reports that so we can fall back to a
+/// raw run. Indirect eval keeps ordinary global-script semantics.
+fn wrap_script(script: &str) -> String {
+    let source = serde_json::to_string(script).expect("string is serializable");
+    format!(
+        "(function(){{var s={source};var v;\
+         try{{v=(0,eval)(s)}}catch(e){{\
+           if(e instanceof EvalError)return{{__talaria_csp:1}};\
+           if(e instanceof SyntaxError&&/await/.test(String(e.message))){{\
+             try{{v=(0,eval)('(async function(){{return(\\n'+s+'\\n)}})()')}}\
+             catch(e2){{if(!(e2 instanceof SyntaxError))throw e2;\
+               v=(0,eval)('(async function(){{'+s+'\\n}})()')}}}}\
+           else throw e}}\
+         if(v&&typeof v.then==='function'){{\
+           var a=window.__talaria_async=window.__talaria_async||{{}};\
+           var id=a.__next=(a.__next||0)+1;a[id]={{state:'pending'}};\
+           v.then(function(x){{a[id]={{state:'ok',value:x}}}},\
+                  function(e){{a[id]={{state:'error',message:String(e&&e.message||e)}}}});\
+           return{{__talaria_async:id}}}}\
+         return{{__talaria_value:v}}}})()"
+    )
+}
+
+fn poll_script(slot: u64) -> String {
+    format!(
+        "(function(){{var a=window.__talaria_async;var s=a&&a[{slot}];\
+         if(!s||s.state==='pending')return{{__talaria_pending:1}};\
+         delete a[{slot}];return s}})()"
+    )
+}
+
+/// Run an agent script with promise support (see [`wrap_script`]).
+fn start_evaluate(
+    state: &Rc<Shared>,
+    webview: WebView,
+    script: String,
+    reply: tokio::sync::oneshot::Sender<Outcome>,
+) {
+    let state = state.clone();
+    let deadline = std::time::Instant::now() + promise_wait();
+    let target = webview.clone();
+    webview.evaluate_javascript(wrap_script(&script), move |result| {
+        let outcome = match result {
+            Ok(servo::JSValue::Object(mut map)) => {
+                if let Some(servo::JSValue::Number(slot)) = map.get("__talaria_async") {
+                    state.pending_evals.borrow_mut().push(PendingEval {
+                        webview: target,
+                        step: EvalStep::Poll { slot: *slot as u64 },
+                        reply,
+                        deadline,
+                        next: std::time::Instant::now() + std::time::Duration::from_millis(20),
+                    });
+                    state.window.request_redraw();
+                    return;
+                }
+                if map.contains_key("__talaria_csp") {
+                    state.pending_evals.borrow_mut().push(PendingEval {
+                        webview: target,
+                        step: EvalStep::RunRaw { script },
+                        reply,
+                        deadline,
+                        next: std::time::Instant::now(),
+                    });
+                    state.window.request_redraw();
+                    return;
+                }
+                Outcome::Ok {
+                    result: ResultPayload::Value {
+                        value: map
+                            .remove("__talaria_value")
+                            .map(js_value_to_json)
+                            .unwrap_or(serde_json::Value::Null),
+                    },
+                }
+            },
+            Ok(value) => Outcome::Ok {
+                result: ResultPayload::Value { value: js_value_to_json(value) },
+            },
+            Err(error) => Outcome::Error { message: describe_js_error(error) },
+        };
+        let _ = reply.send(outcome);
+    });
 }
 
 /// Agent-readable evaluate failures: the thrown error's message for script

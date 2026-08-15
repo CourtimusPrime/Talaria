@@ -55,7 +55,7 @@ pub struct NavigateTool {
 
 #[mcp_tool(
     name = "evaluate",
-    description = "Run arbitrary JavaScript in a tab's page and return the result as JSON. This is the primary interaction primitive: query the DOM, click elements, fill and submit forms, extract data — write the whole interaction as one script instead of many small tool calls."
+    description = "Run arbitrary JavaScript in a tab's page and return the result as JSON. This is the primary interaction primitive: query the DOM, click elements, fill and submit forms, extract data — write the whole interaction as one script instead of many small tool calls. The value of the last expression is returned. Promises are awaited until they settle (up to the command timeout), and top-level `await` works: a single expression is returned as-is; a multi-statement script runs inside an async function, so end it with `return <value>`. Return plain data (strings, numbers, arrays, objects); DOM nodes come back as opaque handles. Keep cross-call state on `window`. (On pages whose CSP forbids eval, scripts still run but promises are not awaited — store results on `window` and poll.)"
 )]
 #[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
 pub struct EvaluateTool {
