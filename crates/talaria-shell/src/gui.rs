@@ -37,6 +37,9 @@ pub enum UiAction {
 pub struct Gui {
     context: EguiGlow,
     rendering_context: Rc<WindowRenderingContext>,
+    /// Ctrl+L: select the whole URL on the frame the bar gains focus, so
+    /// typing replaces it (browser behaviour) instead of appending.
+    select_location: bool,
 }
 
 impl Gui {
@@ -55,7 +58,7 @@ impl Gui {
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         context.egui_ctx.set_fonts(fonts);
-        Self { context, rendering_context }
+        Self { context, rendering_context, select_location: false }
     }
 
     pub fn on_window_event(
@@ -71,10 +74,11 @@ impl Gui {
     }
 
     /// Focus the URL bar (Ctrl+L) and select its contents.
-    pub fn focus_location_bar(&self) {
+    pub fn focus_location_bar(&mut self) {
         self.context.egui_ctx.memory_mut(|memory| {
             memory.request_focus(egui::Id::new("location-bar"));
         });
+        self.select_location = true;
     }
 
     pub fn surrender_focus(&self) {
@@ -94,6 +98,7 @@ impl Gui {
     pub fn update(&mut self, shared: &Rc<Shared>) -> Vec<UiAction> {
         let _ = self.rendering_context.make_current();
         let mut actions: Vec<UiAction> = Vec::new();
+        let mut select_location = std::mem::take(&mut self.select_location);
 
         self.context.run(&shared.window, |ctx| {
             let mut tabs = shared.tabs.borrow_mut();
@@ -138,19 +143,39 @@ impl Gui {
                         }
                     }
                     if let Some(tab) = tabs.displayed_mut() {
-                        let response = ui.add_sized(
-                            ui.available_size(),
-                            egui::TextEdit::singleline(&mut tab.location)
-                                .id(egui::Id::new("location-bar"))
-                                .hint_text("Search or enter address"),
-                        );
+                        let output = egui::TextEdit::singleline(&mut tab.location)
+                            .id(egui::Id::new("location-bar"))
+                            .hint_text("Search or enter address")
+                            .desired_width(ui.available_width())
+                            .show(ui);
+                        let response = output.response;
+                        if select_location && response.has_focus() {
+                            use egui::text::{CCursor, CCursorRange};
+                            let mut state = output.state;
+                            let end = CCursor::new(tab.location.chars().count());
+                            state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), end)));
+                            state.store(ctx, response.id);
+                            select_location = false;
+                        }
                         if response.changed() {
                             tab.location_dirty = true;
                         }
-                        if response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                        {
-                            actions.push(UiAction::Go(tab.location.clone()));
+                        if response.lost_focus() {
+                            let (enter, escape) = ui.input(|input| {
+                                (input.key_pressed(egui::Key::Enter), input.key_pressed(egui::Key::Escape))
+                            });
+                            if enter {
+                                actions.push(UiAction::Go(tab.location.clone()));
+                            } else if escape {
+                                // Escape abandons the edit: back to the page's URL,
+                                // keyboard focus returns to the page.
+                                tab.location = tab
+                                    .webview
+                                    .url()
+                                    .map(|url| url.to_string())
+                                    .unwrap_or_default();
+                                tab.location_dirty = false;
+                            }
                         }
                     } else {
                         ui.label("No tab open");

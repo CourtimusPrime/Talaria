@@ -64,8 +64,10 @@ the browser's **Agents** view, labeled by the client's MCP identity; switch
 to that view to watch the session live or take it over directly (e.g. to
 complete a login), then let the agent continue.
 
-Keyboard: `Ctrl+L` URL bar, `Ctrl+T` new tab, `Ctrl+W` close tab,
-`Ctrl+Tab`/`Ctrl+Shift+Tab` cycle tabs, `Ctrl+R`/`F5` reload.
+Keyboard: `Ctrl+L` URL bar (selects the URL; `Esc` abandons the edit),
+`Ctrl+T` new tab, `Ctrl+W` close tab, `Ctrl+Tab`/`Ctrl+Shift+Tab` cycle tabs,
+`Ctrl+R`/`F5` reload, `Alt+Left`/`Alt+Right` back/forward. `Tab`/`Shift+Tab`
+move between toolbar controls once the chrome has focus.
 
 ## License
 

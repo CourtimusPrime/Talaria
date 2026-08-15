@@ -641,7 +641,8 @@ fn set_wait(event_loop: &ActiveEventLoop, state: &Rc<Shared>) {
 
 /// Standard browser keyboard shortcuts, intercepted before both egui and the
 /// page: Ctrl+L (focus URL bar), Ctrl+T (new tab), Ctrl+W (close tab),
-/// Ctrl+R / F5 (reload). Returns true when the event was consumed.
+/// Ctrl+R / F5 (reload), Alt+Left / Alt+Right (back / forward),
+/// Ctrl+Tab / Ctrl+Shift+Tab (cycle tabs). Returns true when consumed.
 fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEvent) -> bool {
     use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamedKey};
 
@@ -649,6 +650,7 @@ fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEven
         return false;
     }
     let ctrl = state.modifiers.get().control_key();
+    let alt = state.modifiers.get().alt_key();
     let action = match &key_event.logical_key {
         WinitKey::Character(c) if ctrl => match c.to_lowercase().as_str() {
             "l" => {
@@ -670,6 +672,8 @@ fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEven
             _ => None,
         },
         WinitKey::Named(WinitNamedKey::F5) => Some(UiAction::Reload),
+        WinitKey::Named(WinitNamedKey::ArrowLeft) if alt => Some(UiAction::Back),
+        WinitKey::Named(WinitNamedKey::ArrowRight) if alt => Some(UiAction::Forward),
         WinitKey::Named(WinitNamedKey::Tab) if ctrl => {
             let forward = !state.modifiers.get().shift_key();
             state.tabs.borrow_mut().cycle(forward);
