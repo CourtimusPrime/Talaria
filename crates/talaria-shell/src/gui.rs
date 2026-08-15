@@ -12,7 +12,7 @@ use std::sync::Arc;
 use egui::{LayerId, PaintCallback};
 use egui_glow::CallbackFn;
 use egui_glow::winit::EguiGlow;
-use servo::{OffscreenRenderingContext, RenderingContext};
+use servo::{RenderingContext, WindowRenderingContext};
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
@@ -36,13 +36,13 @@ pub enum UiAction {
 
 pub struct Gui {
     context: EguiGlow,
-    rendering_context: Rc<OffscreenRenderingContext>,
+    rendering_context: Rc<WindowRenderingContext>,
 }
 
 impl Gui {
     pub fn new(
         event_loop: &ActiveEventLoop,
-        rendering_context: Rc<OffscreenRenderingContext>,
+        rendering_context: Rc<WindowRenderingContext>,
     ) -> Self {
         let _ = rendering_context.make_current();
         let context = EguiGlow::new(
@@ -91,7 +91,6 @@ impl Gui {
     pub fn update(&mut self, shared: &Rc<Shared>) -> Vec<UiAction> {
         let _ = self.rendering_context.make_current();
         let mut actions: Vec<UiAction> = Vec::new();
-        let rendering_context = self.rendering_context.clone();
 
         self.context.run(&shared.window, |ctx| {
             let mut tabs = shared.tabs.borrow_mut();
@@ -232,7 +231,7 @@ impl Gui {
             let displayed = tabs
                 .displayed()
                 .filter(|tab| !tab.crashed)
-                .map(|tab| tab.webview.clone());
+                .map(|tab| (tab.webview.clone(), tab.rendering_context.clone()));
             drop(tabs);
 
             if let Some(tab_id) = crashed_tab {
@@ -250,7 +249,7 @@ impl Gui {
                 });
             }
 
-            if let Some(webview) = displayed {
+            if let Some((webview, tab_context)) = displayed {
                 let width = (available.width() * scale).round().max(1.0) as u32;
                 let height = (available.height() * scale).round().max(1.0) as u32;
                 let current = webview.size();
@@ -259,7 +258,7 @@ impl Gui {
                 }
                 webview.paint();
 
-                if let Some(render_to_parent) = rendering_context.render_to_parent_callback() {
+                if let Some(render_to_parent) = tab_context.render_to_parent_callback() {
                     ctx.layer_painter(LayerId::background()).add(PaintCallback {
                         rect: available,
                         callback: Arc::new(CallbackFn::new(move |info, painter| {
@@ -283,9 +282,9 @@ impl Gui {
 
     pub fn paint(&mut self, window: &Window) {
         let _ = self.rendering_context.make_current();
-        self.rendering_context.parent_context().prepare_for_rendering();
+        self.rendering_context.prepare_for_rendering();
         self.context.paint(window);
-        self.rendering_context.parent_context().present();
+        self.rendering_context.present();
     }
 }
 

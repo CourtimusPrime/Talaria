@@ -67,7 +67,6 @@ pub struct Shared {
     pub window: Window,
     pub servo: Servo,
     pub window_rendering_context: Rc<WindowRenderingContext>,
-    pub rendering_context: Rc<OffscreenRenderingContext>,
     pub tabs: RefCell<TabManager>,
     pub sessions: RefCell<BTreeMap<u64, Session>>,
     pub vault: RefCell<Vault>,
@@ -87,8 +86,7 @@ pub struct Shared {
 
 pub struct PendingCapture {
     pub webview: WebView,
-    /// The tab to re-show once the capture is done (the displayed tab).
-    pub restore: Option<WebView>,
+    pub context: Rc<OffscreenRenderingContext>,
     pub reply: tokio::sync::oneshot::Sender<Outcome>,
     /// Set by notify_new_frame_ready once the target has painted a frame.
     pub ready: bool,
@@ -96,19 +94,25 @@ pub struct PendingCapture {
 }
 
 impl Shared {
-    /// Capture the shared framebuffer as this webview's screenshot: paint it,
-    /// read the pixels back, then restore the previously-displayed tab.
-    pub fn capture_now(&self, webview: &WebView, restore: Option<WebView>) -> Outcome {
+    /// Paint a webview into its own framebuffer and read the pixels back.
+    /// `hide_after` re-hides a background tab that was shown just to produce
+    /// a frame; the displayed tab is never touched (its framebuffer is its
+    /// own), so captures cause no visible flicker.
+    pub fn capture_now(
+        &self,
+        webview: &WebView,
+        context: &OffscreenRenderingContext,
+        hide_after: bool,
+    ) -> Outcome {
         webview.paint();
-        let size = self.rendering_context.size2d().to_i32();
+        let size = context.size2d().to_i32();
         let rect = euclid::Box2D::from_origin_and_size(
             euclid::Point2D::origin(),
             euclid::Size2D::new(size.width, size.height),
         );
-        let image = self.rendering_context.read_to_image(rect);
-        if let Some(displayed) = restore {
+        let image = context.read_to_image(rect);
+        if hide_after {
             webview.hide();
-            displayed.show();
         }
         match image {
             Some(image) => encode_screenshot(image),
@@ -133,7 +137,7 @@ impl Shared {
             }
         }
         for capture in due {
-            let outcome = self.capture_now(&capture.webview, capture.restore);
+            let outcome = self.capture_now(&capture.webview, &capture.context, true);
             let _ = capture.reply.send(outcome);
         }
     }
@@ -170,7 +174,8 @@ impl Shared {
         let delegate: Rc<dyn servo::WebViewDelegate> = self.clone();
         self.tabs.borrow_mut().open(
             &self.servo,
-            self.rendering_context.clone(),
+            &self.window_rendering_context,
+            self.window.inner_size(),
             delegate,
             self.hidpi_scale(),
             url,
@@ -224,9 +229,6 @@ impl ApplicationHandler<AppEvent> for App {
                 .expect("create window rendering context"),
         );
         let _ = window_rendering_context.make_current();
-        let rendering_context = Rc::new(
-            window_rendering_context.offscreen_context(window.inner_size()),
-        );
 
         // Persistent engine profile (localStorage, indexeddb, cookies…).
         // The default is a temp dir, which both discards session state on
@@ -248,14 +250,13 @@ impl ApplicationHandler<AppEvent> for App {
         servo.setup_logging();
 
         GUI.with_borrow_mut(|gui| {
-            *gui = Some(Gui::new(event_loop, rendering_context.clone()));
+            *gui = Some(Gui::new(event_loop, window_rendering_context.clone()));
         });
 
         let state = Rc::new(Shared {
             window,
             servo,
             window_rendering_context,
-            rendering_context,
             tabs: RefCell::new(TabManager::new()),
             sessions: RefCell::new(BTreeMap::new()),
             vault: RefCell::new(Vault::load()),
@@ -785,36 +786,34 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
             match webview_for(tab_id) {
                 Ok(webview) => {
-                    // The shared offscreen framebuffer holds the displayed
-                    // tab's pixels. A displayed tab can be captured
-                    // immediately; a background tab must first be shown and
-                    // paint a fresh frame (its pipeline is throttled while
-                    // hidden), so it goes through the pending-capture queue
-                    // and is serviced on notify_new_frame_ready or timeout.
-                    let restore = state
-                        .tabs
-                        .borrow()
-                        .displayed()
-                        .map(|t| t.webview.clone())
-                        .filter(|displayed| *displayed != webview);
-                    match restore {
-                        None => {
-                            let outcome = state.capture_now(&webview, None);
-                            let _ = reply.send(outcome);
-                        },
-                        Some(displayed) => {
-                            displayed.hide();
-                            webview.show();
-                            state.pending_captures.borrow_mut().push(PendingCapture {
-                                webview,
-                                restore: Some(displayed),
-                                reply,
-                                ready: false,
-                                deadline: std::time::Instant::now()
-                                    + std::time::Duration::from_millis(1500),
-                            });
-                            state.window.request_redraw();
-                        },
+                    // Each tab has its own framebuffer. The displayed tab can
+                    // be captured immediately; a background tab is briefly
+                    // shown (into its OWN framebuffer — the displayed tab is
+                    // untouched, so nothing flickers) and captured once it
+                    // paints a fresh frame, or at the timeout for pages that
+                    // never produce one.
+                    let tabs = state.tabs.borrow();
+                    let context = tabs
+                        .get(tab_id)
+                        .expect("checked by webview_for")
+                        .rendering_context
+                        .clone();
+                    let is_displayed = tabs.displayed().is_some_and(|t| t.webview == webview);
+                    drop(tabs);
+                    if is_displayed {
+                        let outcome = state.capture_now(&webview, &context, false);
+                        let _ = reply.send(outcome);
+                    } else {
+                        webview.show();
+                        state.pending_captures.borrow_mut().push(PendingCapture {
+                            webview,
+                            context,
+                            reply,
+                            ready: false,
+                            deadline: std::time::Instant::now()
+                                + std::time::Duration::from_millis(1500),
+                        });
+                        state.window.request_redraw();
                     }
                 },
                 Err(outcome) => {

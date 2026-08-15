@@ -5,7 +5,10 @@
 use std::rc::Rc;
 
 use euclid::Scale;
-use servo::{Servo, WebView, WebViewBuilder, WebViewDelegate};
+use servo::{
+    OffscreenRenderingContext, Servo, WebView, WebViewBuilder, WebViewDelegate,
+    WindowRenderingContext,
+};
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +33,9 @@ impl TabOwner {
 pub struct Tab {
     pub id: u64,
     pub webview: WebView,
+    /// Every tab renders into its own offscreen framebuffer, so painting or
+    /// capturing one tab never disturbs another's pixels.
+    pub rendering_context: Rc<OffscreenRenderingContext>,
     pub owner: TabOwner,
     pub crashed: bool,
     /// URL bar contents for this tab.
@@ -67,13 +73,15 @@ impl TabManager {
     pub fn open(
         &mut self,
         servo: &Servo,
-        rendering_context: Rc<servo::OffscreenRenderingContext>,
+        parent_context: &Rc<WindowRenderingContext>,
+        size: winit::dpi::PhysicalSize<u32>,
         delegate: Rc<dyn WebViewDelegate>,
         hidpi_scale: f32,
         url: Url,
         owner: TabOwner,
     ) -> u64 {
-        let webview = WebViewBuilder::new(servo, rendering_context)
+        let rendering_context = Rc::new(parent_context.offscreen_context(size));
+        let webview = WebViewBuilder::new(servo, rendering_context.clone())
             .url(url.clone())
             .hidpi_scale_factor(Scale::new(hidpi_scale))
             .delegate(delegate)
@@ -85,6 +93,7 @@ impl TabManager {
         self.tabs.push(Tab {
             id,
             webview,
+            rendering_context,
             owner,
             crashed: false,
             location: url.to_string(),
