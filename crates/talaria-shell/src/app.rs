@@ -68,18 +68,69 @@ pub struct Shared {
     /// Last cursor position relative to the webview viewport, device pixels.
     pub webview_point: Cell<euclid::Point2D<f32, DevicePixel>>,
     pub modifiers: Cell<ModifiersState>,
-    /// (hide, show) pairs queued by screenshot captures; applied on the next
-    /// event-loop turn because servo callbacks run inside a painter borrow
-    /// where hide()/show() would re-enter and panic.
-    pub pending_visibility: RefCell<Vec<(WebView, WebView)>>,
+    /// Screenshot requests for tabs that are not currently displayed: the
+    /// target must be shown and produce a fresh frame before its pixels exist
+    /// in the shared framebuffer. Serviced from the event loop (never inside
+    /// servo callbacks, which run under a painter borrow).
+    pub pending_captures: RefCell<Vec<PendingCapture>>,
+}
+
+pub struct PendingCapture {
+    pub webview: WebView,
+    /// The tab to re-show once the capture is done (the displayed tab).
+    pub restore: Option<WebView>,
+    pub reply: tokio::sync::oneshot::Sender<Outcome>,
+    /// Set by notify_new_frame_ready once the target has painted a frame.
+    pub ready: bool,
+    pub deadline: std::time::Instant,
 }
 
 impl Shared {
-    pub fn apply_pending_visibility(&self) {
-        for (hide, show) in self.pending_visibility.borrow_mut().drain(..) {
-            hide.hide();
-            show.show();
+    /// Capture the shared framebuffer as this webview's screenshot: paint it,
+    /// read the pixels back, then restore the previously-displayed tab.
+    pub fn capture_now(&self, webview: &WebView, restore: Option<WebView>) -> Outcome {
+        webview.paint();
+        let size = self.rendering_context.size2d().to_i32();
+        let rect = euclid::Box2D::from_origin_and_size(
+            euclid::Point2D::origin(),
+            euclid::Size2D::new(size.width, size.height),
+        );
+        let image = self.rendering_context.read_to_image(rect);
+        if let Some(displayed) = restore {
+            webview.hide();
+            displayed.show();
         }
+        match image {
+            Some(image) => encode_screenshot(image),
+            None => Outcome::Error { message: "framebuffer read failed".into() },
+        }
+    }
+
+    /// Service queued background-tab captures whose frame is ready (or whose
+    /// wait timed out — a static page may never produce a new frame).
+    pub fn process_pending_captures(&self) {
+        let mut due = Vec::new();
+        {
+            let mut pending = self.pending_captures.borrow_mut();
+            let now = std::time::Instant::now();
+            let mut index = 0;
+            while index < pending.len() {
+                if pending[index].ready || pending[index].deadline <= now {
+                    due.push(pending.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        for capture in due {
+            let outcome = self.capture_now(&capture.webview, capture.restore);
+            let _ = capture.reply.send(outcome);
+        }
+    }
+
+    /// Earliest deadline among queued captures, for WaitUntil scheduling.
+    pub fn next_capture_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_captures.borrow().iter().map(|c| c.deadline).min()
     }
 }
 
@@ -154,7 +205,21 @@ impl ApplicationHandler<AppEvent> for App {
             window_rendering_context.offscreen_context(window.inner_size()),
         );
 
+        // Persistent engine profile (localStorage, indexeddb, cookies…).
+        // The default is a temp dir, which both discards session state on
+        // exit and failed to initialize ClientStorage's sqlite at all.
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("talaria")
+            .join("servo");
+        let _ = std::fs::create_dir_all(&config_dir);
+        let opts = servo::Opts {
+            config_dir: Some(config_dir),
+            ..Default::default()
+        };
+
         let servo = ServoBuilder::default()
+            .opts(opts)
             .event_loop_waker(Box::new(waker.clone()))
             .build();
         servo.setup_logging();
@@ -175,16 +240,23 @@ impl ApplicationHandler<AppEvent> for App {
             last_cursor: Cell::new(None),
             webview_point: Cell::new(euclid::Point2D::zero()),
             modifiers: Cell::new(ModifiersState::empty()),
-            pending_visibility: RefCell::new(Vec::new()),
+            pending_captures: RefCell::new(Vec::new()),
         });
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
         *self = App::Running(state);
     }
 
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        if let Some(state) = self.state() {
+            state.process_pending_captures();
+            set_wait(event_loop, state);
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         if let Some(state) = self.state() {
-            state.apply_pending_visibility();
+            state.process_pending_captures();
             match event {
                 AppEvent::Wake => {},
                 AppEvent::SessionStarted { session_id, client } => {
@@ -201,8 +273,8 @@ impl ApplicationHandler<AppEvent> for App {
                 },
             }
             state.servo.spin_event_loop();
+            set_wait(event_loop, state);
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
     }
 
     fn window_event(
@@ -214,7 +286,7 @@ impl ApplicationHandler<AppEvent> for App {
         let Some(state) = self.state().cloned() else {
             return;
         };
-        state.apply_pending_visibility();
+        state.process_pending_captures();
 
         let over_toolbar = |state: &Shared| {
             state
@@ -237,6 +309,12 @@ impl ApplicationHandler<AppEvent> for App {
             },
             WindowEvent::ModifiersChanged(modifiers) => {
                 state.modifiers.set(modifiers.state());
+                // egui tracks modifiers from this event too.
+                GUI.with_borrow_mut(|gui| {
+                    if let Some(gui) = gui.as_mut() {
+                        gui.on_window_event(&state.window, &event);
+                    }
+                });
             },
             WindowEvent::CursorMoved { position, .. } => {
                 state.last_cursor.set(Some(*position));
@@ -263,6 +341,8 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::MouseWheel { delta, .. } if !over_toolbar(&state) => {
                 forward_wheel(&state, *delta);
             },
+            WindowEvent::KeyboardInput { event: key_event, .. }
+                if handle_browser_shortcut(&state, key_event) => {},
             WindowEvent::KeyboardInput { event: key_event, .. }
                 if !GUI.with_borrow(|gui| {
                     gui.as_ref().is_some_and(|gui| gui.has_keyboard_focus())
@@ -298,7 +378,65 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         state.servo.spin_event_loop();
-        event_loop.set_control_flow(ControlFlow::Wait);
+        set_wait(event_loop, &state);
+    }
+}
+
+/// Sleep until the next queued capture deadline, or indefinitely if none.
+fn set_wait(event_loop: &ActiveEventLoop, state: &Rc<Shared>) {
+    let flow = match state.next_capture_deadline() {
+        Some(deadline) => ControlFlow::WaitUntil(deadline),
+        None => ControlFlow::Wait,
+    };
+    event_loop.set_control_flow(flow);
+}
+
+/// Standard browser keyboard shortcuts, intercepted before both egui and the
+/// page: Ctrl+L (focus URL bar), Ctrl+T (new tab), Ctrl+W (close tab),
+/// Ctrl+R / F5 (reload). Returns true when the event was consumed.
+fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEvent) -> bool {
+    use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamedKey};
+
+    if key_event.state != ElementState::Pressed {
+        return false;
+    }
+    let ctrl = state.modifiers.get().control_key();
+    let action = match &key_event.logical_key {
+        WinitKey::Character(c) if ctrl => match c.to_lowercase().as_str() {
+            "l" => {
+                GUI.with_borrow_mut(|gui| {
+                    if let Some(gui) = gui.as_mut() {
+                        gui.focus_location_bar();
+                    }
+                });
+                state.window.request_redraw();
+                return true;
+            },
+            "t" => Some(UiAction::NewTab),
+            "w" => state
+                .tabs
+                .borrow()
+                .displayed()
+                .map(|tab| UiAction::CloseTab(tab.id)),
+            "r" => Some(UiAction::Reload),
+            _ => None,
+        },
+        WinitKey::Named(WinitNamedKey::F5) => Some(UiAction::Reload),
+        WinitKey::Named(WinitNamedKey::Tab) if ctrl => {
+            let forward = !state.modifiers.get().shift_key();
+            state.tabs.borrow_mut().cycle(forward);
+            state.window.request_redraw();
+            return true;
+        },
+        _ => None,
+    };
+    match action {
+        Some(action) => {
+            apply_ui_actions(state, vec![action]);
+            state.window.request_redraw();
+            true
+        },
+        None => false,
     }
 }
 
@@ -388,11 +526,8 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
             UiAction::SwitchMode(mode) => {
                 let mut tabs = state.tabs.borrow_mut();
                 tabs.mode = mode;
-                let shown = tabs.active_id(mode);
+                tabs.sync_visibility();
                 drop(tabs);
-                if let Some(id) = shown {
-                    state.tabs.borrow_mut().set_active(id);
-                }
                 state.window.request_redraw();
             },
             UiAction::Go(input) => {
@@ -436,7 +571,26 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                     tab.webview.reload();
                 }
             },
+            UiAction::ReloadCrashed(id) => {
+                if let Some(tab) = state.tabs.borrow_mut().get_mut(id) {
+                    tab.crashed = false;
+                    tab.webview.reload();
+                }
+            },
         }
+    }
+}
+
+/// Agent-supplied URLs: accept scheme-less hosts ("example.com") by assuming
+/// https, but never fall back to a search query — an agent that meant to
+/// search should do so explicitly.
+fn parse_agent_url(input: &str) -> Result<Url, url::ParseError> {
+    match Url::parse(input) {
+        Ok(url) => Ok(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) if !input.contains(' ') => {
+            Url::parse(&format!("https://{input}"))
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -472,6 +626,12 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             .ok_or(Outcome::Error { message: format!("no tab {tab_id}") })
     };
 
+    // Crashed tabs reject page-level commands with a tool error (per SPEC's
+    // crash-recovery decision); `navigate` recovers the tab instead.
+    let crashed = |tab_id: u64| -> bool {
+        state.tabs.borrow().get(tab_id).is_some_and(|t| t.crashed)
+    };
+
     match command {
         Command::TabsList => {
             let tabs = state.tabs.borrow();
@@ -490,7 +650,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             let _ = reply.send(Outcome::Ok { result: ResultPayload::Tabs { tabs: infos } });
         },
         Command::TabsOpen { url } => {
-            match Url::parse(&url) {
+            match parse_agent_url(&url) {
                 Ok(url) => {
                     let id = state.open_tab(url, TabOwner::Agent { session_id, client });
                     let tabs = state.tabs.borrow();
@@ -528,11 +688,12 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
         },
         Command::Navigate { tab_id, url } => {
-            match (webview_for(tab_id), Url::parse(&url)) {
+            match (webview_for(tab_id), parse_agent_url(&url)) {
                 (Ok(webview), Ok(url)) => {
                     if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
                         tab.location = url.to_string();
                         tab.location_dirty = false;
+                        tab.crashed = false;
                     }
                     webview.load(url);
                     let _ = reply.send(Outcome::Ok { result: ResultPayload::Empty {} });
@@ -546,6 +707,26 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
         },
         Command::Evaluate { tab_id, script } => {
+            // Test hook: lets e2e tests exercise the crash-recovery path
+            // without needing a real WebContent crash.
+            if script == "__talaria_sim_crash__"
+                && std::env::var("TALARIA_TEST_HOOKS").as_deref() == Ok("1")
+            {
+                if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
+                    tab.crashed = true;
+                    state.window.request_redraw();
+                    let _ = reply.send(Outcome::Ok { result: ResultPayload::Empty {} });
+                } else {
+                    let _ = reply.send(Outcome::Error { message: format!("no tab {tab_id}") });
+                }
+                return;
+            }
+            if crashed(tab_id) {
+                let _ = reply.send(Outcome::Error {
+                    message: format!("tab {tab_id} crashed — navigate it to recover"),
+                });
+                return;
+            }
             match webview_for(tab_id) {
                 Ok(webview) => {
                     webview.evaluate_javascript(script, move |result| {
@@ -564,44 +745,45 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
         },
         Command::Screenshot { tab_id } => {
+            if crashed(tab_id) {
+                let _ = reply.send(Outcome::Error {
+                    message: format!("tab {tab_id} crashed — navigate it to recover"),
+                });
+                return;
+            }
             match webview_for(tab_id) {
                 Ok(webview) => {
-                    // All webviews share one offscreen framebuffer, and
-                    // `WebView::take_screenshot` reads whatever was composited
-                    // last (i.e. the displayed tab). Instead: un-hide the
-                    // target, paint it into the framebuffer, read the pixels
-                    // back synchronously, then restore the displayed tab.
-                    // No servo callback involved, so no painter re-entrancy.
+                    // The shared offscreen framebuffer holds the displayed
+                    // tab's pixels. A displayed tab can be captured
+                    // immediately; a background tab must first be shown and
+                    // paint a fresh frame (its pipeline is throttled while
+                    // hidden), so it goes through the pending-capture queue
+                    // and is serviced on notify_new_frame_ready or timeout.
                     let restore = state
                         .tabs
                         .borrow()
                         .displayed()
                         .map(|t| t.webview.clone())
                         .filter(|displayed| *displayed != webview);
-                    if restore.is_some() {
-                        webview.show();
+                    match restore {
+                        None => {
+                            let outcome = state.capture_now(&webview, None);
+                            let _ = reply.send(outcome);
+                        },
+                        Some(displayed) => {
+                            displayed.hide();
+                            webview.show();
+                            state.pending_captures.borrow_mut().push(PendingCapture {
+                                webview,
+                                restore: Some(displayed),
+                                reply,
+                                ready: false,
+                                deadline: std::time::Instant::now()
+                                    + std::time::Duration::from_millis(1500),
+                            });
+                            state.window.request_redraw();
+                        },
                     }
-                    webview.paint();
-                    let size = state.rendering_context.size2d().to_i32();
-                    let rect = euclid::Box2D::from_origin_and_size(
-                        euclid::Point2D::origin(),
-                        euclid::Size2D::new(size.width, size.height),
-                    );
-                    let image = state.rendering_context.read_to_image(rect);
-                    // KNOWN ISSUE: for a tab that is not currently displayed,
-                    // this still captures the displayed tab's pixels — a
-                    // hidden webview's paint() appears not to reach the shared
-                    // framebuffer. Screenshots of the *displayed* tab are
-                    // correct. Tracked in OVERNIGHT_LOG.md.
-                    if let Some(displayed) = restore {
-                        webview.hide();
-                        displayed.show();
-                    }
-                    let outcome = match image {
-                        Some(image) => encode_screenshot(image),
-                        None => Outcome::Error { message: "framebuffer read failed".into() },
-                    };
-                    let _ = reply.send(outcome);
                 },
                 Err(outcome) => {
                     let _ = reply.send(outcome);
@@ -633,9 +815,15 @@ fn js_value_to_json(value: servo::JSValue) -> serde_json::Value {
     match value {
         servo::JSValue::Undefined | servo::JSValue::Null => Value::Null,
         servo::JSValue::Boolean(b) => Value::Bool(b),
-        servo::JSValue::Number(n) => serde_json::Number::from_f64(n)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        servo::JSValue::Number(n) => {
+            // Integral doubles serialize as integers ("42", not "42.0") so
+            // agents comparing against JSON integers aren't surprised.
+            if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
+                Value::Number(serde_json::Number::from(n as i64))
+            } else {
+                serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null)
+            }
+        },
         servo::JSValue::String(s) => Value::String(s),
         servo::JSValue::Element(s) => Value::String(format!("[element {s}]")),
         servo::JSValue::ShadowRoot(s) => Value::String(format!("[shadow-root {s}]")),
@@ -696,7 +884,24 @@ fn download(url: &str, filename: &str) -> Outcome {
 }
 
 impl servo::WebViewDelegate for Shared {
-    fn notify_new_frame_ready(&self, _webview: WebView) {
+    fn request_navigation(
+        &self,
+        _webview: WebView,
+        navigation_request: servo::NavigationRequest,
+    ) {
+        // The default delegate drops the request, which blocks link-click
+        // navigation entirely. Talaria is not a policy layer: allow all.
+        navigation_request.allow();
+    }
+
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        // Runs inside servo's painter borrow: only mark state, never paint
+        // or toggle visibility here.
+        if let Ok(mut pending) = self.pending_captures.try_borrow_mut() {
+            for capture in pending.iter_mut().filter(|c| c.webview == webview) {
+                capture.ready = true;
+            }
+        }
         self.window.request_redraw();
     }
 

@@ -26,6 +26,29 @@ cargo run --release -p talaria-shell -- https://example.com
 Requires Rust ≥ 1.88 and Servo's Linux/macOS build prerequisites (`python3`, `pkg-config`,
 `cmake`, `clang`, fontconfig/freetype dev headers).
 
+## Connecting an agent (MCP)
+
+With the Talaria browser running, point any MCP client at the `talaria-mcp`
+stdio server. Claude Desktop example (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "talaria": { "command": "/path/to/target/release/talaria-mcp" }
+  }
+}
+```
+
+Tools: `tabs_list`, `tabs_open`, `tabs_close`, `tabs_focus`, `navigate`,
+`evaluate` (arbitrary in-page JS — the primary interaction primitive),
+`screenshot`, `cookies_read`, `download`. Tabs opened by an agent appear in
+the browser's **Agents** view, labeled by the client's MCP identity; switch
+to that view to watch the session live or take it over directly (e.g. to
+complete a login), then let the agent continue.
+
+Keyboard: `Ctrl+L` URL bar, `Ctrl+T` new tab, `Ctrl+W` close tab,
+`Ctrl+Tab`/`Ctrl+Shift+Tab` cycle tabs, `Ctrl+R`/`F5` reload.
+
 ## License
 
 Talaria is dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).

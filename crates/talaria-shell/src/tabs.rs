@@ -115,6 +115,7 @@ impl TabManager {
         if self.active_agent == Some(id) {
             self.active_agent = self.tabs.iter().rev().find(|t| t.owner.is_agent()).map(|t| t.id);
         }
+        self.sync_visibility();
         true
     }
 
@@ -124,20 +125,30 @@ impl TabManager {
         let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
             return;
         };
-        let previous = if tab.owner.is_agent() {
-            self.active_agent.replace(id)
+        if tab.owner.is_agent() {
+            self.active_agent = Some(id);
         } else {
-            self.active_me.replace(id)
-        };
-        if previous != Some(id) {
-            if let Some(prev) = previous.and_then(|p| self.get(p)) {
-                prev.webview.hide();
-                prev.webview.blur();
+            self.active_me = Some(id);
+        }
+        self.sync_visibility();
+    }
+
+    /// Invariant: exactly the displayed tab is shown (and focused); every
+    /// other webview is hidden. This matters beyond bookkeeping — a webview's
+    /// hidden→shown transition is what makes servo produce a fresh frame, and
+    /// `paint()` without a fresh frame is a no-op that leaves the shared
+    /// framebuffer stale (the "view switched but page didn't" bug).
+    pub fn sync_visibility(&self) {
+        let displayed_id = self.displayed().map(|tab| tab.id);
+        for tab in &self.tabs {
+            if Some(tab.id) == displayed_id {
+                tab.webview.show();
+                tab.webview.focus();
+            } else {
+                tab.webview.hide();
+                tab.webview.blur();
             }
         }
-        let tab = self.get(id).expect("checked above");
-        tab.webview.show();
-        tab.webview.focus();
     }
 
     pub fn get(&self, id: u64) -> Option<&Tab> {
@@ -182,6 +193,27 @@ impl TabManager {
 
     pub fn iter(&self) -> impl Iterator<Item = &Tab> {
         self.tabs.iter()
+    }
+
+    /// Cycle the active tab within the current view (Ctrl+Tab / Ctrl+Shift+Tab).
+    pub fn cycle(&mut self, forward: bool) {
+        let ids: Vec<u64> = match self.mode {
+            ViewMode::Me => self.me_tabs().map(|t| t.id).collect(),
+            ViewMode::Agents => self.agent_tabs().map(|t| t.id).collect(),
+        };
+        if ids.len() < 2 {
+            return;
+        }
+        let current = self.active_id(self.mode);
+        let position = current
+            .and_then(|id| ids.iter().position(|&i| i == id))
+            .unwrap_or(0);
+        let next = if forward {
+            (position + 1) % ids.len()
+        } else {
+            (position + ids.len() - 1) % ids.len()
+        };
+        self.set_active(ids[next]);
     }
 
     pub fn me_tabs(&self) -> impl Iterator<Item = &Tab> {

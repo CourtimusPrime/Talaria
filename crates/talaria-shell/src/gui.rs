@@ -30,6 +30,8 @@ pub enum UiAction {
     Back,
     Forward,
     Reload,
+    /// Reload a crashed tab: clears the crashed flag and reloads the page.
+    ReloadCrashed(u64),
 }
 
 pub struct Gui {
@@ -63,6 +65,13 @@ impl Gui {
 
     pub fn has_keyboard_focus(&self) -> bool {
         self.context.egui_ctx.memory(|memory| memory.focused().is_some())
+    }
+
+    /// Focus the URL bar (Ctrl+L) and select its contents.
+    pub fn focus_location_bar(&self) {
+        self.context.egui_ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new("location-bar"));
+        });
     }
 
     pub fn surrender_focus(&self) {
@@ -100,25 +109,37 @@ impl Gui {
                     ui.separator();
 
                     let has_tab = tabs.displayed().is_some();
-                    if ui.add_enabled(has_tab, egui::Button::new("←")).clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new("<")).on_hover_text("Back").clicked() {
                         actions.push(UiAction::Back);
                     }
-                    if ui.add_enabled(has_tab, egui::Button::new("→")).clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new(">")).on_hover_text("Forward").clicked() {
                         actions.push(UiAction::Forward);
                     }
-                    if ui.add_enabled(has_tab, egui::Button::new("⟳")).clicked() {
+                    if ui
+                        .add_enabled(has_tab, egui::Button::new("R"))
+                        .on_hover_text("Reload (Ctrl+R)")
+                        .clicked()
+                    {
                         actions.push(UiAction::Reload);
                     }
 
-                    let new_tab = ui.button("＋").clicked();
+                    let new_tab = ui.button("+").on_hover_text("New tab (Ctrl+T)").clicked();
                     if new_tab {
                         actions.push(UiAction::NewTab);
                     }
 
+                    if let Some(tab) = tabs.displayed() {
+                        if tab.webview.load_status() != servo::LoadStatus::Complete
+                            && !tab.crashed
+                        {
+                            ui.spinner();
+                        }
+                    }
                     if let Some(tab) = tabs.displayed_mut() {
                         let response = ui.add_sized(
                             ui.available_size(),
                             egui::TextEdit::singleline(&mut tab.location)
+                                .id(egui::Id::new("location-bar"))
                                 .hint_text("Search or enter address"),
                         );
                         if response.changed() {
@@ -149,10 +170,14 @@ impl Gui {
                             if tab.crashed {
                                 label = format!("💥 {label}");
                             }
-                            if ui.selectable_label(active == Some(tab.id), label).clicked() {
+                            if ui
+                                .selectable_label(active == Some(tab.id), label)
+                                .on_hover_text(&tab.location)
+                                .clicked()
+                            {
                                 actions.push(UiAction::SelectTab(tab.id));
                             }
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("x").on_hover_text("Close tab").clicked() {
                                 actions.push(UiAction::CloseTab(tab.id));
                             }
                             ui.separator();
@@ -179,11 +204,14 @@ impl Gui {
                                 if tab.crashed {
                                     label = format!("💥 {label}");
                                 }
-                                if ui.selectable_label(active == Some(tab.id), label).clicked()
+                                if ui
+                                    .selectable_label(active == Some(tab.id), label)
+                                    .on_hover_text(&tab.location)
+                                    .clicked()
                                 {
                                     actions.push(UiAction::SelectTab(tab.id));
                                 }
-                                if ui.small_button("✕").clicked() {
+                                if ui.small_button("x").on_hover_text("Close tab").clicked() {
                                     actions.push(UiAction::CloseTab(tab.id));
                                 }
                                 ui.separator();
@@ -197,8 +225,31 @@ impl Gui {
             shared.toolbar_height.set(available.min.y);
             let scale = ctx.pixels_per_point();
 
-            let displayed = tabs.displayed().map(|tab| tab.webview.clone());
+            let crashed_tab = tabs
+                .displayed()
+                .filter(|tab| tab.crashed)
+                .map(|tab| tab.id);
+            let displayed = tabs
+                .displayed()
+                .filter(|tab| !tab.crashed)
+                .map(|tab| tab.webview.clone());
             drop(tabs);
+
+            if let Some(tab_id) = crashed_tab {
+                // Crashed state replaces the page (same shape as "Aw, Snap").
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ui.available_height() * 0.35);
+                        ui.heading("💥 This tab crashed");
+                        ui.label("The page's rendering process went away.");
+                        ui.add_space(8.0);
+                        if ui.button("Reload").clicked() {
+                            actions.push(UiAction::ReloadCrashed(tab_id));
+                        }
+                    });
+                });
+            }
+
             if let Some(webview) = displayed {
                 let width = (available.width() * scale).round().max(1.0) as u32;
                 let height = (available.height() * scale).round().max(1.0) as u32;
