@@ -27,6 +27,7 @@ tracing = "0.1"
 egui = "0.34.3"
 egui-winit = "0.34.3"
 egui_glow = { version = "0.34.3", features = ["winit"] }
+egui-phosphor = "0.12"
 glow = "0.17"
 # Shell plumbing
 talaria-protocol = { path = "crates/talaria-protocol" }

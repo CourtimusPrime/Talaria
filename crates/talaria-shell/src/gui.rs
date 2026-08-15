@@ -52,6 +52,9 @@ impl Gui {
             None,
             false,
         );
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        context.egui_ctx.set_fonts(fonts);
         Self { context, rendering_context }
     }
 
@@ -108,21 +111,21 @@ impl Gui {
                     ui.separator();
 
                     let has_tab = tabs.displayed().is_some();
-                    if ui.add_enabled(has_tab, egui::Button::new("<")).on_hover_text("Back").clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new(egui_phosphor::regular::ARROW_LEFT)).on_hover_text("Back").clicked() {
                         actions.push(UiAction::Back);
                     }
-                    if ui.add_enabled(has_tab, egui::Button::new(">")).on_hover_text("Forward").clicked() {
+                    if ui.add_enabled(has_tab, egui::Button::new(egui_phosphor::regular::ARROW_RIGHT)).on_hover_text("Forward").clicked() {
                         actions.push(UiAction::Forward);
                     }
                     if ui
-                        .add_enabled(has_tab, egui::Button::new("R"))
+                        .add_enabled(has_tab, egui::Button::new(egui_phosphor::regular::ARROW_CLOCKWISE))
                         .on_hover_text("Reload (Ctrl+R)")
                         .clicked()
                     {
                         actions.push(UiAction::Reload);
                     }
 
-                    let new_tab = ui.button("+").on_hover_text("New tab (Ctrl+T)").clicked();
+                    let new_tab = ui.button(egui_phosphor::regular::PLUS).on_hover_text("New tab (Ctrl+T)").clicked();
                     if new_tab {
                         actions.push(UiAction::NewTab);
                     }
@@ -176,7 +179,7 @@ impl Gui {
                             {
                                 actions.push(UiAction::SelectTab(tab.id));
                             }
-                            if ui.small_button("x").on_hover_text("Close tab").clicked() {
+                            if ui.small_button(egui_phosphor::regular::X).on_hover_text("Close tab").clicked() {
                                 actions.push(UiAction::CloseTab(tab.id));
                             }
                             ui.separator();
@@ -199,7 +202,7 @@ impl Gui {
                                     .filter(|t| !t.is_empty())
                                     .unwrap_or_else(|| tab.location.clone());
                                 title.truncate(24);
-                                let mut label = format!("🤖 {} · {title}", tab.owner.label());
+                                let mut label = format!("{} {} · {title}", egui_phosphor::regular::ROBOT, tab.owner.label());
                                 if tab.crashed {
                                     label = format!("💥 {label}");
                                 }
@@ -210,7 +213,7 @@ impl Gui {
                                 {
                                     actions.push(UiAction::SelectTab(tab.id));
                                 }
-                                if ui.small_button("x").on_hover_text("Close tab").clicked() {
+                                if ui.small_button(egui_phosphor::regular::X).on_hover_text("Close tab").clicked() {
                                     actions.push(UiAction::CloseTab(tab.id));
                                 }
                                 ui.separator();
