@@ -29,6 +29,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         .or_else(|_| Url::parse(&format!("https://{input}")))
         .unwrap_or_else(|_| app::resolve_location(&input));
 
+    // Single instance: a running Talaria owns the control socket (and the
+    // engine profile). Hand it the URL and exit rather than stealing the
+    // socket path — the first instance would otherwise become unreachable
+    // to agents the moment we quit.
+    match control::forward_to_running_instance(url.as_str()) {
+        Ok(true) => {
+            eprintln!("Talaria is already running — opened {url} there.");
+            return Ok(());
+        },
+        Ok(false) => {},
+        Err(error) => {
+            eprintln!("Talaria appears to be running but did not accept the URL ({error}); starting anyway.");
+        },
+    }
+
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     control::spawn(event_loop.create_proxy());
     let mut app = App::new(&event_loop, url);

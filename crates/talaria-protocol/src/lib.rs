@@ -53,6 +53,10 @@ pub enum Command {
     /// Credential-vault lookup by domain (autofill/session reuse, per SPEC).
     CookiesRead { domain: String },
     Download { url: String, filename: String },
+    /// Open a tab in the *human's* (Me) view and bring the window forward.
+    /// Used by a second `talaria` launch to hand its URL to the running
+    /// instance (single-instance behaviour); not exposed as an MCP tool.
+    OpenForUser { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

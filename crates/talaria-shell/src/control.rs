@@ -25,6 +25,55 @@ pub struct AgentRequest {
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
+/// If another Talaria already owns the control socket, hand it `url` to open
+/// in the human's view and return `Ok(true)`; `Ok(false)` when no live
+/// instance answers (a stale socket file is fine — bind removes it). Runs
+/// before the event loop exists, so it uses blocking std sockets.
+pub fn forward_to_running_instance(url: &str) -> std::io::Result<bool> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let path = socket_path();
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        // Nothing listening (or never created): we're the first instance.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false)
+        },
+        Err(error) => return Err(error),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    let mut send = |message: &ClientMessage| -> std::io::Result<()> {
+        let mut data = serde_json::to_vec(message).expect("serializable");
+        data.push(b'\n');
+        stream.write_all(&data)
+    };
+    send(&ClientMessage::Hello { client: "talaria-launcher".into() })?;
+    send(&ClientMessage::Request { id: 1, command: Command::OpenForUser { url: url.to_owned() } })?;
+    let mut lines = BufReader::new(stream).lines();
+    let ack = lines.next().transpose()?;
+    if !matches!(
+        ack.as_deref().map(serde_json::from_str::<ServerMessage>),
+        Some(Ok(ServerMessage::HelloAck { .. }))
+    ) {
+        return Ok(false); // Something else owns the path; start normally.
+    }
+    match lines.next().transpose()?.as_deref().map(serde_json::from_str::<ServerMessage>) {
+        Some(Ok(ServerMessage::Reply { outcome: Outcome::Ok { .. }, .. })) => Ok(true),
+        Some(Ok(ServerMessage::Reply { outcome: Outcome::Error { message }, .. })) => {
+            Err(std::io::Error::other(message))
+        },
+        _ => Ok(false),
+    }
+}
+
 pub fn spawn(proxy: EventLoopProxy<AppEvent>) {
     std::thread::Builder::new()
         .name("talaria-control".into())

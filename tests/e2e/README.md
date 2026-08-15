@@ -10,7 +10,8 @@ Require a built `target/release/talaria` (+ `talaria-mcp`) and Xvfb.
   already running with `DISPLAY` set, e.g. started by the runner above).
 
 - `run_all.py` — the whole regression: one shell for the socket-driven suites
-  (control_socket, crash_recovery, crash_event, timeout_session, mcp_client),
+  (control_socket, crash_recovery, crash_event, timeout_session, mcp_client,
+  single_instance),
   then the standalone keyboard_nav and takeover suites.
 
 ```sh

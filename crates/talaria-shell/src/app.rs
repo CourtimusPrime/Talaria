@@ -1016,6 +1016,19 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             let entries = state.vault.borrow().matching(&domain);
             let _ = reply.send(Outcome::Ok { result: ResultPayload::Credentials { entries } });
         },
+        Command::OpenForUser { url } => {
+            let url = resolve_location(&url);
+            let id = state.open_tab(url, TabOwner::Me);
+            {
+                let mut tabs = state.tabs.borrow_mut();
+                tabs.mode = ViewMode::Me;
+                tabs.sync_visibility();
+            }
+            state.window.focus_window();
+            state.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+            state.window.request_redraw();
+            state.reply_after_load(id, false, reply);
+        },
         Command::Download { url, filename } => {
             if filename.contains('/') || filename.contains("..") {
                 let _ = reply.send(Outcome::Error { message: "bad filename".into() });
