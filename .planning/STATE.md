@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
 status: executing
-stopped_at: Completed 02-06-PLAN.md
-last_updated: "2026-08-16T07:43:10.536Z"
+stopped_at: Completed 02-07-PLAN.md
+last_updated: "2026-08-16T08:14:50.693Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 11
-  completed_plans: 6
+  completed_plans: 7
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
-Plan: 7 of 11
+Plan: 8 of 11
 Status: Ready to execute
 Last activity: 2026-08-16 — Phase 02 execution started
 
-Progress: [██████░░░░] 55%
+Progress: [██████░░░░] 64%
 
 ## Performance Metrics
 
@@ -64,6 +64,7 @@ Progress: [██████░░░░] 55%
 | Phase 02 P04 | 26min | 3 tasks | 4 files |
 | Phase 02 P05 | 49min | 3 tasks | 4 files |
 | Phase 02 P06 | 41min | 3 tasks | 3 files |
+| Phase 02 P07 | 47min | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -91,6 +92,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 02-06: the evaluate in-flight completion flag is an Rc<Cell<bool>> — a Cell set is infallible and borrow-free, so a servo callback cannot silently drop it and leave a healthy tab permanently refused
 - [Phase ?]: 02-06: the in-flight entry expires on its own deadline as well as its flag, so a lost engine callback self-heals; that deadline is registered with next_capture_deadline because a deadline nothing wakes for is not a deadline
 - [Phase ?]: 02-06: MCP-10 stays In Progress — the second evaluate now fails fast, but the first still burns the timeout; completing it needs an upstream libservo slow-script interrupt
+- [Phase ?]: 02-07: lifecycle events are addressed to the tab's owning session, not broadcast; PendingEvent carries a plain session id so a human-owned tab produces no entry at all
+- [Phase ?]: 02-07: the four tab-table delegate callbacks defer to a pending_tab_work queue on a busy table instead of skipping; the two marking callbacks log at error level, since their queues are never held across a servo call
+- [Phase ?]: 02-07: AGENT-04 stays In Progress — the shell half is done, plan 02-08 owns the MCP notification half
 
 ### Pending Todos
 
@@ -113,6 +117,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T07:43:05.226Z
-Stopped at: Completed 02-06-PLAN.md
+Last session: 2026-08-16T08:14:50.688Z
+Stopped at: Completed 02-07-PLAN.md
 Resume file: None

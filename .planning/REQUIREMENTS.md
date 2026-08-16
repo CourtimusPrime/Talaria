@@ -28,7 +28,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 - [x] **AGENT-01**: User can toggle between "Me" tabs and "Agents" tabs from a single control — *Must Have*
 - [x] **AGENT-02**: While viewing an agent's tab, user input (click/scroll/type) drives that same live session (takeover) — *Must Have*
 - [x] **AGENT-03**: Multiple concurrent agent sessions are each visible and distinguishable in the Agents view — *Should Have*
-- [ ] **AGENT-04**: Tab open/close/crash events reach MCP clients as MCP notifications, not only via polling — *Should Have* — **partial**: events exist on the control socket (`crates/talaria-protocol/src/lib.rs:71-77`) but the MCP proxy discards them (`crates/talaria-mcp/src/socket.rs:75-77`)
+- [ ] **AGENT-04**: Tab open/close/crash events reach MCP clients as MCP notifications, not only via polling — *Should Have* — **partial**: plan 02-07 made the shell half correct — crash and close events are now addressed to the one session that owns the tab (a human-owned tab produces none) and are queued and drained from the event loop instead of being dropped under reentrancy. The MCP proxy still discards them (`crates/talaria-mcp/src/socket.rs`), so nothing reaches an MCP client yet; plan 02-08 owns that half
 
 ### MCP Tool Surface (MCP)
 
@@ -143,7 +143,7 @@ Deferred. Tracked but not in the current roadmap.
 | MCP-12 | Phase 2 | Complete |
 | SEC-01 | Phase 2 | Complete |
 | SEC-02 | Phase 2 | Pending |
-| AGENT-04 | Phase 2 | Pending |
+| AGENT-04 | Phase 2 | In Progress |
 | CRED-02 | Phase 2 | Pending |
 | CRED-03 | Phase 2 | Pending |
 | TEST-03 | Phase 2 | In Progress |
