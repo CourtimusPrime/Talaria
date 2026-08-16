@@ -2,7 +2,21 @@
 
 Out-of-scope discoveries logged during execution. Not fixed here.
 
-## `cargo clippy --all-targets -- -D warnings` is red at the phase baseline
+## ~~`cargo clippy --all-targets -- -D warnings` is red at the phase baseline~~ — RESOLVED by plan 02-11
+
+**Resolved 2026-08-16 in commit `b29b32e`.** Plan 02-11 took the "fix them"
+branch, not the "narrow the gate" branch: the CI job runs the full
+`cargo clippy --all-targets -- -D warnings` with no allow-list at the command
+line, and the command exits 0 at the phase tip. Two lints were fixed in code
+(the redundant closure became point-free; four `f32 -> f32` casts were dropped),
+and two were accepted in place with a justifying comment — the `tool_box!`
+variant postfix, whose variant names the macro generates rather than this crate
+choosing them, and `TabManager::open`'s arity, which has one caller and whose
+arguments are all engine handles. Behaviour was held constant: `cargo test` 9/9
+and the full e2e suite 14/14 PASS, including `takeover_test` and
+`keyboard_nav_test`, which drive the exact mouse paths the cast removal touched.
+
+The original entry follows for the record.
 
 Found during plan 02-02, Task 1. Several plans in this phase carry
 `cargo clippy --all-targets -- -D warnings` as an acceptance criterion. That

@@ -1,5 +1,13 @@
 # Talaria
 
+[![CI](https://github.com/court/talaria/actions/workflows/ci.yml/badge.svg)](https://github.com/court/talaria/actions/workflows/ci.yml)
+
+<!-- The badge target is derived from the `repository` field in Cargo.toml. This
+     checkout has no git remote configured, so the workflow has never run and the
+     badge will read "no status" until the repository is pushed. Check it on the
+     first push: a badge pointing at the wrong owner/repo renders as no status
+     too, which looks identical to a pipeline that has simply not run yet. -->
+
 A lightweight, lightning-fast web browser for humans and agents.
 
 Talaria embeds [Servo](https://servo.org) (via the `servo` crate, a.k.a. libservo) as its
