@@ -7,6 +7,11 @@
 //! Per SPEC: this vault backs autofill suggestion and `cookies.read` session
 //! reuse. It is *not* an agent-driven login mechanism — fresh logins happen
 //! via human takeover.
+//!
+//! The vault is writable from inside the shell: [`Vault::upsert`] and
+//! [`Vault::delete`] are the capture path a credentials panel drives, keyed on
+//! an entry's URL host plus its username. Both persist immediately, so a
+//! caller never has to remember a second step.
 
 use std::fs;
 use std::io::Write;
@@ -22,6 +27,21 @@ pub struct Vault {
     path: PathBuf,
     cipher: Option<ChaCha20Poly1305>,
     entries: Vec<CredentialEntry>,
+}
+
+/// The host an entry keys on: its URL's host, lowercased. `None` when the URL
+/// does not parse into a host — a bare hostname a user typed into a
+/// credentials panel is the common case, and it has no key to match on.
+fn entry_host(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+}
+
+/// A domain as the matching and delete paths compare it: trimmed, stripped of
+/// a leading dot, lowercased.
+fn normalise_domain(domain: &str) -> String {
+    domain.trim().trim_start_matches('.').to_ascii_lowercase()
 }
 
 fn config_dir() -> PathBuf {
@@ -148,20 +168,72 @@ impl Vault {
         }
     }
 
+    /// Store `entry`, replacing the existing entry with the same URL host and
+    /// username, and persist. The key is the host, not the whole URL, so
+    /// re-saving the same login from a different page of the same site
+    /// updates it rather than accumulating near-duplicates.
+    ///
+    /// An entry whose URL does not parse into a host has no key to match on,
+    /// so it is appended rather than replacing anything. A user typing a bare
+    /// hostname into a credentials panel is a real case, and keeping an
+    /// unmatched entry is better than silently discarding their input.
+    // Allowed dead: this is the storage half of the credentials capture path.
+    // The chrome that calls it lands in plan 02-10, and this crate is a binary,
+    // so until then a `pub` method reads as unreachable from the crate root.
+    #[allow(dead_code)]
+    pub fn upsert(&mut self, entry: CredentialEntry) {
+        let host = entry_host(&entry.url);
+        let existing = host.and_then(|host| {
+            self.entries.iter().position(|candidate| {
+                candidate.username == entry.username
+                    && entry_host(&candidate.url).is_some_and(|candidate| candidate == host)
+            })
+        });
+        match existing {
+            Some(index) => self.entries[index] = entry,
+            None => self.entries.push(entry),
+        }
+        self.save();
+    }
+
+    /// Remove the entry keyed on `host` and `username`, reporting whether one
+    /// was there. Persists only when something was actually removed.
+    // Allowed dead for the same reason as [`Vault::upsert`].
+    #[allow(dead_code)]
+    pub fn delete(&mut self, host: &str, username: &str) -> bool {
+        let host = normalise_domain(host);
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            !(entry.username == username
+                && entry_host(&entry.url).is_some_and(|candidate| candidate == host))
+        });
+        let removed = self.entries.len() != before;
+        if removed {
+            self.save();
+        }
+        removed
+    }
+
+    /// Every stored entry, borrowed so a UI can list them without cloning the
+    /// whole vector. Pairs with [`Vault::matching`], which clones because its
+    /// result crosses the control socket.
+    // Allowed dead for the same reason as [`Vault::upsert`].
+    #[allow(dead_code)]
+    pub fn entries(&self) -> &[CredentialEntry] {
+        &self.entries
+    }
+
     /// Entries whose URL host matches `domain` (exact or subdomain).
     pub fn matching(&self, domain: &str) -> Vec<CredentialEntry> {
-        let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+        let domain = normalise_domain(domain);
         self.entries
             .iter()
             .filter(|entry| {
-                url::Url::parse(&entry.url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-                    .is_some_and(|host| {
-                        host == domain
-                            || host.ends_with(&format!(".{domain}"))
-                            || domain.ends_with(&format!(".{host}"))
-                    })
+                entry_host(&entry.url).is_some_and(|host| {
+                    host == domain
+                        || host.ends_with(&format!(".{domain}"))
+                        || domain.ends_with(&format!(".{host}"))
+                })
             })
             .cloned()
             .collect()
@@ -181,19 +253,84 @@ mod tests {
         }
     }
 
+    fn login(url: &str, username: &str, password: &str) -> CredentialEntry {
+        CredentialEntry {
+            url: url.to_owned(),
+            username: username.to_owned(),
+            password: password.to_owned(),
+            cookies: Vec::new(),
+        }
+    }
+
+    /// A vault with no cipher: [`Vault::save`] returns early, so the write
+    /// paths below never touch disk or the keychain.
+    fn detached(entries: Vec<CredentialEntry>) -> Vault {
+        Vault { path: PathBuf::new(), cipher: None, entries }
+    }
+
     #[test]
     fn domain_matching() {
-        let vault = Vault {
-            path: PathBuf::new(),
-            cipher: None,
-            entries: vec![
-                entry("https://accounts.google.com/signin"),
-                entry("https://github.com/login"),
-            ],
-        };
+        let vault = detached(vec![
+            entry("https://accounts.google.com/signin"),
+            entry("https://github.com/login"),
+        ]);
         assert_eq!(vault.matching("google.com").len(), 1);
         assert_eq!(vault.matching("accounts.google.com").len(), 1);
         assert_eq!(vault.matching("github.com").len(), 1);
         assert_eq!(vault.matching("example.com").len(), 0);
+    }
+
+    #[test]
+    fn upsert_appends_a_new_entry() {
+        let mut vault = detached(Vec::new());
+        vault.upsert(login("https://github.com/login", "court", "first"));
+        assert_eq!(vault.entries().len(), 1);
+        assert_eq!(vault.entries()[0].username, "court");
+    }
+
+    #[test]
+    fn upsert_replaces_the_same_host_and_username() {
+        let mut vault = detached(Vec::new());
+        vault.upsert(login("https://github.com/login", "court", "first"));
+        vault.upsert(login("https://github.com/login", "court", "second"));
+        assert_eq!(vault.entries().len(), 1, "the repeated save appended a duplicate");
+        assert_eq!(vault.entries()[0].password, "second");
+    }
+
+    #[test]
+    fn upsert_appends_a_second_username_on_the_same_host() {
+        let mut vault = detached(Vec::new());
+        vault.upsert(login("https://github.com/login", "court", "first"));
+        vault.upsert(login("https://github.com/login", "other", "second"));
+        assert_eq!(vault.entries().len(), 2);
+    }
+
+    #[test]
+    fn upsert_matches_across_a_path_difference() {
+        let mut vault = detached(Vec::new());
+        vault.upsert(login("https://github.com/login", "court", "first"));
+        vault.upsert(login("https://github.com/session/new", "court", "second"));
+        assert_eq!(vault.entries().len(), 1, "the key is the host, not the whole URL");
+        assert_eq!(vault.entries()[0].password, "second");
+    }
+
+    #[test]
+    fn delete_removes_one_entry_and_reports_it() {
+        let mut vault = detached(vec![
+            login("https://github.com/login", "court", "first"),
+            login("https://github.com/login", "other", "second"),
+        ]);
+        assert!(vault.delete("github.com", "court"));
+        assert_eq!(vault.entries().len(), 1);
+        assert_eq!(vault.entries()[0].username, "other");
+    }
+
+    #[test]
+    fn delete_of_an_absent_pair_changes_nothing() {
+        let mut vault = detached(vec![login("https://github.com/login", "court", "first")]);
+        assert!(!vault.delete("github.com", "nobody"));
+        assert!(!vault.delete("example.com", "court"));
+        assert_eq!(vault.entries().len(), 1);
+        assert_eq!(vault.entries()[0].password, "first");
     }
 }
