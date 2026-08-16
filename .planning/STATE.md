@@ -4,16 +4,16 @@ milestone: v1.0
 milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
-status: executing
-stopped_at: Completed 02-10-PLAN.md
-last_updated: "2026-08-16T10:02:37.234Z"
+status: verifying
+stopped_at: Completed 02-11-PLAN.md
+last_updated: "2026-08-16T10:29:16.223Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
   total_phases: 1
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 11
-  completed_plans: 10
+  completed_plans: 11
 ---
 
 # Project State
@@ -29,10 +29,10 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
 Plan: 11 of 11
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-08-16 — Phase 02 execution started
 
-Progress: [█████████░] 91%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -68,6 +68,7 @@ Progress: [█████████░] 91%
 | Phase 02 P08 | 29min | 3 tasks | 3 files |
 | Phase 02 P09 | 33m | 3 tasks | 3 files |
 | Phase 02 P10 | 50m | 3 tasks | 5 files |
+| Phase 02 P11 | 45m | 4 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -108,6 +109,10 @@ Recent decisions affecting current work:
 - [Phase ?]: 02-10: autofill is a chrome-side suggestion with copy controls, never page-DOM injection (D-23) — injection would collide with an agent's own evaluate and expose the password to every script on the page
 - [Phase ?]: 02-10: a typed bare hostname is completed to https before it becomes a vault entry, otherwise it can never be domain-matched or deleted again
 - [Phase ?]: 02-10: e2e panel input is driven from the focus point the panel itself sets, not from row coordinates — a row's y depends on whether the machine has a usable keychain
+- [Phase ?]: 02-11: the seven pre-existing clippy lints were fixed rather than the gate narrowed — CI runs the full --all-targets -D warnings with no command-line allow-list
+- [Phase ?]: 02-11: #[allow] on a macro invocation is silently ignored (rustc unused_attributes), so the enum_variant_names allow for tool_box! had to be module-scoped
+- [Phase ?]: 02-11: CI builds --locked so an ordinary push never re-resolves; re-resolution is the scheduled lockfile-audit job's exclusive business
+- [Phase ?]: 02-11: TEST-03 stays In Progress — both workflows are config-only and have never executed, because this repository has no git remote
 
 ### Pending Todos
 
@@ -120,6 +125,7 @@ None yet.
 - **Verification weight sits almost entirely in the Python e2e suite** — only three Rust unit tests exist, and there is no CI (TEST-03, Phase 2).
 - MCP-09 half closed: parse_agent_url refuses file:/javascript:/blob:, but an agent with an evaluate handle still reaches the filesystem via location.href='file://...' or window.open('file://...') — proven readable end to end. Needs WebViewDelegate::request_navigation + request_create_new policy on agent-owned tabs; out of 02-02's scope. Do not mark MCP-09 complete until a follow-up plan lands.
 - MCP-10 half closed: 02-06 added per-tab in-flight tracking, so a SECOND evaluate on a wedged tab is refused instantly and screenshot/tabs_close/tabs_focus/tabs_list keep working. The FIRST evaluate still runs to the command timeout and never completes — that needs a SpiderMonkey slow-script interrupt exposed through libservo (upstream, out of Phase 2). Do not mark MCP-10 complete in this phase.
+- Neither GitHub Actions workflow has ever run — the repository has no git remote. TEST-03 needs a remote, a push, and a green run before it can be marked complete. Likely first-run risks: apt list insufficient on a hosted image, Servo under software GL, and the xdotool-driven vault suites being flaky on a slower machine.
 
 ## Deferred Items
 
@@ -130,6 +136,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T10:02:37.228Z
-Stopped at: Completed 02-10-PLAN.md
+Last session: 2026-08-16T10:29:08.160Z
+Stopped at: Completed 02-11-PLAN.md
 Resume file: None
