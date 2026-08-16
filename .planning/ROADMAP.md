@@ -61,7 +61,7 @@ it depends on adding an HTTP transport that doesn't exist yet.
   5. A user can save a credential in Talaria and have it offered back by domain match on a later visit, with no plaintext credential file left on disk
   6. CI runs build, clippy, unit tests, and the e2e suite on every push, and is green
 
-**Plans**: 8/11 plans executed
+**Plans**: 10/11 plans executed
 
 Plans:
 
@@ -73,8 +73,8 @@ Plans:
 - [x] 02-06-PLAN.md — Per-tab `evaluate` in-flight tracking with instant busy refusal; takeover route stays open (wave 4)
 - [x] 02-07-PLAN.md — Owner-addressed event queue + deferred tab-work queue; no silent drops in delegate callbacks (wave 5)
 - [x] 02-08-PLAN.md — Surface tab crash/close to MCP clients as notifications, owner-scoped (wave 6)
-- [ ] 02-09-PLAN.md — Vault write API, verified plaintext-import cleanup, checked key permissions, user notices (wave 6)
-- [ ] 02-10-PLAN.md — Credentials panel and domain-matched toolbar autofill suggestion in the chrome (wave 7)
+- [x] 02-09-PLAN.md — Vault write API, verified plaintext-import cleanup, checked key permissions, user notices (wave 6)
+- [x] 02-10-PLAN.md — Credentials panel and domain-matched toolbar autofill suggestion in the chrome (wave 7)
 - [ ] 02-11-PLAN.md — CI pipeline (build, clippy, unit tests, Xvfb e2e) plus a scheduled lockfile-drift audit (wave 8)
 
 ### Phase 3: Table-Stakes Browsing
@@ -184,7 +184,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation & Core Engine | — | ✅ Complete | 2026-08-15 |
-| 2. Harden the Agent Surface | 8/11 | In Progress|  |
+| 2. Harden the Agent Surface | 10/11 | In Progress|  |
 | 3. Table-Stakes Browsing | 0/4 | Not started | - |
 | 4. Authenticated Remote Transport | 0/3 | Not started | - |
 | 5. Distributed Mode | 0/4 | Not started | - |

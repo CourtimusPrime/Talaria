@@ -61,3 +61,52 @@ half would have made the diff unreviewable against its own constraints.
 
 **Consequence:** AGENT-04 stays **In Progress**, not Complete. See the plan
 02-08 SUMMARY, "Requirements Status".
+
+## Autofill suggests, it does not populate the page's form fields
+
+Found during plan 02-10 — the flagged assumption that plan carried, resolved as
+the plan proposed rather than left implicit.
+
+CRED-02 reads "stored credentials are **suggested for autofill** by domain match
+in the shell UI". Plan 02-10 delivers that as a chrome-side offer: a toolbar
+control naming the matching username, with copy controls for the username and
+the password. It does **not** populate the page's form fields, per D-23.
+
+**What closing it would cost:** form-field detection plus a page-scripting path
+from the chrome. Both are new surface, and neither is the expensive part.
+
+**Why deferred:** it needs its own decision, not just work. Injecting into the
+page would (a) collide with an agent's own `evaluate` scripting the same form —
+two writers, no arbitration — and (b) place the user's password inside a
+document every script on that page can read, which is the disclosure the vault's
+encryption exists to prevent. Plan 02-10's threat T-02-10-01 is written against
+exactly this, and `crates/talaria-shell/src/gui.rs` carries the reasoning in a
+comment at the control, because "just fill the form, it's friendlier" is the
+change most likely to be made by someone who has not read this.
+
+**Consequence:** none for CRED-02, which is marked complete on the "suggested"
+reading. Recorded so a later reader knows the narrower reading was chosen
+deliberately.
+
+## A credential entry whose URL has no parseable host is unmatchable and undeletable
+
+Found during plan 02-10, Task 1.
+
+`Vault::matching` and `Vault::delete` both key on `entry_host`, which is `None`
+when the entry's URL does not parse into a host. `Vault::upsert` deliberately
+*appends* such an entry rather than discarding it — so it can be stored, but
+never surfaced by a domain match and never removed.
+
+Plan 02-10 closed the reachable half: `credential_url` in
+`crates/talaria-shell/src/gui.rs` completes a typed bare hostname to `https://…`
+before it becomes an entry, so nothing the panel creates can land in this state.
+The remaining case is a hand-written `vault.json` carrying a bare host, imported
+on first run.
+
+**What closing it would cost:** a fallback in `entry_host` (or in `delete` and
+`matching` separately) treating an unparseable URL as its own host, plus unit
+tests for the new behaviour.
+
+**Why deferred:** it changes the key semantics plan 02-09 defined, documented and
+unit-tested three plans ago, from inside a UI plan. It belongs in a vault change,
+not a chrome change.

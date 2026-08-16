@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
 status: executing
-stopped_at: Completed 02-09-PLAN.md
-last_updated: "2026-08-16T09:21:40.006Z"
+stopped_at: Completed 02-10-PLAN.md
+last_updated: "2026-08-16T10:02:37.234Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 11
-  completed_plans: 8
+  completed_plans: 10
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
-Plan: 10 of 11
+Plan: 11 of 11
 Status: Ready to execute
 Last activity: 2026-08-16 — Phase 02 execution started
 
-Progress: [███████░░░] 73%
+Progress: [█████████░] 91%
 
 ## Performance Metrics
 
@@ -67,6 +67,7 @@ Progress: [███████░░░] 73%
 | Phase 02 P07 | 47min | 3 tasks | 2 files |
 | Phase 02 P08 | 29min | 3 tasks | 3 files |
 | Phase 02 P09 | 33m | 3 tasks | 3 files |
+| Phase 02 P10 | 50m | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -103,6 +104,10 @@ Recent decisions affecting current work:
 - [Phase ?]: Vault write path keys on the entry URL's host plus username, not the whole URL, so re-saving the same login from a different page updates it (02-09)
 - [Phase ?]: Plaintext vault import removes the source only after re-reading, decrypting and entry-count-matching the encrypted file; a failed verification chmods the source 0600 and logs at error level (02-09)
 - [Phase ?]: Vault one-shot notices (plaintext import, keychain downgrade) live on Vault itself with read/clear accessors, so app.rs needed no change; the chrome that renders them is plan 02-10 (02-09)
+- [Phase ?]: 02-10: the credentials panel's own open state goes through the UI-intent round trip, not an inline field write — a single sanctioned exception is how the egui anti-pattern returns
+- [Phase ?]: 02-10: autofill is a chrome-side suggestion with copy controls, never page-DOM injection (D-23) — injection would collide with an agent's own evaluate and expose the password to every script on the page
+- [Phase ?]: 02-10: a typed bare hostname is completed to https before it becomes a vault entry, otherwise it can never be domain-matched or deleted again
+- [Phase ?]: 02-10: e2e panel input is driven from the focus point the panel itself sets, not from row coordinates — a row's y depends on whether the machine has a usable keychain
 
 ### Pending Todos
 
@@ -125,6 +130,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T09:21:39.999Z
-Stopped at: Completed 02-09-PLAN.md
+Last session: 2026-08-16T10:02:37.228Z
+Stopped at: Completed 02-10-PLAN.md
 Resume file: None

@@ -58,8 +58,8 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 - [ ] **AUTH-02**: A user can view and individually revoke a connected agent's access — *Should Have*
 - [ ] **AUTH-03**: An HTTP/SSE MCP transport exists alongside stdio — *Must Have* — prerequisite for AUTH-01; today `rust-mcp-sdk` features are `["server","macros","stdio"]` (`Cargo.toml:45`)
 - [x] **CRED-01**: Credentials are stored in a local, domain-keyed file, encrypted at rest — *Must Have* — ChaCha20-Poly1305, keychain with 0600 key-file fallback (`crates/talaria-shell/src/vault.rs`)
-- [ ] **CRED-02**: Stored credentials are suggested for autofill by domain match in the shell UI; agents never use them for fresh/interactive logins (that's takeover's job) — *Must Have* — **partial**: `matching()` domain keying exists, no autofill UI in `crates/talaria-shell/src/gui.rs`
-- [ ] **CRED-03**: A user can save a credential from within Talaria — *Must Have* — the vault is read-only in-app and populated only by external import
+- [x] **CRED-02**: Stored credentials are suggested for autofill by domain match in the shell UI; agents never use them for fresh/interactive logins (that's takeover's job) — *Must Have* — **partial**: `matching()` domain keying exists, no autofill UI in `crates/talaria-shell/src/gui.rs`
+- [x] **CRED-03**: A user can save a credential from within Talaria — *Must Have* — the vault is read-only in-app and populated only by external import
 
 ### Table-Stakes Browsing (BROWSE)
 
@@ -144,8 +144,8 @@ Deferred. Tracked but not in the current roadmap.
 | SEC-01 | Phase 2 | Complete |
 | SEC-02 | Phase 2 | Complete |
 | AGENT-04 | Phase 2 | In Progress |
-| CRED-02 | Phase 2 | Pending |
-| CRED-03 | Phase 2 | Pending |
+| CRED-02 | Phase 2 | Complete |
+| CRED-03 | Phase 2 | Complete |
 | TEST-03 | Phase 2 | In Progress |
 | BROWSE-01 | Phase 3 | Pending |
 | BROWSE-02 | Phase 3 | Pending |
