@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
 status: executing
-stopped_at: Completed 02-02-PLAN.md
-last_updated: "2026-08-16T05:54:35.378Z"
+stopped_at: Completed 02-03-PLAN.md
+last_updated: "2026-08-16T06:12:27.682Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 11
-  completed_plans: 1
+  completed_plans: 3
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
-Plan: 3 of 11
+Plan: 4 of 11
 Status: Ready to execute
 Last activity: 2026-08-16 — Phase 02 execution started
 
-Progress: [█░░░░░░░░░] 9%
+Progress: [███░░░░░░░] 27%
 
 ## Performance Metrics
 
@@ -60,6 +60,7 @@ Progress: [█░░░░░░░░░] 9%
 |------|----------|-------|-------|
 | Phase 02 P01 | 15m | 3 tasks | 3 files |
 | Phase 02 P02 | 23m | 2 tasks | 3 files |
+| Phase 02 P03 | 24min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -76,6 +77,8 @@ Recent decisions affecting current work:
 - Phase 2: Phase 2 baseline verdict GREEN — all 9 e2e suites pass at 16411ee, so later failures in this phase are attributable
 - [Phase ?]: 02-02: agent URL allowlist is http, https, data, and the exact about:blank literal; the about: scheme as a whole is not admitted because popup adoption depends on that one string
 - [Phase ?]: 02-02: resolve_location now names file: alongside about: so the human omnibox can open a local file — D-02's unrestricted human path did not actually work before
+- [Phase ?]: SEC-01: control socket peer check fails closed — a credential-lookup error rejects the connection, and a rejected peer gets a closed connection with no reply
+- [Phase ?]: Fallback control socket lives in a 0700 per-UID directory as talaria-$UID/talaria.sock; the XDG path is unchanged and ensure_socket_dir is a no-op there
 
 ### Pending Todos
 
@@ -97,6 +100,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T05:54:35.372Z
-Stopped at: Completed 02-02-PLAN.md
+Last session: 2026-08-16T06:12:27.677Z
+Stopped at: Completed 02-03-PLAN.md
 Resume file: None

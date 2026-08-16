@@ -61,13 +61,13 @@ it depends on adding an HTTP transport that doesn't exist yet.
   5. A user can save a credential in Talaria and have it offered back by domain match on a later visit, with no plaintext credential file left on disk
   6. CI runs build, clippy, unit tests, and the e2e suite on every push, and is green
 
-**Plans**: 1/11 plans executed
+**Plans**: 3/11 plans executed
 
 Plans:
 
 - [x] 02-01-PLAN.md — Green e2e baseline for HEAD + overnight-lock PID liveness and a pre-commit gate (wave 1)
-- [ ] 02-02-PLAN.md — Scheme allowlist on `parse_agent_url`, refusal naming the scheme, human omnibox untouched (wave 2)
-- [ ] 02-03-PLAN.md — Control-socket peer-UID check, 0600 socket inside a 0700 per-UID dir, Python path alignment (wave 2)
+- [x] 02-02-PLAN.md — Scheme allowlist on `parse_agent_url`, refusal naming the scheme, human omnibox untouched (wave 2)
+- [x] 02-03-PLAN.md — Control-socket peer-UID check, 0600 socket inside a 0700 per-UID dir, Python path alignment (wave 2)
 - [ ] 02-04-PLAN.md — Bound `download`: byte cap, uniquifying create, request timeout and cancellation (wave 3)
 - [ ] 02-05-PLAN.md — Pipeline both sides of the control socket and fix the retry that can re-execute a command (wave 3)
 - [ ] 02-06-PLAN.md — Per-tab `evaluate` in-flight tracking with instant busy refusal; takeover route stays open (wave 4)
@@ -184,7 +184,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation & Core Engine | — | ✅ Complete | 2026-08-15 |
-| 2. Harden the Agent Surface | 1/11 | In Progress|  |
+| 2. Harden the Agent Surface | 3/11 | In Progress|  |
 | 3. Table-Stakes Browsing | 0/4 | Not started | - |
 | 4. Authenticated Remote Transport | 0/3 | Not started | - |
 | 5. Distributed Mode | 0/4 | Not started | - |

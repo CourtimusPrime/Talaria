@@ -49,7 +49,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 
 <!-- Local IPC hygiene, deliberately NOT the per-agent policy layer ruled out in PROJECT.md Out of Scope. -->
 
-- [ ] **SEC-01**: The control socket authenticates its peer (UID check), so another local user cannot drive the browser — *Must Have* — no auth or peer check today; the `/tmp/talaria-$UID.sock` fallback path is world-connectable
+- [x] **SEC-01**: The control socket authenticates its peer (UID check), so another local user cannot drive the browser — *Must Have* — no auth or peer check today; the `/tmp/talaria-$UID.sock` fallback path is world-connectable
 - [ ] **SEC-02**: Importing credentials removes the plaintext source file rather than leaving it on disk — *Must Have* — plaintext `vault.json` survives import (`crates/talaria-shell/src/vault.rs:113-124`)
 
 ### Auth & Credentials (AUTH / CRED)
@@ -141,7 +141,7 @@ Deferred. Tracked but not in the current roadmap.
 | MCP-10 | Phase 2 | Pending |
 | MCP-11 | Phase 2 | Pending |
 | MCP-12 | Phase 2 | Pending |
-| SEC-01 | Phase 2 | Pending |
+| SEC-01 | Phase 2 | Complete |
 | SEC-02 | Phase 2 | Pending |
 | AGENT-04 | Phase 2 | Pending |
 | CRED-02 | Phase 2 | Pending |
