@@ -3,8 +3,8 @@
 
 Phase 1: one shell (TALARIA_TEST_HOOKS=1, TALARIA_COMMAND_TIMEOUT_SECS=3)
 serves the socket-driven suites: control_socket, scheme_refusal,
-crash_recovery, crash_event, timeout_session, mcp_client, single_instance,
-popup.  Phase 2: the standalone suites (keyboard_nav, takeover,
+crash_recovery, crash_event, timeout_session, wedge_fastfail, mcp_client,
+single_instance, popup.  Phase 2: the standalone suites (keyboard_nav, takeover,
 download_bounds) each start their own shell.
 
 Honours TALARIA_E2E_DISPLAY / XDG_RUNTIME_DIR (see harness.py) so it can run
@@ -52,6 +52,7 @@ try:
     run("crash_recovery_test", [], env)
     run("crash_event_test", [], env)
     run("timeout_session_test", [], env)
+    run("wedge_fastfail_test", [], env)
     run("mcp_client_test", [], env)
     run("single_instance_test", [], env)
     run("popup_test", [], env)
