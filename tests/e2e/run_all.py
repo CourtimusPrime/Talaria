@@ -4,8 +4,8 @@
 Phase 1: one shell (TALARIA_TEST_HOOKS=1, TALARIA_COMMAND_TIMEOUT_SECS=3)
 serves the socket-driven suites: control_socket, scheme_refusal,
 crash_recovery, crash_event, timeout_session, mcp_client, single_instance,
-popup.  Phase 2: the standalone suites (keyboard_nav, takeover) each start
-their own shell.
+popup.  Phase 2: the standalone suites (keyboard_nav, takeover,
+download_bounds) each start their own shell.
 
 Honours TALARIA_E2E_DISPLAY / XDG_RUNTIME_DIR (see harness.py) so it can run
 next to a soak on the default display.  Exit code = number of failed suites.
@@ -59,7 +59,7 @@ finally:
     harness.stop(shell, xvfb)
     log.close()
 
-for name in ("keyboard_nav_test", "takeover_test"):
+for name in ("keyboard_nav_test", "takeover_test", "download_bounds_test"):
     run(name, [])
 
 failed = [n for n, ok in results.items() if not ok]
