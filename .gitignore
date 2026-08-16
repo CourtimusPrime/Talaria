@@ -5,3 +5,5 @@ tests/e2e/*.xwd
 tests/e2e/*.log
 __pycache__/
 .overnight-lock
+/.cargo/
+/.wt-env
