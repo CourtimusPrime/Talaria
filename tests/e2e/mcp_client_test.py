@@ -1,92 +1,196 @@
 #!/usr/bin/env python3
 """Drive talaria-mcp as a real MCP client over stdio: initialize, list tools,
-call every tool end-to-end against the running shell."""
+call every tool end-to-end against the running shell, prove two tool calls
+pipeline, and prove tab lifecycle events arrive as MCP notifications on the
+owning session and on no other.
+
+Reads the proxy's stdout off the raw fd with its own buffer rather than
+proc.stdout.readline(): this suite times reads out on purpose, and a Python
+buffered reader that has once timed out refuses every later read. Notifications
+share the stream with responses, so anything a response overtakes is buffered
+rather than discarded."""
 import base64
 import json
 import os
+import select
 import subprocess
 import sys
+import time
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+BINARY = os.path.join(REPO, "target/release/talaria-mcp")
 T = os.environ.get("TALARIA_E2E_OUT", "/tmp/talaria-e2e")
 os.makedirs(T, exist_ok=True)
 
-proc = subprocess.Popen(
-    [os.path.join(REPO, "target/release/talaria-mcp")],
-    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    text=True, bufsize=1,
-)
 
-msg_id = 0
+class Client:
+    """One talaria-mcp process, driven as an MCP client over stdio."""
 
-def rpc(method, params=None, notify=False):
-    global msg_id
-    m = {"jsonrpc": "2.0", "method": method}
-    if params is not None:
-        m["params"] = params
-    if not notify:
-        msg_id += 1
-        m["id"] = msg_id
-    proc.stdin.write(json.dumps(m) + "\n")
-    proc.stdin.flush()
-    if notify:
-        return None
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            err = proc.stderr.read()
-            sys.exit(f"talaria-mcp died: {err[-800:]}")
+    def __init__(self, name):
+        self.name = name
+        self.proc = subprocess.Popen(
+            [BINARY],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        self.fd = self.proc.stdout.fileno()
+        self.buf = b""
+        self.notes = []
+        self.msg_id = 0
+
+    def write(self, message):
+        self.proc.stdin.write(json.dumps(message) + "\n")
+        self.proc.stdin.flush()
+
+    def readline(self, timeout):
+        """One decoded message, or None if nothing arrived within `timeout`.
+        Non-JSON stdout lines are skipped, as they always were."""
+        deadline = time.monotonic() + timeout
+        while True:
+            while b"\n" not in self.buf:
+                left = deadline - time.monotonic()
+                if left <= 0 or not select.select([self.fd], [], [], left)[0]:
+                    return None
+                chunk = os.read(self.fd, 65536)
+                if not chunk:
+                    sys.exit(f"talaria-mcp ({self.name}) died: "
+                             f"{self.proc.stderr.read()[-800:]}")
+                self.buf += chunk
+            line, _, self.buf = self.buf.partition(b"\n")
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+    def send(self, method, params=None, notify=False):
+        """Write one message without waiting for its response."""
+        m = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            m["params"] = params
+        if notify:
+            self.write(m)
+            return None
+        self.msg_id += 1
+        m["id"] = self.msg_id
+        self.write(m)
+        return self.msg_id
+
+    def send_call(self, tool, args):
+        return self.send("tools/call", {"name": tool, "arguments": args})
+
+    def response(self, wanted, timeout=60):
+        """The response to one of `wanted` ids. A notification met on the way
+        is buffered, never dropped — dropping one here would hide exactly the
+        bug the notification assertions below exist to catch."""
+        while True:
+            m = self.readline(timeout)
+            assert m is not None, \
+                f"{self.name}: no response to {wanted} in {timeout}s; notes={self.notes}"
+            if "id" not in m:
+                self.notes.append(m)
+            elif m["id"] in wanted:
+                return m
+
+    def rpc(self, method, params=None, notify=False):
+        i = self.send(method, params, notify)
+        return None if i is None else self.response({i})
+
+    def call(self, tool, args):
+        r = self.rpc("tools/call", {"name": tool, "arguments": args})
+        if "error" in r:
+            return {"_rpc_error": r["error"]}
+        return r["result"]
+
+    def initialize(self):
+        r = self.rpc("initialize", {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": self.name, "version": "1.0"},
+        })
+        assert "result" in r, r
+        self.rpc("notifications/initialized", {}, notify=True)
+        return r["result"]
+
+    def open_tab(self, url="https://example.com/"):
+        r = self.call("tabs_open", {"url": url})
+        assert not r.get("isError"), r
+        return json.loads(r["content"][0]["text"])["tab"]["tab_id"]
+
+    def expect_note(self, event, tab_id, why, seconds=15):
+        """A JSON-RPC message with no id carrying this event name and this tab
+        id — enough for a client to act without a follow-up tabs_list."""
+        want = {"event": event, "tab_id": tab_id}
+        deadline = time.monotonic() + seconds
+        while True:
+            for note in self.notes:
+                if note.get("params", {}).get("data") == want:
+                    assert note.get("method") == "notifications/message", note
+                    self.notes.remove(note)
+                    print(f"{self.name} notified: {json.dumps(note['params'])}")
+                    return note
+            left = deadline - time.monotonic()
+            assert left > 0, (f"{self.name}: no {event} notification for tab {tab_id} "
+                              f"within {seconds}s ({why}); saw {self.notes}")
+            m = self.readline(left)
+            if m is not None and "id" not in m:
+                self.notes.append(m)
+
+    def expect_silence(self, why, seconds=2.0):
+        """No unsolicited message of ANY shape — not merely none naming a
+        particular tab id, so a regression leaking a differently-shaped
+        notification fails here too."""
+        assert not self.notes, f"{self.name}: buffered notifications: {self.notes}"
+        assert not self.buf, f"{self.name}: buffered bytes: {self.buf!r}"
+        m = self.readline(seconds)
+        assert m is None, f"{self.name}: unsolicited message ({why}): {m}"
+        print(f"{self.name} stayed silent for {seconds}s ({why})")
+
+    def shutdown(self):
         try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if r.get("id") == msg_id:
-            return r
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            self.proc.kill()
+            self.proc.wait()
 
-def call(tool, args):
-    r = rpc("tools/call", {"name": tool, "arguments": args})
-    if "error" in r:
-        return {"_rpc_error": r["error"]}
-    return r["result"]
 
-r = rpc("initialize", {
-    "protocolVersion": "2025-06-18",
-    "capabilities": {},
-    "clientInfo": {"name": "mcp-e2e", "version": "1.0"},
-})
-assert "result" in r, r
-print("INIT ok, server:", r["result"]["serverInfo"]["name"],
-      "protocol:", r["result"]["protocolVersion"])
-rpc("notifications/initialized", {}, notify=True)
+client = Client("mcp-e2e")
 
-r = rpc("tools/list", {})
+init = client.initialize()
+print("INIT ok, server:", init["serverInfo"]["name"],
+      "protocol:", init["protocolVersion"])
+# The notification below is `notifications/message`, which a conformant client
+# only accepts from a server that declared the logging capability.
+assert "logging" in init["capabilities"], init["capabilities"]
+print("CAPABILITIES:", json.dumps(init["capabilities"]))
+
+r = client.rpc("tools/list", {})
 tools = sorted(t["name"] for t in r["result"]["tools"])
 print("TOOLS:", tools)
 expected = ["cookies_read", "download", "evaluate", "navigate", "screenshot",
             "tabs_close", "tabs_focus", "tabs_list", "tabs_open"]
 assert tools == expected, tools
 
-r = call("tabs_list", {})
+r = client.call("tabs_list", {})
 assert not r.get("isError"), r
 print("tabs_list:", r["content"][0]["text"][:120])
 
-r = call("tabs_open", {"url": "https://example.com/"})
+r = client.call("tabs_open", {"url": "https://example.com/"})
 assert not r.get("isError"), r
 tab = json.loads(r["content"][0]["text"])["tab"]
 tab_id = tab["tab_id"]
 print("tabs_open -> tab", tab_id, "owner", tab["owner"])
 assert tab["owner"] == "mcp-e2e", tab
 
-import time
 time.sleep(6)
 
-r = call("evaluate", {"tab_id": tab_id, "script": "document.title"})
+r = client.call("evaluate", {"tab_id": tab_id, "script": "document.title"})
 assert not r.get("isError"), r
 value = json.loads(r["content"][0]["text"])["value"]
 print("evaluate title:", value)
 assert value == "Example Domain", value
 
-r = call("screenshot", {"tab_id": tab_id})
+r = client.call("screenshot", {"tab_id": tab_id})
 assert not r.get("isError"), r
 img = next(c for c in r["content"] if c["type"] == "image")
 png = base64.b64decode(img["data"])
@@ -94,11 +198,11 @@ open(os.path.join(T, "mcp-screenshot.png"), "wb").write(png)
 print("screenshot:", len(png), "bytes", img["mimeType"])
 assert img["mimeType"] == "image/png" and len(png) > 10000
 
-r = call("cookies_read", {"domain": "example.com"})
+r = client.call("cookies_read", {"domain": "example.com"})
 assert not r.get("isError"), r
 print("cookies_read:", r["content"][0]["text"][:80])
 
-r = call("download", {
+r = client.call("download", {
     "url": "https://raw.githubusercontent.com/servo/servo/main/README.md",
     "filename": "talaria-mcp-test-download.md",
 })
@@ -108,20 +212,22 @@ print("download:", dl)
 assert os.path.exists(dl["path"]) and dl["bytes"] > 100
 os.remove(dl["path"])
 
-r = call("navigate", {"tab_id": tab_id, "url": "https://servo.org/"})
+r = client.call("navigate", {"tab_id": tab_id, "url": "https://servo.org/"})
 assert not r.get("isError"), r
 print("navigate ok")
 
-r = call("tabs_focus", {"tab_id": tab_id})
+r = client.call("tabs_focus", {"tab_id": tab_id})
 assert not r.get("isError"), r
 print("tabs_focus ok")
 
-r = call("tabs_close", {"tab_id": tab_id})
+r = client.call("tabs_close", {"tab_id": tab_id})
 assert not r.get("isError"), r
 print("tabs_close ok")
+# That close was this session's own tab, so it also produces a notification.
+client.expect_note("tab_closed", tab_id, "closed the tool-surface tab")
 
 # Error paths
-r = call("evaluate", {"tab_id": 9999, "script": "1"})
+r = client.call("evaluate", {"tab_id": 9999, "script": "1"})
 assert r.get("isError") or "_rpc_error" in r, r
 print("error path (bad tab) ok:", json.dumps(r)[:120])
 
@@ -135,48 +241,21 @@ print("error path (bad tab) ok:", json.dumps(r)[:120])
 # the beat makes the slow call the definite holder, and the assertion then
 # fails on a serialising connection every time instead of half the time.
 
-def send_call(tool, args):
-    """Write one tools/call without waiting for its response."""
-    global msg_id
-    msg_id += 1
-    proc.stdin.write(json.dumps({
-        "jsonrpc": "2.0", "id": msg_id, "method": "tools/call",
-        "params": {"name": tool, "arguments": args},
-    }) + "\n")
-    proc.stdin.flush()
-    return msg_id
-
-
-def next_response(wanted):
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            sys.exit(f"talaria-mcp died: {proc.stderr.read()[-800:]}")
-        try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if r.get("id") in wanted:
-            return r
-
-
-r = call("tabs_open", {"url": "https://example.com/"})
-assert not r.get("isError"), r
-slow_tab = json.loads(r["content"][0]["text"])["tab"]["tab_id"]
+slow_tab = client.open_tab()
 time.sleep(6)
 
 # A synchronous busy-wait, so no promise polling is involved and the call
 # still finishes inside the shared shell's 3s command timeout.
-slow = send_call("evaluate", {
+slow = client.send_call("evaluate", {
     "tab_id": slow_tab,
     "script": "var t=Date.now();while(Date.now()-t<1500){};'slow'",
 })
 time.sleep(0.4)
 t0 = time.monotonic()
-fast = send_call("tabs_list", {})
+fast = client.send_call("tabs_list", {})
 order, seen, fast_dt = [], {}, None
 while len(seen) < 2:
-    r = next_response({slow, fast})
+    r = client.response({slow, fast})
     if r["id"] == fast:
         fast_dt = time.monotonic() - t0
     order.append(r["id"])
@@ -189,9 +268,47 @@ assert fast_dt < 0.5, f"tabs_list took {fast_dt:.1f}s — it waited on the evalu
 print(f"CONCURRENT tool calls: tabs_list returned in {fast_dt:.2f}s "
       "while the evaluate was still outstanding")
 
-r = call("tabs_close", {"tab_id": slow_tab})
+r = client.call("tabs_close", {"tab_id": slow_tab})
 assert not r.get("isError"), r
+client.expect_note("tab_closed", slow_tab, "closed the concurrency tab")
 
-proc.stdin.close()
-proc.wait(timeout=5)
+# Tab lifecycle notifications (AGENT-04). A second proxy process, a separate
+# MCP session, is spawned and kept live so the silence assertion means "a
+# connected session that would see a fan-out saw nothing" rather than "a
+# session that never connected saw nothing" — the proxy connects to the
+# control socket lazily, on its first tool call.
+observer = Client("mcp-e2e-observer")
+try:
+    observer.initialize()
+    observer_tab = observer.open_tab()
+    print("observer session live, owns tab", observer_tab)
+
+    # --- own-session delivery: crash, then close, on the actor's tab ---
+    crashed = client.open_tab()
+    r = client.call("evaluate", {"tab_id": crashed, "script": "__talaria_sim_crash__"})
+    assert not r.get("isError"), r
+    client.expect_note("tab_crashed", crashed, "own tab crashed")
+    print("tab_crashed reached the owning MCP session as a notification")
+
+    r = client.call("tabs_close", {"tab_id": crashed})
+    assert not r.get("isError"), r
+    client.expect_note("tab_closed", crashed, "own tab closed")
+    print("tab_closed reached the owning MCP session as a notification")
+
+    # --- cross-session silence ---
+    # The observer owns none of those tabs. The shell addresses each event to
+    # the session that owns the tab; the proxy must forward, never fan out.
+    observer.expect_silence("another MCP session's tab crashed and closed")
+
+    # The observer's own close proves that silence was real addressing and not
+    # a dead notification path on that process.
+    r = observer.call("tabs_close", {"tab_id": observer_tab})
+    assert not r.get("isError"), r
+    observer.expect_note("tab_closed", observer_tab, "observer closed its own tab")
+    print("the observer's notification path is live — its silence was addressing")
+    client.expect_silence("the observer closed its own tab")
+finally:
+    observer.shutdown()
+
+client.shutdown()
 print("ALL MCP CLIENT CHECKS PASSED")
