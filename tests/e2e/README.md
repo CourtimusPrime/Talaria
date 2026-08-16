@@ -28,6 +28,33 @@ TALARIA_E2E_DISPLAY=:98 XDG_RUNTIME_DIR=/tmp/talaria-e2e-rt python3 tests/e2e/ru
 
 Launchers only kill Talaria processes attached to their own display.
 
+## Baseline
+
+Every plan in a hardening phase compares itself against a recorded baseline
+run, so the invocation has to be identical each time or the comparison means
+nothing. Use exactly this, with the prerequisites listed at the top of this
+file already satisfied:
+
+```sh
+cargo build --release
+mkdir -p /tmp/talaria-e2e-rt && chmod 700 /tmp/talaria-e2e-rt
+TALARIA_E2E_DISPLAY=:98 \
+  XDG_RUNTIME_DIR=/tmp/talaria-e2e-rt \
+  TALARIA_E2E_OUT=/tmp/talaria-e2e-baseline \
+  python3 tests/e2e/run_all.py
+```
+
+`TALARIA_E2E_DISPLAY=:98` and the private `XDG_RUNTIME_DIR` are what keep the
+run off the default display and off the default control socket, so a soak or a
+parallel session on `:99` is untouched. `TALARIA_E2E_OUT` keeps the artifacts
+of a baseline run separate from an ad-hoc one.
+
+Record the per-suite PASS/FAIL lines, the exit code (it is the number of
+failed suites), the commit the binary was built from, and `cargo --version`.
+A run that was skipped is not a pass — a baseline that did not actually
+execute must be reported as a failure, or every later failure in the phase
+becomes unattributable.
+
 ## Manual accessibility check (not automated)
 
 Screen-reader output can't be verified headlessly, so accesskit/VoiceOver is a
