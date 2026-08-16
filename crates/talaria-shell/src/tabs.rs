@@ -90,6 +90,11 @@ impl TabManager {
         }
     }
 
+    /// Every argument past `size` is an engine handle owned by `Shared`, and
+    /// there is exactly one caller (`Shared::open_tab`). Grouping them into a
+    /// parameter struct would move the same list one line up at that one call
+    /// site without making anything clearer, so the arity is accepted.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         &mut self,
         servo: &Servo,

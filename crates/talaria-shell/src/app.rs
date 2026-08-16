@@ -988,7 +988,7 @@ fn forward_mouse_move(state: &Shared, position: PhysicalPosition<f64>) {
     let size = webview.size();
     let viewport = euclid::Rect::new(
         euclid::Point2D::zero(),
-        euclid::Size2D::new(size.width as f32, size.height as f32),
+        euclid::Size2D::new(size.width, size.height),
     );
     if !viewport.contains(point) {
         if viewport.contains(previous) {
@@ -1013,7 +1013,7 @@ fn forward_mouse_button(
     let size = webview.size();
     let viewport = euclid::Rect::new(
         euclid::Point2D::zero(),
-        euclid::Size2D::new(size.width as f32, size.height as f32),
+        euclid::Size2D::new(size.width, size.height),
     );
     if !viewport.contains(point) {
         return;
