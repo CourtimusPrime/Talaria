@@ -12,12 +12,17 @@
 //! already gone. A request the connection accepted is never re-sent: a
 //! retried `tabs_open` or `download` that runs twice is worse than the
 //! stale-connection error the retry was hiding.
+//!
+//! Unsolicited events share the reply stream. The reader hands each one to the
+//! event sink this connection was built with, and `main` turns it into an MCP
+//! notification. The sink lives on the connection rather than on a reader, so a
+//! reconnect after a shell restart re-attaches to the same sink.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use talaria_protocol::{socket_path, ClientMessage, Command, Outcome, ServerMessage};
+use talaria_protocol::{socket_path, ClientMessage, Command, Event, Outcome, ServerMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -31,6 +36,9 @@ type Waiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Outcome>>>>;
 pub struct ShellConnection {
     state: Mutex<Option<Connected>>,
     next_id: AtomicU64,
+    /// Where unsolicited shell events go. Cloned into every reader task, so a
+    /// reconnect keeps delivering to the same drain.
+    events: mpsc::UnboundedSender<Event>,
 }
 
 /// A live wire plus the bookkeeping that lets many requests share it.
@@ -63,8 +71,10 @@ enum Attempt {
 }
 
 impl ShellConnection {
-    pub fn new() -> Self {
-        Self { state: Mutex::new(None), next_id: AtomicU64::new(1) }
+    /// `events` receives every unsolicited event the shell addresses to this
+    /// session, in arrival order.
+    pub fn new(events: mpsc::UnboundedSender<Event>) -> Self {
+        Self { state: Mutex::new(None), next_id: AtomicU64::new(1), events }
     }
 
     /// Send one command, await its reply. Connects (with the given client
@@ -90,7 +100,7 @@ impl ShellConnection {
             let mut state = self.state.lock().await;
             if state.as_ref().is_none_or(|connected| connected.outbound.is_closed()) {
                 // Replacing the value drops the dead one, aborting its tasks.
-                match connect(client).await {
+                match connect(client, self.events.clone()).await {
                     Ok(connected) => *state = Some(connected),
                     Err(error) => return Attempt::Done(Err(error)),
                 }
@@ -134,7 +144,10 @@ impl ShellConnection {
     }
 }
 
-async fn connect(client: &str) -> Result<Connected, String> {
+async fn connect(
+    client: &str,
+    events: mpsc::UnboundedSender<Event>,
+) -> Result<Connected, String> {
     let path = socket_path();
     let stream = UnixStream::connect(&path).await.map_err(|error| {
         format!(
@@ -162,16 +175,17 @@ async fn connect(client: &str) -> Result<Connected, String> {
         }
     }));
     let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
-    let reader = tokio::spawn(read_loop(reader, waiters.clone(), writer.clone()));
+    let reader = tokio::spawn(read_loop(reader, waiters.clone(), writer.clone(), events));
     Ok(Connected { outbound, waiters, reader, writer })
 }
 
 /// Read replies until the connection dies, handing each outcome to the caller
-/// that is waiting on its id.
+/// that is waiting on its id and each event to the connection's event sink.
 async fn read_loop(
     mut reader: BufReader<OwnedReadHalf>,
     waiters: Waiters,
     writer: Arc<JoinHandle<()>>,
+    events: mpsc::UnboundedSender<Event>,
 ) {
     loop {
         match read_message(&mut reader).await {
@@ -182,10 +196,17 @@ async fn read_loop(
                     let _ = waiter.send(outcome);
                 }
             },
-            Ok(ServerMessage::Event { .. }) => {
-                // Dropped for now. Plan 02-08 turns this arm into an MCP
-                // notification; the background reader existing at all is what
-                // makes an unsolicited server-to-client message possible.
+            Ok(ServerMessage::Event { event }) => {
+                // Forward, never filter. The shell has already decided this
+                // event belongs to this session — it addresses each one to the
+                // session that owns the tab and sends it on that connection
+                // alone. Filtering again here would be redundant; fanning out
+                // to other sessions would re-broaden exactly what the shell
+                // narrowed, and leak another agent's tab ids.
+                //
+                // A closed sink means the drain is gone, i.e. the process is
+                // shutting down. Not an error worth propagating.
+                let _ = events.send(event);
             },
             Ok(ServerMessage::HelloAck { .. }) => {
                 // Only legal during the handshake, which `connect` consumed.

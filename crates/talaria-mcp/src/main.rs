@@ -56,7 +56,10 @@ impl ServerHandler for Handler {
 
 #[tokio::main]
 async fn main() -> SdkResult<()> {
-    let connection = ShellConnection::new();
+    // Unsolicited shell events land here; the drain task below turns each one
+    // into an MCP notification.
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let connection = ShellConnection::new(event_tx);
 
     let server_details = InitializeResult {
         server_info: Implementation {
