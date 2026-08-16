@@ -85,7 +85,7 @@ pub struct CookiesReadTool {
 
 #[mcp_tool(
     name = "download",
-    description = "Download a URL to the user's downloads directory under the given filename."
+    description = "Download a URL to the user's downloads directory under the given filename. (This fetch uses a plain HTTP client rather than the browser's own network stack, so it carries none of the page's session cookies — a URL behind a login will silently return the login page instead of the file. For those, ask the user to take over and download it, or extract the resource with `evaluate` from inside the logged-in page. A size cap applies, 2 GiB by default and tunable through TALARIA_MAX_DOWNLOAD_BYTES; exceeding it aborts the download and removes the partial file. An existing file of the same name is never overwritten — the download is saved under a uniquified name like `report (1).pdf`, and the returned path is the one actually written.)"
 )]
 #[derive(Debug, ::serde::Deserialize, ::serde::Serialize, JsonSchema)]
 pub struct DownloadTool {
