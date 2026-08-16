@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
 status: executing
-stopped_at: Completed 02-07-PLAN.md
-last_updated: "2026-08-16T08:14:50.693Z"
+stopped_at: Completed 02-08-PLAN.md
+last_updated: "2026-08-16T08:47:46.358Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 11
-  completed_plans: 7
+  completed_plans: 8
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
-Plan: 8 of 11
+Plan: 9 of 11
 Status: Ready to execute
 Last activity: 2026-08-16 — Phase 02 execution started
 
-Progress: [██████░░░░] 64%
+Progress: [███████░░░] 73%
 
 ## Performance Metrics
 
@@ -65,6 +65,7 @@ Progress: [██████░░░░] 64%
 | Phase 02 P05 | 49min | 3 tasks | 4 files |
 | Phase 02 P06 | 41min | 3 tasks | 3 files |
 | Phase 02 P07 | 47min | 3 tasks | 2 files |
+| Phase 02 P08 | 29min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -95,6 +96,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 02-07: lifecycle events are addressed to the tab's owning session, not broadcast; PendingEvent carries a plain session id so a human-owned tab produces no entry at all
 - [Phase ?]: 02-07: the four tab-table delegate callbacks defer to a pending_tab_work queue on a busy table instead of skipping; the two marking callbacks log at error level, since their queues are never held across a servo call
 - [Phase ?]: 02-07: AGENT-04 stays In Progress — the shell half is done, plan 02-08 owns the MCP notification half
+- [Phase ?]: 02-08: MCP tab lifecycle notifications ride notifications/message via McpServer::notify_log_message, with ServerCapabilities.logging declared; the payload is the serialized protocol Event so no follow-up tabs_list is needed
+- [Phase ?]: 02-08: The proxy's event sink lives on ShellConnection and the reader forwards without filtering — the shell already addressed each event to the owning session, and a fan-out here would re-broaden it
+- [Phase ?]: 02-08: AGENT-04 stays In Progress: close and crash reach MCP clients, but talaria_protocol::Event has no tab-open variant, so a popup adopted under an agent's tab is still poll-only (deferred-items.md)
 
 ### Pending Todos
 
@@ -117,6 +121,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T08:14:50.688Z
-Stopped at: Completed 02-07-PLAN.md
+Last session: 2026-08-16T08:47:39.593Z
+Stopped at: Completed 02-08-PLAN.md
 Resume file: None
