@@ -6,6 +6,9 @@ display without killing it):
 - ``TALARIA_E2E_DISPLAY``  X display to create with Xvfb (default ``:99``).
 - ``XDG_RUNTIME_DIR``      inherited by the shell — point it at a private
   directory to get a private control socket (``$XDG_RUNTIME_DIR/talaria.sock``).
+  With it unset the shell falls back to ``talaria-$UID/talaria.sock`` inside
+  the temp directory, a per-UID directory it creates at mode 0700; see
+  ``socket_path`` below, which mirrors ``talaria_protocol::socket_path``.
 
 Only Talaria processes attached to *this* display are killed before launch;
 shells on other displays are left alone.
@@ -18,7 +21,22 @@ import time
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 DISPLAY = os.environ.get("TALARIA_E2E_DISPLAY", ":99")
 BINARY = os.path.join(REPO, "target", "release", "talaria")
-SOCK = os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock"
+
+
+def socket_path():
+    """Where the shell puts its control socket.
+
+    Mirrors ``talaria_protocol::socket_path``: ``$XDG_RUNTIME_DIR`` when that
+    variable is set, otherwise a per-UID ``talaria-$UID`` directory under the
+    temp directory, plus the socket filename.  The suites carry this same
+    expression inline rather than importing it — each one must stay runnable
+    standalone against an already-running shell."""
+    return os.environ.get("XDG_RUNTIME_DIR",
+                          f"{os.environ.get('TMPDIR', '/tmp')}/talaria-{os.getuid()}") \
+        + "/talaria.sock"
+
+
+SOCK = socket_path()
 
 
 def x_env(**extra):

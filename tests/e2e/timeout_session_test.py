@@ -3,7 +3,9 @@
 end. Expects a running shell with TALARIA_COMMAND_TIMEOUT_SECS=3."""
 import json, os, socket, time
 
-SOCK = os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock"
+SOCK = os.environ.get("XDG_RUNTIME_DIR",
+                      f"{os.environ.get('TMPDIR', '/tmp')}/talaria-{os.getuid()}") \
+    + "/talaria.sock"
 rid = 0
 
 def conn(name):

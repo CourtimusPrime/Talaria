@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""E2E: drive Talaria's control socket like an agent would."""
+"""E2E: drive Talaria's control socket like an agent would.
+
+Also pins the socket's filesystem protection: the shell makes it owner-only at
+bind, and on the temp fallback the directory holding it too."""
 import base64
 import json
 import os
 import socket
+import stat
 import sys
 import time
 
-SOCK = os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock"
+SOCK = os.environ.get("XDG_RUNTIME_DIR",
+                      f"{os.environ.get('TMPDIR', '/tmp')}/talaria-{os.getuid()}") \
+    + "/talaria.sock"
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/talaria-e2e"
 os.makedirs(OUT, exist_ok=True)
 
@@ -20,6 +26,19 @@ for attempt in range(30):
         time.sleep(1)
 else:
     sys.exit("could not connect to " + SOCK)
+
+# The protection the shell establishes at bind (SEC-01). Another local user
+# must not be able to reach this socket in the first place.
+mode = stat.S_IMODE(os.stat(SOCK).st_mode)
+assert mode == 0o600, f"socket mode {oct(mode)}, want 0o600"
+assert os.stat(SOCK).st_uid == os.getuid(), "socket is not owned by this user"
+if "XDG_RUNTIME_DIR" not in os.environ:  # temp fallback: we own the dir too
+    dir_mode = stat.S_IMODE(os.stat(os.path.dirname(SOCK)).st_mode)
+    assert dir_mode == 0o700, f"socket dir mode {oct(dir_mode)}, want 0o700"
+print("SOCKET PERMS ok:", SOCK, oct(mode))
+if os.getuid() != 0:
+    print("SKIP cross-uid rejection: this process shares the shell's uid, so it "
+          "cannot exercise the refusal half of the peer check")
 
 f = s.makefile("rw")
 req_id = 0

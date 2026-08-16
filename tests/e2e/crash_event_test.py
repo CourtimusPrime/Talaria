@@ -4,7 +4,9 @@ tab_crashed and tab_closed events for a tab it doesn't own. Expects a running
 shell with TALARIA_TEST_HOOKS=1."""
 import json, os, socket, time
 
-SOCK = os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock"
+SOCK = os.environ.get("XDG_RUNTIME_DIR",
+                      f"{os.environ.get('TMPDIR', '/tmp')}/talaria-{os.getuid()}") \
+    + "/talaria.sock"
 
 def conn(name):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

@@ -8,7 +8,9 @@ import socket
 import sys
 import time
 
-SOCK = os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock"
+SOCK = os.environ.get("XDG_RUNTIME_DIR",
+                      f"{os.environ.get('TMPDIR', '/tmp')}/talaria-{os.getuid()}") \
+    + "/talaria.sock"
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 for _ in range(30):

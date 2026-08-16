@@ -22,7 +22,9 @@ import sys
 import threading
 import time
 
-SOCK = os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock"
+SOCK = os.environ.get("XDG_RUNTIME_DIR",
+                      f"{os.environ.get('TMPDIR', '/tmp')}/talaria-{os.getuid()}") \
+    + "/talaria.sock"
 
 OPENER = b"""<!doctype html><title>opener</title>
 <a id=lnk href="/child?via=link" target="_blank">open in a new tab</a>

@@ -9,7 +9,9 @@ resolve_location rather than parse_agent_url and still opens a local file.
 Expects a running shell."""
 import json, os, socket
 
-SOCK = os.environ.get("XDG_RUNTIME_DIR", "/tmp") + "/talaria.sock"
+SOCK = os.environ.get("XDG_RUNTIME_DIR",
+                      f"{os.environ.get('TMPDIR', '/tmp')}/talaria-{os.getuid()}") \
+    + "/talaria.sock"
 OUT = os.path.abspath(os.environ.get("TALARIA_E2E_OUT", "/tmp/talaria-e2e"))
 
 def conn(name):
