@@ -12,6 +12,26 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/court/talaria"
 
+# ---------------------------------------------------------------------------
+# Cargo.lock is load-bearing. Do not regenerate it casually.
+#
+# `primeorder` is held at 0.14.0-rc.14 (Cargo.lock, the `primeorder` package
+# entry). Nothing in this table pins it — it is a transitive dependency pulled
+# in through servo, and the constraint exists only inside the committed
+# lockfile. A fresh resolution takes primeorder 0.14.0 final, which no longer
+# satisfies the trait bounds that p256, p384 and p521 0.14.0-rc.14 are written
+# against, and the build fails with a trait-bound error that names none of this.
+#
+# Recovery, if it has already drifted:
+#
+#     cargo update -p primeorder --precise 0.14.0-rc.14
+#
+# CI builds `--locked` so an ordinary push never re-resolves. The drift is
+# watched deliberately instead: .github/workflows/lockfile-audit.yml resolves
+# from scratch on a weekly schedule and prints the diagnosis above when the
+# build fails. That job never writes a lockfile back.
+# ---------------------------------------------------------------------------
+
 [workspace.dependencies]
 # Servo engine (libservo, published on crates.io as `servo`).
 # Versions below track servo v0.4.0's own workspace pins.

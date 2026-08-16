@@ -88,6 +88,13 @@ out to (`xdpyinfo`, `xdotool`, `xwd`, ImageMagick `convert`, `pkill`) alongside
 Servo's build prerequisites, and points the shell at a job-private
 `XDG_RUNTIME_DIR` so it gets its own control socket.
 
+The lockfile is deliberately load-bearing (see the comment at the top of
+`Cargo.toml`), so CI builds `--locked`. A separate weekly job,
+`.github/workflows/lockfile-audit.yml`, resolves dependencies from scratch on
+purpose — it is *expected* to fail, and it prints the pinned-dependency
+diagnosis and its recovery command when it does. It never runs on push, and it
+never writes a lockfile back.
+
 ## License
 
 Talaria is dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).

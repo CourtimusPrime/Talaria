@@ -1,0 +1,104 @@
+name: Lockfile audit
+
+# Scheduled and manual only — deliberately never on push.
+#
+# This job is *expected* to fail. Its whole purpose is to resolve dependencies
+# from scratch and find out whether the pinned combination still comes back on
+# its own, and a job whose failure is the normal outcome must never sit in the
+# path of an ordinary commit. Adding a push trigger here would train everyone to
+# ignore a red tick, which is exactly the habit the main pipeline exists to avoid.
+on:
+  schedule:
+    # Mondays, 04:17 UTC. Off the hour so it does not queue behind the crowd.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fresh-resolution:
+    name: resolve dependencies from scratch
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      # Build prerequisites only. The X packages the main pipeline installs are
+      # deliberately absent: a resolution failure surfaces at build time, and this
+      # job never runs the end-to-end suite. Do not add them back for symmetry —
+      # they would only make a job that is expected to fail slower to fail.
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake clang python3 \
+            libssl-dev libdbus-1-dev \
+            libfontconfig-dev libfreetype-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libx11-dev libxcb1-dev
+
+      - name: Record toolchain versions
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+
+      # No cache. A cached target directory built against the pinned resolution
+      # would mask the very failure this job exists to find.
+      - name: Discard the committed lockfile and resolve from scratch
+        run: |
+          set -euo pipefail
+          rm -f Cargo.lock
+          cargo generate-lockfile
+          echo "--- resolved versions of the crates this audit watches ---"
+          cargo tree --invert --package primeorder --edges normal || true
+
+      - name: Build the workspace against the fresh resolution
+        id: fresh_build
+        run: cargo build --release
+
+      # The point of the whole job. The drift is expected; what CI adds is that it
+      # is found weekly with the explanation attached, rather than by a contributor
+      # with a clean checkout and a trait-bound error that names none of the crates
+      # actually responsible.
+      - name: Explain the failure
+        if: failure() && steps.fresh_build.outcome == 'failure'
+        run: |
+          echo "::error title=Fresh dependency resolution no longer builds::See the diagnosis below"
+          cat <<'DIAGNOSIS'
+          A from-scratch resolution does not build, and this is the known cause:
+
+            `primeorder` resolves to 0.14.0 (final). The elliptic-curve crates
+            servo depends on — p256, p384 and p521 — are still at 0.14.0-rc.14 and
+            are written against the release-candidate trait bounds, so the final
+            primeorder release fails to satisfy them. The error surfaces as a
+            trait-bound mismatch that names neither primeorder nor the cause.
+
+          The working combination is held ONLY by the committed Cargo.lock. No
+          manifest field pins it; see the comment block at the top of Cargo.toml.
+
+          Recovery, from a checkout whose lockfile has already drifted:
+
+              cargo update -p primeorder --precise 0.14.0-rc.14
+
+          This job intentionally discards Cargo.lock in its own workspace copy and
+          never writes one back to the repository. Nothing here commits. The
+          committed lockfile in the default branch is untouched by this run.
+
+          If the build failed for some reason OTHER than the above, treat that as
+          new information: the pin may now be releasable, or a different dependency
+          has moved. Read the build log before acting on this message.
+          DIAGNOSIS
