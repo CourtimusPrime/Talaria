@@ -97,6 +97,31 @@ pub struct Shared {
     /// callbacks while its evaluator is mutably borrowed, so a follow-up
     /// evaluate can never be started from inside a callback.
     pub pending_evals: RefCell<Vec<PendingEval>>,
+    /// One entry per outstanding `evaluate`, so a second script command on a
+    /// tab whose script thread is already wedged is refused immediately
+    /// instead of burning the whole command timeout. Maintained only from
+    /// the event loop; see [`EvalGuard`] for why the completion signal
+    /// itself is not.
+    pub evaluating: RefCell<Vec<EvalGuard>>,
+}
+
+/// One outstanding `evaluate` on a tab.
+///
+/// `done` is a reference-counted `Cell`, deliberately — not a `RefCell` and
+/// not a field on `Tab`. Every way an evaluate can end is reachable from
+/// inside a servo evaluate callback, which runs while the engine holds its
+/// own borrows; setting a `Cell` neither borrows nor can fail, so a terminus
+/// records completion without the `try_borrow` that silently drops work
+/// elsewhere in this file. A missed flag here would leave a healthy tab
+/// permanently refused, so it must not be droppable.
+pub struct EvalGuard {
+    pub tab_id: u64,
+    /// Set by whichever terminus ends the evaluate; swept from the loop.
+    pub done: Rc<Cell<bool>>,
+    /// Expire the entry even if the callback never arrives at all — the
+    /// engine can drop one, and a lost callback must self-heal rather than
+    /// wedge the tab forever. Same instant the evaluate itself is bounded by.
+    pub deadline: std::time::Instant,
 }
 
 pub struct PendingEval {
@@ -107,6 +132,9 @@ pub struct PendingEval {
     pub deadline: std::time::Instant,
     /// Earliest time to issue the next evaluate.
     pub next: std::time::Instant,
+    /// This evaluate's [`EvalGuard::done`] flag, carried forward so whichever
+    /// branch finally replies clears the tab's in-flight entry.
+    pub done: Rc<Cell<bool>>,
 }
 
 pub enum EvalStep {
@@ -193,8 +221,36 @@ impl Shared {
         self.process_pending_loads();
     }
 
+    /// Drop in-flight entries that have completed or expired. Runs on the
+    /// event loop, so borrowing normally is safe here.
+    pub fn sweep_evaluating(&self) {
+        let now = std::time::Instant::now();
+        self.evaluating
+            .borrow_mut()
+            .retain(|guard| !guard.done.get() && guard.deadline > now);
+    }
+
+    /// Whether `tab_id` already has an evaluate in flight.
+    pub fn tab_evaluating(&self, tab_id: u64) -> bool {
+        self.sweep_evaluating();
+        self.evaluating.borrow().iter().any(|guard| guard.tab_id == tab_id)
+    }
+
+    /// Record a new outstanding evaluate on `tab_id` and hand back its
+    /// completion flag for the evaluate machinery to set when it ends.
+    pub fn begin_evaluating(&self, tab_id: u64) -> Rc<Cell<bool>> {
+        let done = Rc::new(Cell::new(false));
+        self.evaluating.borrow_mut().push(EvalGuard {
+            tab_id,
+            done: done.clone(),
+            deadline: std::time::Instant::now() + promise_wait(),
+        });
+        done
+    }
+
     /// Issue due evaluate follow-ups (see [`PendingEval`]).
     pub fn process_pending_evals(self: &Rc<Self>) {
+        self.sweep_evaluating();
         let now = std::time::Instant::now();
         let due: Vec<PendingEval> = {
             let mut pending = self.pending_evals.borrow_mut();
@@ -211,6 +267,7 @@ impl Shared {
         };
         for eval in due {
             if eval.deadline <= now {
+                eval.done.set(true);
                 let _ = eval.reply.send(Outcome::Error {
                     message: format!(
                         "promise did not settle within {}s",
@@ -220,7 +277,7 @@ impl Shared {
                 continue;
             }
             let state = self.clone();
-            let PendingEval { webview, step, reply, deadline, .. } = eval;
+            let PendingEval { webview, step, reply, deadline, done, .. } = eval;
             match step {
                 EvalStep::Poll { slot } => {
                     let poll_webview = webview.clone();
@@ -228,6 +285,8 @@ impl Shared {
                         match result {
                             Ok(servo::JSValue::Object(mut map)) => {
                                 if map.contains_key("__talaria_pending") {
+                                    // Still in flight: carry the flag forward
+                                    // rather than clearing it.
                                     state.pending_evals.borrow_mut().push(PendingEval {
                                         webview: poll_webview,
                                         step: EvalStep::Poll { slot },
@@ -235,6 +294,7 @@ impl Shared {
                                         deadline,
                                         next: std::time::Instant::now()
                                             + std::time::Duration::from_millis(50),
+                                        done,
                                     });
                                     state.window.request_redraw();
                                     return;
@@ -259,14 +319,17 @@ impl Shared {
                                     };
                                     Outcome::Error { message: format!("promise rejected: {message}") }
                                 };
+                                done.set(true);
                                 let _ = reply.send(outcome);
                             },
                             Ok(_) => {
+                                done.set(true);
                                 let _ = reply.send(Outcome::Error {
                                     message: "promise poll returned an unexpected shape".into(),
                                 });
                             },
                             Err(error) => {
+                                done.set(true);
                                 let _ = reply.send(Outcome::Error {
                                     message: format!(
                                         "page went away before the promise settled ({})",
@@ -279,6 +342,7 @@ impl Shared {
                 },
                 EvalStep::RunRaw { script } => {
                     webview.evaluate_javascript(script, move |result| {
+                        done.set(true);
                         let _ = reply.send(match result {
                             Ok(value) => Outcome::Ok {
                                 result: ResultPayload::Value { value: js_value_to_json(value) },
@@ -340,13 +404,17 @@ impl Shared {
         });
     }
 
-    /// Earliest deadline among queued captures/loads/evals, for WaitUntil
-    /// scheduling.
+    /// Earliest deadline among queued captures/loads/evals and outstanding
+    /// evaluates, for WaitUntil scheduling. The in-flight registry is a
+    /// source here because a deadline nothing wakes for is not a deadline:
+    /// an entry whose callback was lost must expire on time, not whenever
+    /// the loop happens to turn next.
     pub fn next_capture_deadline(&self) -> Option<std::time::Instant> {
         let captures = self.pending_captures.borrow().iter().map(|c| c.deadline).min();
         let loads = self.pending_loads.borrow().iter().map(|l| l.deadline).min();
         let evals = self.pending_evals.borrow().iter().map(|e| e.next).min();
-        [captures, loads, evals].into_iter().flatten().min()
+        let evaluating = self.evaluating.borrow().iter().map(|g| g.deadline).min();
+        [captures, loads, evals, evaluating].into_iter().flatten().min()
     }
 
     /// Keep the window title in step with whatever tab is displayed (tab
@@ -484,6 +552,7 @@ impl ApplicationHandler<AppEvent> for App {
             pending_captures: RefCell::new(Vec::new()),
             pending_loads: RefCell::new(Vec::new()),
             pending_evals: RefCell::new(Vec::new()),
+            evaluating: RefCell::new(Vec::new()),
         });
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
@@ -1029,7 +1098,12 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                 return;
             }
             match webview_for(tab_id) {
-                Ok(webview) => start_evaluate(state, webview, script, reply),
+                Ok(webview) => {
+                    // Only after the lookup succeeds: a request naming a tab
+                    // that does not exist must leave no entry behind.
+                    let done = state.begin_evaluating(tab_id);
+                    start_evaluate(state, webview, script, reply, done);
+                },
                 Err(outcome) => {
                     let _ = reply.send(outcome);
                 },
@@ -1164,6 +1238,7 @@ fn start_evaluate(
     webview: WebView,
     script: String,
     reply: tokio::sync::oneshot::Sender<Outcome>,
+    done: Rc<Cell<bool>>,
 ) {
     let state = state.clone();
     let deadline = std::time::Instant::now() + promise_wait();
@@ -1171,6 +1246,8 @@ fn start_evaluate(
     webview.evaluate_javascript(wrap_script(&script), move |result| {
         let outcome = match result {
             Ok(servo::JSValue::Object(mut map)) => {
+                // Both parking branches are still in flight, so neither
+                // clears the tab's entry — the follow-up carries the flag.
                 if let Some(servo::JSValue::Number(slot)) = map.get("__talaria_async") {
                     state.pending_evals.borrow_mut().push(PendingEval {
                         webview: target,
@@ -1178,6 +1255,7 @@ fn start_evaluate(
                         reply,
                         deadline,
                         next: std::time::Instant::now() + std::time::Duration::from_millis(20),
+                        done,
                     });
                     state.window.request_redraw();
                     return;
@@ -1189,6 +1267,7 @@ fn start_evaluate(
                         reply,
                         deadline,
                         next: std::time::Instant::now(),
+                        done,
                     });
                     state.window.request_redraw();
                     return;
@@ -1207,6 +1286,7 @@ fn start_evaluate(
             },
             Err(error) => Outcome::Error { message: describe_js_error(error) },
         };
+        done.set(true);
         let _ = reply.send(outcome);
     });
 }
