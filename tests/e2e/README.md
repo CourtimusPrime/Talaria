@@ -55,6 +55,35 @@ A run that was skipped is not a pass — a baseline that did not actually
 execute must be reported as a failure, or every later failure in the phase
 becomes unattributable.
 
+## Branch lock (overnight loops)
+
+`overnight_lock.py` marks who owns this branch and working tree, so a second
+loop refuses to start rather than rebuilding the binary a first loop is
+soaking. It only prevents that if something calls it, so `.githooks/pre-commit`
+calls it on every commit. Hooks are not installed by cloning — enable them once
+per checkout:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+A loop takes the lock before its first commit and identifies itself to the hook
+by exporting the same owner id:
+
+```sh
+export TALARIA_OVERNIGHT_OWNER=<owner-id>
+python3 tests/e2e/overnight_lock.py acquire "$TALARIA_OVERNIGHT_OWNER" --pid $$
+# ... work ...
+python3 tests/e2e/overnight_lock.py release "$TALARIA_OVERNIGHT_OWNER"
+```
+
+`--pid` records a process that outlives the acquiring script, which is what
+makes the liveness check meaningful; it defaults to the parent process. A lock
+whose owning process is gone is stale — the next `acquire` clears it and says
+so. A lock whose owner is still alive refuses everyone else, including at
+commit time. `git commit --no-verify` bypasses the hook, which is right only
+once you have confirmed the other session is actually stopped.
+
 ## Manual accessibility check (not automated)
 
 Screen-reader output can't be verified headlessly, so accesskit/VoiceOver is a

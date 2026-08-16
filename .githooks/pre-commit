@@ -1,0 +1,39 @@
+#!/bin/sh
+# Refuse a commit while another session holds a live lock on this branch.
+#
+# Two overnight loops once ran on the same branch and the same working tree:
+# one froze rebuilds and soaked a binary while the other rebuilt the shell
+# underneath it and committed on top, so the soak's numbers described a binary
+# that no longer existed. tests/e2e/overnight_lock.py was written to mark
+# ownership, but nothing called it, so it prevented nothing. This hook is what
+# calls it.
+#
+# A loop identifies itself by exporting TALARIA_OVERNIGHT_OWNER with the same
+# owner id it passed to `acquire`. The owning session commits normally;
+# everyone else is refused while that session's process is still alive. A dead
+# owner is not a live lock, so a crashed loop blocks nobody.
+#
+# Escape hatch: `git commit --no-verify` bypasses this. That is the correct
+# move for a human who has confirmed the other session is actually stopped —
+# and the wrong one otherwise.
+#
+# Fails open only for a missing python3 or a missing lock script: a broken or
+# partial checkout must not make the repository uncommittable. Every other
+# non-zero status from `check` fails the commit.
+
+root=$(git rev-parse --show-toplevel) || exit 0
+lock_script="$root/tests/e2e/overnight_lock.py"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-commit: python3 not found — skipping the overnight branch-lock check" >&2
+  exit 0
+fi
+
+if [ ! -f "$lock_script" ]; then
+  echo "pre-commit: $lock_script not in this checkout — skipping the overnight branch-lock check" >&2
+  exit 0
+fi
+
+cd "$root" || exit 0
+python3 tests/e2e/overnight_lock.py check
+exit $?
