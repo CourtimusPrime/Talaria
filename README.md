@@ -69,6 +69,25 @@ Keyboard: `Ctrl+L` URL bar (selects the URL; `Esc` abandons the edit),
 `Ctrl+R`/`F5` reload, `Alt+Left`/`Alt+Right` back/forward. `Tab`/`Shift+Tab`
 move between toolbar controls once the chrome has focus.
 
+## Continuous integration
+
+Every push and every pull request runs the same four checks, in this order, and a
+failure at any one of them stops the run:
+
+1. `cargo build --release --locked` for the whole workspace
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo test`
+4. the full end-to-end suite, `python3 tests/e2e/run_all.py`
+
+There is no path filter on the workflow, so a push that changes no Rust source still
+runs all four — a filtered push reports green without having verified anything.
+
+The end-to-end step needs a virtual framebuffer. The suite drives the real binary
+through a window, so the job installs `Xvfb` and the X utilities the harness shells
+out to (`xdpyinfo`, `xdotool`, `xwd`, ImageMagick `convert`, `pkill`) alongside
+Servo's build prerequisites, and points the shell at a job-private
+`XDG_RUNTIME_DIR` so it gets its own control socket.
+
 ## License
 
 Talaria is dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).

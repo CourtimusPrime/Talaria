@@ -1,0 +1,162 @@
+name: CI
+
+# Deliberately no branch filter and no path filter.
+#
+# A `paths:` / `paths-ignore:` filter is what lets a push produce zero jobs and
+# still show a green tick: GitHub reports "no runs required" as success, so a
+# commit that touched nothing the filter matched would look verified when
+# nothing verified it. Every push and every pull request runs the whole
+# pipeline, including a push that changes no Rust source at all. If this file
+# ever grows a path filter, that guarantee is gone.
+on:
+  push:
+  pull_request:
+
+# The job reads the checkout and writes nothing back. A pull request from a fork
+# therefore cannot obtain a write-scoped token through this workflow.
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build, clippy, test, e2e
+    runs-on: ubuntu-latest
+    # A from-scratch Servo release build is long. This limit sits well above the
+    # observed duration on purpose: a job killed mid-build is indistinguishable
+    # from a broken build, and that ambiguity costs more than the wasted minutes.
+    # See the plan 02-11 SUMMARY for the measurement this number is derived from.
+    timeout-minutes: 180
+
+    steps:
+      # A Servo release build plus its dependency graph is large relative to a
+      # hosted runner's free space, and exhausting it surfaces as a confusing
+      # linker error rather than as "out of disk". Reclaim first.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      # Servo's build prerequisites plus every external binary the e2e harness
+      # shells out to. `apt-get install` exits non-zero when a package cannot be
+      # located, so a missing X utility is an install failure here rather than a
+      # test that quietly does not run later.
+      #
+      # Package names are the Ubuntu 24.04 (noble) names, which is what
+      # ubuntu-latest resolves to.
+      - name: Install system packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake clang python3 \
+            libssl-dev libdbus-1-dev \
+            libfontconfig-dev libfreetype-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libx11-dev libxcb1-dev \
+            libgl1-mesa-dri libxcursor1 libxi6 libxrandr2 libxkbcommon-x11-0 \
+            xvfb x11-utils xdotool x11-apps imagemagick procps
+
+      # No rust-toolchain.toml is committed, so the toolchain is whatever the
+      # runner image ships. Print it rather than assume it: a failure caused by a
+      # toolchain bump should be readable in the log instead of inferred.
+      - name: Record toolchain and tool versions
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          python3 --version
+          Xvfb -version 2>&1 | head -1 || true
+          xdotool --version
+
+      # Speed only. A cache miss must change nothing about correctness — every
+      # step below rebuilds from source if the cache is cold.
+      #
+      # The key includes the lockfile hash, so an entry created for one dependency
+      # set is never served to a different one.
+      - name: Cache cargo registry and build directory
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      # Steps from here run in a fixed order — build, clippy, test, e2e — and each
+      # fails the job on a non-zero exit. The ordering is itself a guarantee: a
+      # clippy failure stops the run rather than letting a broken build's
+      # end-to-end results confuse the diagnosis.
+      #
+      # --locked so CI uses the committed lockfile. That lockfile is load-bearing:
+      # it holds primeorder back to a release candidate (see the comment in
+      # Cargo.toml). Resolving fresh is the scheduled lockfile-audit job's business,
+      # never this one's.
+      - name: Build the workspace in release mode
+        run: cargo build --release --locked
+
+      # Both binaries must exist before the e2e suite runs: harness.py launches
+      # target/release/talaria and mcp_client_test drives target/release/talaria-mcp.
+      # Asserting it here stops a later reorganisation from producing a green build
+      # whose e2e step then fails for an unrelated-looking reason.
+      - name: Assert both release binaries exist
+        run: |
+          set -euo pipefail
+          test -x target/release/talaria
+          test -x target/release/talaria-mcp
+          echo "both release binaries present"
+
+      - name: Clippy with warnings denied
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Rust unit tests
+        run: cargo test --locked
+
+      # The e2e suite carries essentially all behavioural coverage — there are only
+      # a handful of #[test] functions in the workspace — so a pipeline that skipped
+      # this step would verify almost nothing.
+      #
+      # TALARIA_E2E_DISPLAY pins the display the harness creates with Xvfb rather
+      # than relying on its :99 default, and XDG_RUNTIME_DIR points the shell at a
+      # job-private, owner-only directory so it gets a private control socket. Two
+      # hosted-runner jobs are separate machines, but a self-hosted runner executing
+      # two jobs at once would otherwise have them fight over the default display
+      # and the shared socket path; pinning both makes concurrent runs safe there too.
+      #
+      # The orchestrator exits with the number of failed suites, so its exit code is
+      # the gate directly: 0 passes, and any non-zero value — including 1, meaning
+      # exactly one suite failed — fails the job. It is deliberately not piped, not
+      # wrapped in a conditional, and not followed by `|| true`; nothing can swallow it.
+      - name: End-to-end suite under Xvfb
+        env:
+          TALARIA_E2E_DISPLAY: ":98"
+          TALARIA_E2E_OUT: ${{ runner.temp }}/talaria-e2e-out
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="${{ runner.temp }}/talaria-e2e-rt"
+          mkdir -p "$XDG_RUNTIME_DIR" "$TALARIA_E2E_OUT"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          python3 tests/e2e/run_all.py
+
+      # Failure only, and scoped to the e2e output directory and nothing else.
+      #
+      # Do NOT widen this path. The home and configuration directories hold the
+      # credential vault, its key file, and the engine profile; a debugging
+      # convenience that publishes the user's secrets is not a convenience.
+      - name: Upload end-to-end logs and screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-output
+          path: ${{ runner.temp }}/talaria-e2e-out
+          if-no-files-found: warn
+          retention-days: 7
