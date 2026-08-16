@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use talaria_protocol::{
-    socket_path, ClientMessage, Command, Outcome, ServerMessage,
+    ensure_socket_dir, socket_dir, socket_path, ClientMessage, Command, Outcome, ServerMessage,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -88,6 +88,15 @@ pub fn spawn(proxy: EventLoopProxy<AppEvent>) {
 }
 
 async fn serve(proxy: EventLoopProxy<AppEvent>) {
+    // A socket we cannot place in a private directory is not a socket we
+    // should listen on: reaching it is equivalent to owning the session.
+    if let Err(error) = ensure_socket_dir() {
+        log::error!(
+            "control socket directory {} unusable: {error}",
+            socket_dir().display()
+        );
+        return;
+    }
     let path = socket_path();
     let _ = std::fs::remove_file(&path);
     let listener = match UnixListener::bind(&path) {
@@ -97,6 +106,22 @@ async fn serve(proxy: EventLoopProxy<AppEvent>) {
             return;
         },
     };
+    // Fail closed on the same reasoning: this whole gate exists because the
+    // socket used to be reachable by other local users.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let owner_only = std::fs::Permissions::from_mode(0o600);
+        if let Err(error) = std::fs::set_permissions(&path, owner_only) {
+            log::error!(
+                "control socket {} could not be made owner-only: {error}",
+                path.display()
+            );
+            drop(listener);
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+    }
     log::info!("control socket listening at {}", path.display());
 
     let proxy = Arc::new(proxy);
