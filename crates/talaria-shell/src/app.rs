@@ -1015,6 +1015,13 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
         state.tabs.borrow().get(tab_id).is_some_and(|t| t.crashed)
     };
 
+    // For `evaluate` ONLY. A page that wedges its own script thread is exactly
+    // when the human needs to get back into the tab, so screenshot, tabs_close,
+    // tabs_focus, tabs_list, navigate, cookies_read, open_for_user and download
+    // must keep answering on a busy tab — that is the product's reactive
+    // backstop, not an oversight. Do not generalise this across the dispatch.
+    let busy = |tab_id: u64| -> bool { state.tab_evaluating(tab_id) };
+
     match command {
         Command::TabsList => {
             let tabs = state.tabs.borrow();
@@ -1094,6 +1101,16 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             if crashed(tab_id) {
                 let _ = reply.send(Outcome::Error {
                     message: format!("tab {tab_id} crashed — navigate it to recover"),
+                });
+                return;
+            }
+            // Fail fast in front of the command timeout, never instead of it:
+            // the evaluate already in flight still runs until that outer bound.
+            // The wording says a previous evaluate is still running so the
+            // agent and the user read this as a wedged page, not a flaky tool.
+            if busy(tab_id) {
+                let _ = reply.send(Outcome::Error {
+                    message: format!("tab {tab_id} busy — a previous evaluate is still running"),
                 });
                 return;
             }
