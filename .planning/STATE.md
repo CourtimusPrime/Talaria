@@ -2,18 +2,18 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 2
-current_phase_name: Harden the Agent Surface
-status: planning
-stopped_at: Phase 2 planned — 11 plans, 8 waves, checker passed (0 blockers)
-last_updated: "2026-08-15T10:40:31.687Z"
-last_activity: 2026-08-15
-last_activity_desc: Phase 2 planned — 11 plans in 8 waves, plan-checker passed with 0 blockers
+current_phase: 02
+current_phase_name: harden-the-agent-surface
+status: executing
+stopped_at: Completed 02-01-PLAN.md — baseline GREEN, branch lock enforced
+last_updated: "2026-08-16T05:27:45.775Z"
+last_activity: 2026-08-16
+last_activity_desc: Phase 02 execution started
 progress:
-  total_phases: 7
-  completed_phases: 1
-  total_plans: 24
-  completed_plans: 0
+  total_phases: 1
+  completed_phases: 0
+  total_plans: 11
+  completed_plans: 1
 ---
 
 # Project State
@@ -23,16 +23,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-15)
 
 **Core value:** An agent can drive a real, already-logged-in browsing session, and a human can take over instantly the moment it hits something only a human can clear.
-**Current focus:** Phase 2 — Harden the Agent Surface
+**Current focus:** Phase 02 — harden-the-agent-surface
 
 ## Current Position
 
-Phase: 2 of 7 (Harden the Agent Surface)
-Plan: 0 of 11 in current phase
+Phase: 02 (harden-the-agent-surface) — EXECUTING
+Plan: 2 of 11
 Status: Ready to execute
-Last activity: 2026-08-15 — Phase 2 planned; 11 plans in 8 waves, checker passed
+Last activity: 2026-08-16 — Phase 02 execution started
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] 9%
 
 ## Performance Metrics
 
@@ -54,6 +54,11 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: —
 
 *Updated after each plan completion*
+**Per-Plan Metrics:**
+
+| Plan | Duration | Tasks | Files |
+|------|----------|-------|-------|
+| Phase 02 P01 | 15m | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -65,6 +70,9 @@ Recent decisions affecting current work:
 - Init: OAuth resequenced from Phase 2 to Phase 4 — stdio needs no auth; auth's driver is remote access and depends on an HTTP transport that doesn't exist yet
 - Init: SEC-01 (control-socket peer-UID check) is local IPC hygiene, deliberately distinct from the per-agent policy layer that stays out of scope
 - Phase 1: egui-on-winit shell replaced the Tauri + Servo-WRY plan, removing the WRY dependency entirely
+- Phase 2: D-28: overnight lock records os.getppid() (or explicit --pid) instead of os.getpid(), so PID liveness is meaningful; dead owners self-clear, live ones still refuse
+- Phase 2: D-29: .githooks/pre-commit calls overnight_lock.py check via core.hooksPath, making the branch-lock preflight non-optional
+- Phase 2: Phase 2 baseline verdict GREEN — all 9 e2e suites pass at 16411ee, so later failures in this phase are attributable
 
 ### Pending Todos
 
@@ -73,7 +81,7 @@ None yet.
 ### Blockers/Concerns
 
 - **REL-02 has no chosen approach** — Tauri's updater plugin no longer applies to the egui shell. Decide before Phase 7; does not block Phases 2–6.
-- **`.overnight-lock` is advisory** — nothing auto-enforces the preflight call, and a stale PID currently sits in the working tree that will refuse the next loop start.
+- ~~**`.overnight-lock` is advisory**~~ — RESOLVED by plan 02-01. `.githooks/pre-commit` enforces the lock at commit time via `core.hooksPath`, and a lock whose owning PID is dead now self-clears instead of refusing. The stale `c85a1ef3` / pid 2796577 lock was cleared.
 - **Verification weight sits almost entirely in the Python e2e suite** — only three Rust unit tests exist, and there is no CI (TEST-03, Phase 2).
 
 ## Deferred Items
@@ -85,6 +93,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-15T10:40:31.677Z
-Stopped at: Phase 2 planned — 11 plans, 8 waves, checker passed (0 blockers)
-Resume file: .planning/phases/02-harden-the-agent-surface/02-01-PLAN.md
+Last session: 2026-08-16T05:27:39.873Z
+Stopped at: Completed 02-01-PLAN.md — baseline GREEN, branch lock enforced
+Resume file: None

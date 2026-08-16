@@ -92,7 +92,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 
 - [x] **TEST-01**: An end-to-end suite runs headless (Xvfb) and passes cleanly, with a shared harness avoiding display/socket race conditions — *Must Have*
 - [x] **TEST-02**: Autonomous overnight loops cannot run two sessions against the same branch concurrently — *Must Have* — `tests/e2e/overnight_lock.py`, commit `ff0000a`. Advisory: nothing auto-enforces the call.
-- [ ] **TEST-03**: CI runs build, clippy, Rust unit tests, and the e2e suite on every push — *Should Have* — no CI exists; three Rust unit tests total
+- [ ] **TEST-03**: CI runs build, clippy, Rust unit tests, and the e2e suite on every push — *Should Have* — no CI exists; three Rust unit tests total. Plan 02-01 landed the branch-lock half (D-28/D-29); the CI job itself (D-26/D-27) ships in plan 02-11.
 
 ## v2 Requirements
 
@@ -146,7 +146,7 @@ Deferred. Tracked but not in the current roadmap.
 | AGENT-04 | Phase 2 | Pending |
 | CRED-02 | Phase 2 | Pending |
 | CRED-03 | Phase 2 | Pending |
-| TEST-03 | Phase 2 | Pending |
+| TEST-03 | Phase 2 | In Progress |
 | BROWSE-01 | Phase 3 | Pending |
 | BROWSE-02 | Phase 3 | Pending |
 | BROWSE-03 | Phase 3 | Pending |
@@ -165,6 +165,7 @@ Deferred. Tracked but not in the current roadmap.
 | REL-04 | Phase 7 | Pending |
 
 **Coverage:**
+
 - v1 requirements: 47 total
 - Mapped to phases: 47
 - Unmapped: 0 ✓
