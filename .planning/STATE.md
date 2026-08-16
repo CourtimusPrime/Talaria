@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
 status: executing
-stopped_at: Completed 02-05-PLAN.md
-last_updated: "2026-08-16T07:19:38.031Z"
+stopped_at: Completed 02-06-PLAN.md
+last_updated: "2026-08-16T07:43:10.536Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 11
-  completed_plans: 5
+  completed_plans: 6
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
-Plan: 6 of 11
+Plan: 7 of 11
 Status: Ready to execute
 Last activity: 2026-08-16 — Phase 02 execution started
 
-Progress: [█████░░░░░] 45%
+Progress: [██████░░░░] 55%
 
 ## Performance Metrics
 
@@ -63,6 +63,7 @@ Progress: [█████░░░░░] 45%
 | Phase 02 P03 | 24min | 3 tasks | 9 files |
 | Phase 02 P04 | 26min | 3 tasks | 4 files |
 | Phase 02 P05 | 49min | 3 tasks | 4 files |
+| Phase 02 P06 | 41min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -87,6 +88,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 02-05: the MCP retry is expressed as a two-state Attempt enum — NotSent is reachable only from a failed send on the outbound channel, so a request a live connection accepted is structurally un-retryable
 - [Phase ?]: 02-05: bounding each control-socket write by the command timeout is what makes awaiting the writer at teardown safe instead of stranding it
 - [Phase ?]: 02-05: MCP tool calls are dispatched concurrently by rust-mcp-sdk, so a back-to-back ordering assertion passes against a serialising connection half the time — the slow call needs a head start for the test to bind
+- [Phase ?]: 02-06: the evaluate in-flight completion flag is an Rc<Cell<bool>> — a Cell set is infallible and borrow-free, so a servo callback cannot silently drop it and leave a healthy tab permanently refused
+- [Phase ?]: 02-06: the in-flight entry expires on its own deadline as well as its flag, so a lost engine callback self-heals; that deadline is registered with next_capture_deadline because a deadline nothing wakes for is not a deadline
+- [Phase ?]: 02-06: MCP-10 stays In Progress — the second evaluate now fails fast, but the first still burns the timeout; completing it needs an upstream libservo slow-script interrupt
 
 ### Pending Todos
 
@@ -98,6 +102,7 @@ None yet.
 - ~~**`.overnight-lock` is advisory**~~ — RESOLVED by plan 02-01. `.githooks/pre-commit` enforces the lock at commit time via `core.hooksPath`, and a lock whose owning PID is dead now self-clears instead of refusing. The stale `c85a1ef3` / pid 2796577 lock was cleared.
 - **Verification weight sits almost entirely in the Python e2e suite** — only three Rust unit tests exist, and there is no CI (TEST-03, Phase 2).
 - MCP-09 half closed: parse_agent_url refuses file:/javascript:/blob:, but an agent with an evaluate handle still reaches the filesystem via location.href='file://...' or window.open('file://...') — proven readable end to end. Needs WebViewDelegate::request_navigation + request_create_new policy on agent-owned tabs; out of 02-02's scope. Do not mark MCP-09 complete until a follow-up plan lands.
+- MCP-10 half closed: 02-06 added per-tab in-flight tracking, so a SECOND evaluate on a wedged tab is refused instantly and screenshot/tabs_close/tabs_focus/tabs_list keep working. The FIRST evaluate still runs to the command timeout and never completes — that needs a SpiderMonkey slow-script interrupt exposed through libservo (upstream, out of Phase 2). Do not mark MCP-10 complete in this phase.
 
 ## Deferred Items
 
@@ -108,6 +113,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T07:19:38.025Z
-Stopped at: Completed 02-05-PLAN.md
+Last session: 2026-08-16T07:43:05.226Z
+Stopped at: Completed 02-06-PLAN.md
 Resume file: None

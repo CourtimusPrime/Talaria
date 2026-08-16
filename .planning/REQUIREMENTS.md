@@ -41,7 +41,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 - [x] **MCP-07**: An agent can download a file via `download(url, filename)` — *Should Have* — `crates/talaria-mcp/src/tools.rs:89-98`
 - [x] **MCP-08**: Popup/new-tab requests from a page (`window.open`, `target=_blank`) open a real tab under the parent's owner — *Must Have* — commit `5b1f4db`, e2e `tests/e2e/popup_test.py`
 - [ ] **MCP-09**: Agents cannot navigate to `file://` URLs (scheme allowlist enforced on `navigate` and `evaluate`) — *Must Have* — **partial** (plan 02-02): `parse_agent_url` now allowlists `http`/`https`/`data`/`about:blank`, so `tabs_open` and `navigate` refuse `file:` naming the scheme (`tests/e2e/scheme_refusal_test.py`). The `evaluate` half is still open — `location.href='file://…'` and `window.open('file://…')` from a script reach the filesystem and the content reads straight back out. Closing it needs `WebViewDelegate::request_navigation` + `request_create_new` policy on agent-owned tabs.
-- [ ] **MCP-10**: A heavy-JS page does not wedge `evaluate` — *Must Have* — **partial**: a blanket command timeout bounds it (`crates/talaria-shell/src/control.rs:185-201`) but there is no per-tab script isolation
+- [ ] **MCP-10**: A heavy-JS page does not wedge `evaluate` — *Must Have* — **partial**: plan 02-06 added per-tab in-flight tracking (`Shared::evaluating`), so a second `evaluate` on a tab whose script thread is already busy is refused instantly with `tab {id} busy — a previous evaluate is still running` instead of burning the command timeout, and `screenshot`/`tabs_close`/`tabs_focus`/`tabs_list` keep answering on that tab. The *first* evaluate still runs to the timeout and never completes: making the evaluate itself complete needs a SpiderMonkey slow-script interrupt exposed through libservo, which is upstream work outside Phase 2
 - [x] **MCP-11**: One slow or wedged tool call does not block tool calls against other tabs — *Must Have* — `ShellConnection`'s single mutex serializes every call, compounding MCP-10
 - [x] **MCP-12**: `download` is bounded — enforced size cap and no silent overwrite of an existing file — *Should Have*
 
@@ -138,7 +138,7 @@ Deferred. Tracked but not in the current roadmap.
 | TEST-01 | Phase 1 | Complete |
 | TEST-02 | Phase 1 | Complete |
 | MCP-09 | Phase 2 | Pending |
-| MCP-10 | Phase 2 | Pending |
+| MCP-10 | Phase 2 | In Progress |
 | MCP-11 | Phase 2 | Complete |
 | MCP-12 | Phase 2 | Complete |
 | SEC-01 | Phase 2 | Complete |
