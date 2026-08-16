@@ -882,10 +882,18 @@ fn parse_agent_url(input: &str) -> Result<Url, String> {
 
 /// Omnibox behavior: URL if it parses (or looks like a host), search query
 /// otherwise.
+///
+/// `about:` and `file:` are named explicitly because neither carries a host,
+/// so the host test alone would send both to the search engine. The human is
+/// the trust root here: unlike `parse_agent_url`, this path allowlists
+/// nothing — a user who types a local path gets the local file.
 pub fn resolve_location(input: &str) -> Url {
     let input = input.trim();
     if let Ok(url) = Url::parse(input) {
-        if !url.scheme().is_empty() && url.host().is_some() || url.scheme() == "about" {
+        if !url.scheme().is_empty() && url.host().is_some()
+            || url.scheme() == "about"
+            || url.scheme() == "file"
+        {
             return url;
         }
     }
