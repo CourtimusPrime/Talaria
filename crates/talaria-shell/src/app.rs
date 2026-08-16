@@ -8,6 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::rc::Rc;
 
 use base64::Engine;
@@ -1101,7 +1102,10 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                 return;
             }
             std::thread::spawn(move || {
-                let outcome = download(&url, &filename);
+                // `reply` doubles as the cancellation handle: `download` polls
+                // its closed state, which becomes true the moment the control
+                // socket's command timeout drops the receiving half.
+                let outcome = download(&url, &filename, &reply);
                 let _ = reply.send(outcome);
             });
         },
@@ -1287,24 +1291,158 @@ fn encode_screenshot(image: servo::RgbaImage) -> Outcome {
     }
 }
 
-fn download(url: &str, filename: &str) -> Outcome {
+/// Ceiling on a downloaded body when nothing overrides it: 2 GiB. A download is
+/// an agent-initiated write to the user's disk, so it needs a bound the remote
+/// server cannot raise.
+const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Ceiling on a downloaded body, tunable through `TALARIA_MAX_DOWNLOAD_BYTES`.
+/// A value that does not parse as an unsigned 64-bit integer falls back to the
+/// default rather than to zero — a typo must not silently disable downloads —
+/// and never to unbounded, so a typo cannot silently disable the cap either.
+fn max_download_bytes() -> u64 {
+    std::env::var("TALARIA_MAX_DOWNLOAD_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MAX_DOWNLOAD_BYTES)
+}
+
+/// How long a download may take, for the connect, for any single read, and
+/// overall: just under the control socket's command timeout, so the agent gets
+/// this path's specific message rather than a generic timeout. Derived from
+/// `TALARIA_COMMAND_TIMEOUT_SECS` exactly the way `promise_wait` is.
+fn download_timeout() -> std::time::Duration {
+    let timeout_secs: u64 = std::env::var("TALARIA_COMMAND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    std::time::Duration::from_secs(timeout_secs.saturating_sub(2).max(1))
+}
+
+/// Create the destination file without ever clobbering one the user already
+/// has: try the plain name, then `stem (1).ext`, `stem (2).ext`, and so on.
+/// Creation is exclusive rather than truncating, which is what makes the
+/// guarantee hold under two concurrent downloads asking for the same name — the
+/// loser of the race sees `AlreadyExists` and advances to the next counter
+/// instead of opening the winner's file. A collision is resolved here, never by
+/// prompting: an agent cannot see a dialog.
+fn create_unique(
+    dir: &std::path::Path,
+    filename: &str,
+) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    // A leading dot is part of the name, not an extension separator, so
+    // `.bashrc` uniquifies as `.bashrc (1)` rather than ` (1).bashrc`.
+    let (stem, extension) = match filename.rfind('.') {
+        Some(dot) if dot > 0 => (&filename[..dot], &filename[dot..]),
+        _ => (filename, ""),
+    };
+    for counter in 0..1000 {
+        let candidate = if counter == 0 {
+            dir.join(filename)
+        } else {
+            dir.join(format!("{stem} ({counter}){extension}"))
+        };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => return Ok((file, candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many files already share this name",
+    ))
+}
+
+/// Give up on a download in progress: drop the writer, remove the partial file
+/// so nothing half-written survives at the destination, and report why.
+fn abandon_download(
+    writer: std::io::BufWriter<std::fs::File>,
+    path: &std::path::Path,
+    message: String,
+) -> Outcome {
+    drop(writer);
+    let _ = std::fs::remove_file(path);
+    Outcome::Error { message }
+}
+
+/// Fetch `url` into the user's downloads directory under `filename`: bounded in
+/// bytes, bounded in time, never clobbering an existing file, and abandoned the
+/// moment nobody is waiting for the result. `reply` is borrowed purely as a
+/// cancellation handle — the control socket drops its receiving half when the
+/// command timeout fires, so a closed sender means the agent already got an
+/// error and these bytes are unwanted.
+fn download(
+    url: &str,
+    filename: &str,
+    reply: &tokio::sync::oneshot::Sender<Outcome>,
+) -> Outcome {
     let dir = dirs::download_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let path = dir.join(filename);
-    let response = match ureq::get(url).call() {
+    let max_bytes = max_download_bytes();
+    let timeout = download_timeout();
+    // A bare `ureq::get` has no timeouts at all, so a server that accepts and
+    // then stalls would hold this thread open long past the command timeout.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(timeout)
+        .timeout_read(timeout)
+        .build();
+    let response = match agent.get(url).call() {
         Ok(response) => response,
         Err(error) => return Outcome::Error { message: format!("request failed: {error}") },
     };
-    let mut reader = response.into_reader();
-    let file = match std::fs::File::create(&path) {
-        Ok(file) => file,
+    let (file, path) = match create_unique(&dir, filename) {
+        Ok(created) => created,
         Err(error) => return Outcome::Error { message: format!("create failed: {error}") },
     };
+    let mut reader = response.into_reader();
     let mut writer = std::io::BufWriter::new(file);
-    match std::io::copy(&mut reader, &mut writer) {
-        Ok(bytes) => Outcome::Ok {
-            result: ResultPayload::Download { path: path.display().to_string(), bytes },
+    let mut buffer = vec![0_u8; 64 * 1024];
+    // Counted from the bytes we actually read and write, never from
+    // content-length: the header is attacker-controlled and need not match the
+    // body it describes.
+    let mut written: u64 = 0;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if reply.is_closed() {
+            let message = "download cancelled: nothing is waiting for the result".to_owned();
+            return abandon_download(writer, &path, message);
+        }
+        if std::time::Instant::now() >= deadline {
+            // The per-read timeout above cannot catch a peer that drips one
+            // byte at a time; this overall deadline can.
+            let seconds = timeout.as_secs();
+            let message = format!("download timed out after {seconds}s");
+            return abandon_download(writer, &path, message);
+        }
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                return abandon_download(writer, &path, format!("read failed: {error}"));
+            },
+        };
+        written += read as u64;
+        if written > max_bytes {
+            let message = format!(
+                "download exceeds the {max_bytes} byte cap \
+                 (raise TALARIA_MAX_DOWNLOAD_BYTES to allow more)"
+            );
+            return abandon_download(writer, &path, message);
+        }
+        let write_result = writer.write_all(&buffer[..read]);
+        if let Err(error) = write_result {
+            return abandon_download(writer, &path, format!("write failed: {error}"));
+        }
+    }
+    let flush_result = writer.flush();
+    if let Err(error) = flush_result {
+        return abandon_download(writer, &path, format!("write failed: {error}"));
+    }
+    Outcome::Ok {
+        result: ResultPayload::Download {
+            path: path.display().to_string(),
+            bytes: written,
         },
-        Err(error) => Outcome::Error { message: format!("write failed: {error}") },
     }
 }
 
