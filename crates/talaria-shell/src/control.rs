@@ -209,19 +209,35 @@ async fn handle_connection(
     });
     write_line(&mut write_half, &ServerMessage::HelloAck { session_id }).await?;
 
+    // Each write is bounded by the same clock a command is: a write that
+    // cannot land within it means a peer that stopped reading, not a slow
+    // one, and an unbounded write here would strand this task forever once
+    // teardown starts awaiting it.
+    let write_bound = std::time::Duration::from_secs(command_timeout_secs());
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
-            if write_line(&mut write_half, &message).await.is_err() {
-                break;
+            match tokio::time::timeout(write_bound, write_line(&mut write_half, &message)).await {
+                Ok(Ok(())) => {},
+                _ => break,
             }
         }
     });
 
+    // One task per in-flight request, so a slow command on one tab does not
+    // stop the next line being read. Tracked rather than detached: teardown
+    // must not truncate a reply that is still outstanding.
+    let mut inflight = tokio::task::JoinSet::new();
+
     while let Some(line) = lines.next_line().await? {
+        // Reap finished requests so a long-lived session's set does not grow
+        // with every command it has ever issued. Never blocks.
+        while inflight.try_join_next().is_some() {}
         if line.trim().is_empty() {
             continue;
         }
-        let (id, outcome) = match serde_json::from_str::<ClientMessage>(&line) {
+        // A request's outcome is awaited off this loop; the other two arms
+        // have nothing to wait for and answer inline.
+        let immediate = match serde_json::from_str::<ClientMessage>(&line) {
             Ok(ClientMessage::Request { id, command }) => {
                 let (tx, rx) = oneshot::channel();
                 let request = AgentRequest {
@@ -233,45 +249,65 @@ async fn handle_connection(
                 if proxy.send_event(AppEvent::Agent(request)).is_err() {
                     break; // Event loop is gone; shell is shutting down.
                 }
-                // Commands that never complete (e.g. `evaluate` of a script
-                // that never terminates — servo never fires the callback)
-                // must not hang the agent forever.
-                let timeout_secs = std::env::var("TALARIA_COMMAND_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(30);
-                let outcome = match tokio::time::timeout(
-                    std::time::Duration::from_secs(timeout_secs),
-                    rx,
-                )
-                .await
-                {
-                    Ok(Ok(outcome)) => outcome,
-                    Ok(Err(_)) => Outcome::Error {
-                        message: "shell dropped the request".into(),
-                    },
-                    Err(_) => Outcome::Error {
-                        message: format!(
-                            "timed out after {timeout_secs}s (script still running?)"
-                        ),
-                    },
-                };
-                (id, outcome)
+                let replies = out_tx.clone();
+                inflight.spawn(async move {
+                    // Commands that never complete (e.g. `evaluate` of a script
+                    // that never terminates — servo never fires the callback)
+                    // must not hang the agent forever.
+                    let timeout_secs = command_timeout_secs();
+                    let outcome = match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        rx,
+                    )
+                    .await
+                    {
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(_)) => Outcome::Error {
+                            message: "shell dropped the request".into(),
+                        },
+                        Err(_) => Outcome::Error {
+                            message: format!(
+                                "timed out after {timeout_secs}s (script still running?)"
+                            ),
+                        },
+                    };
+                    let _ = replies.send(ServerMessage::Reply { id, outcome });
+                });
+                None
             },
             Ok(ClientMessage::Hello { .. }) => {
-                (0, Outcome::Error { message: "duplicate hello".into() })
+                Some((0, Outcome::Error { message: "duplicate hello".into() }))
             },
-            Err(error) => (0, Outcome::Error { message: format!("bad request: {error}") }),
+            Err(error) => Some((0, Outcome::Error { message: format!("bad request: {error}") })),
         };
-        if out_tx.send(ServerMessage::Reply { id, outcome }).is_err() {
-            break; // Writer is gone; connection is dead.
+        if let Some((id, outcome)) = immediate {
+            if out_tx.send(ServerMessage::Reply { id, outcome }).is_err() {
+                break; // Writer is gone; connection is dead.
+            }
         }
     }
 
+    // Let every outstanding request answer before the socket goes away. Each
+    // is already bounded by the command timeout, so this drain is bounded too.
+    while inflight.join_next().await.is_some() {}
+
     let _ = proxy.send_event(AppEvent::SessionEnded { session_id });
     drop(out_tx);
-    writer.abort();
+    // Awaited, not aborted: aborting here is exactly what would truncate the
+    // replies the drain above just queued.
+    let _ = writer.await;
     Ok(())
+}
+
+/// Outer bound on one command: how long the shell waits for the event loop to
+/// produce an outcome before answering the agent with an error, default 30s.
+/// The same bound caps a single socket write, so a peer that stops reading
+/// cannot strand a connection's writer task.
+fn command_timeout_secs() -> u64 {
+    std::env::var("TALARIA_COMMAND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30)
 }
 
 async fn write_line(
