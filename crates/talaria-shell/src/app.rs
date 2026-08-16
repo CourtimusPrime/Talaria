@@ -103,6 +103,51 @@ pub struct Shared {
     /// the event loop; see [`EvalGuard`] for why the completion signal
     /// itself is not.
     pub evaluating: RefCell<Vec<EvalGuard>>,
+    /// Unsolicited lifecycle events waiting to be handed to the one session
+    /// that owns the tab each describes. Queued rather than sent directly
+    /// because a crash or a close is raised from inside a servo delegate
+    /// callback, where the session map may be momentarily borrowed — and an
+    /// event dropped there is a notification the agent never learns it
+    /// missed. Drained from the event loop; see [`Shared::queue_event`].
+    pub pending_events: RefCell<Vec<PendingEvent>>,
+    /// Tab-table changes a delegate callback could not apply because the
+    /// table was busy. Skipping one loses a crash mark, a close, a URL
+    /// update or a whole popup, so the work is deferred to the loop instead
+    /// (where the table is never contended) rather than discarded.
+    pub pending_tab_work: RefCell<Vec<TabWork>>,
+}
+
+/// One unsolicited event, addressed to exactly one session.
+///
+/// The addressee is a plain session id rather than an `Option`: a human-owned
+/// tab has no agent addressee at all, so its lifecycle produces no entry —
+/// the owner filter is expressed in the type rather than re-checked at the
+/// send.
+pub struct PendingEvent {
+    pub session_id: u64,
+    pub event: talaria_protocol::Event,
+}
+
+/// A tab-table mutation a servo delegate callback had to defer.
+///
+/// Everything here is keyed by [`WebView`] rather than by tab id, because
+/// resolving a webview to its tab is itself a tab-table read — the very thing
+/// the callback could not do.
+pub enum TabWork {
+    /// Adopt an already-built popup webview under its parent's tab. Building
+    /// the webview and its framebuffer needs no tab-table borrow, so a
+    /// callback can always get that far before deciding to defer.
+    AdoptPopup {
+        parent: WebView,
+        webview: WebView,
+        rendering_context: Rc<OffscreenRenderingContext>,
+    },
+    /// Mark the webview's tab crashed and notify its owner.
+    MarkCrashed { webview: WebView },
+    /// Close the webview's tab and notify its owner.
+    Close { webview: WebView },
+    /// Apply a location change to the webview's tab.
+    UrlChanged { webview: WebView, url: Url },
 }
 
 /// One outstanding `evaluate` on a tab.
@@ -219,6 +264,12 @@ impl Shared {
             let _ = capture.reply.send(outcome);
         }
         self.process_pending_loads();
+        // Chained here rather than added to each winit handler: all three
+        // handlers already call this drain, so both queues are reached from
+        // every one of them. Tab work runs first because applying it is what
+        // raises the events the second drain then delivers.
+        self.process_pending_tab_work();
+        self.process_pending_events();
     }
 
     /// Drop in-flight entries that have completed or expired. Runs on the
@@ -431,17 +482,154 @@ impl Shared {
         }
     }
 
-    /// Push an unsolicited event to every connected control client.
-    /// Non-blocking (unbounded channel), so this is safe to call from servo
-    /// delegate callbacks.
-    pub fn broadcast_event(&self, event: talaria_protocol::Event) {
-        if let Ok(sessions) = self.sessions.try_borrow() {
-            for session in sessions.values() {
+    /// Queue an unsolicited event for the session that owns the tab it
+    /// describes — and for no other.
+    ///
+    /// A human-owned tab has no agent addressee, so its lifecycle produces
+    /// nothing at all. This is *addressing*, not policy: Talaria does not
+    /// gate what an agent may do, it only decides who a message was for.
+    /// Telling agent A about agent B's tab ids is a leak, and it is free to
+    /// avoid here while the delivery path is being built.
+    ///
+    /// Safe to call from inside a servo delegate callback: pushing onto the
+    /// queue touches neither the session map nor the tab table, and the drain
+    /// holds this borrow only long enough to take the entries out.
+    pub fn queue_event(&self, owner: &TabOwner, event: talaria_protocol::Event) {
+        let TabOwner::Agent { session_id, .. } = owner else {
+            return;
+        };
+        self.pending_events
+            .borrow_mut()
+            .push(PendingEvent { session_id: *session_id, event });
+        // A queued event that nothing wakes for is a dropped event.
+        self.window.request_redraw();
+    }
+
+    /// Hand each queued event to its addressee's channel.
+    ///
+    /// Split scope, as with every other queue here: the entries are taken out
+    /// under a borrow that makes no call into servo and no call into the
+    /// session map, which is what leaves a producing callback unable to
+    /// contend for it in the first place.
+    pub fn process_pending_events(&self) {
+        let due: Vec<PendingEvent> = std::mem::take(&mut self.pending_events.borrow_mut());
+        for entry in due {
+            // A session that disconnected between the event being queued and
+            // this drain is simply absent from the map. Discarding its entry
+            // is correct addressing, not a lost notification: there is no
+            // longer anyone the event was for.
+            if let Some(session) = self.sessions.borrow().get(&entry.session_id) {
                 let _ = session
                     .events
-                    .send(talaria_protocol::ServerMessage::Event { event: event.clone() });
+                    .send(talaria_protocol::ServerMessage::Event { event: entry.event });
             }
         }
+    }
+
+    /// Apply tab-table changes a delegate callback had to defer.
+    ///
+    /// Same split scope: the queue borrow is released before anything touches
+    /// the tab table or calls into servo, so a callback pushing onto it can
+    /// never find it busy.
+    pub fn process_pending_tab_work(&self) {
+        let due: Vec<TabWork> = std::mem::take(&mut self.pending_tab_work.borrow_mut());
+        for work in due {
+            match work {
+                TabWork::AdoptPopup { parent, webview, rendering_context } => {
+                    let mut tabs = self.tabs.borrow_mut();
+                    self.adopt_popup(&mut tabs, &parent, webview, rendering_context);
+                },
+                TabWork::MarkCrashed { webview } => {
+                    let marked = {
+                        let mut tabs = self.tabs.borrow_mut();
+                        tabs.find_by_webview_mut(&webview).map(|tab| {
+                            tab.crashed = true;
+                            (tab.id, tab.owner.clone())
+                        })
+                    };
+                    if let Some((tab_id, owner)) = marked {
+                        self.queue_event(&owner, talaria_protocol::Event::TabCrashed { tab_id });
+                    }
+                },
+                TabWork::Close { webview } => {
+                    let mut closed = None;
+                    {
+                        let mut tabs = self.tabs.borrow_mut();
+                        // Owner first: the close removes the tab, and an event
+                        // raised afterwards would have nothing to address.
+                        if let Some(id) = tabs.find_by_webview(&webview) {
+                            let owner = tabs.get(id).map(|tab| tab.owner.clone());
+                            if let (Some(owner), true) = (owner, tabs.close(id)) {
+                                closed = Some((id, owner));
+                            }
+                        }
+                    }
+                    if let Some((tab_id, owner)) = closed {
+                        self.queue_event(&owner, talaria_protocol::Event::TabClosed { tab_id });
+                    }
+                },
+                TabWork::UrlChanged { webview, url } => {
+                    apply_url_change(&mut self.tabs.borrow_mut(), &webview, &url);
+                },
+            }
+        }
+    }
+
+    /// Adopt an already-built popup webview as a tab under its opener: the
+    /// popup takes the parent's owner (an agent's popups stay that agent's)
+    /// and fronts its own view only if the opener was that view's active tab.
+    ///
+    /// Shared by the inline delegate path and the deferred queue so both
+    /// produce the same tab, including the same activation rule.
+    fn adopt_popup(
+        &self,
+        tabs: &mut TabManager,
+        parent_webview: &WebView,
+        webview: WebView,
+        rendering_context: Rc<OffscreenRenderingContext>,
+    ) {
+        let Some(parent_id) = tabs.find_by_webview(parent_webview) else {
+            return;
+        };
+        let Some(owner) = tabs.get(parent_id).map(|tab| tab.owner.clone()) else {
+            return;
+        };
+        // A popup fronts its own view when its opener was the active tab
+        // there (browser behaviour), and stays behind an opener that was
+        // already in the background. Which view is *displayed* is irrelevant:
+        // an agent's popup must not drag the human out of the Me view.
+        let parent_active = tabs.active_id(owner.view()) == Some(parent_id);
+        // The popup's real URL arrives via notify_url_changed; until then the
+        // URL bar shows what a `window.open()` with no argument keeps forever.
+        let id = tabs.register(
+            webview,
+            rendering_context,
+            owner,
+            "about:blank".into(),
+            parent_active,
+            true,
+        );
+        log::info!("popup from tab {parent_id} opened as tab {id}");
+    }
+}
+
+/// Apply a page-driven location change to the webview's tab. Shared by
+/// `notify_url_changed` and the deferred queue so a deferred update is
+/// byte-for-byte the update the callback would have made.
+fn apply_url_change(tabs: &mut TabManager, webview: &WebView, url: &Url) {
+    let Some(tab) = tabs.find_by_webview_mut(webview) else {
+        return;
+    };
+    if !tab.location_dirty {
+        tab.location = url.to_string();
+    }
+    // The navigation an adopted popup was waiting for has begun, so its
+    // blank grace window is over and `load_status` alone tells the truth
+    // from here. Servo runs a whole Started→Complete cycle on the popup's
+    // *own* blank document first, which is why load status can't be that
+    // signal.
+    if url.as_str() != "about:blank" {
+        tab.initial_blank_until = None;
     }
 }
 
@@ -553,6 +741,8 @@ impl ApplicationHandler<AppEvent> for App {
             pending_loads: RefCell::new(Vec::new()),
             pending_evals: RefCell::new(Vec::new()),
             evaluating: RefCell::new(Vec::new()),
+            pending_events: RefCell::new(Vec::new()),
+            pending_tab_work: RefCell::new(Vec::new()),
         });
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
@@ -869,8 +1059,12 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                 state.open_tab(url, TabOwner::Me);
             },
             UiAction::CloseTab(id) => {
-                if state.tabs.borrow_mut().close(id) {
-                    state.broadcast_event(talaria_protocol::Event::TabClosed { tab_id: id });
+                // Owner before close: the close removes the tab, so an event
+                // raised afterwards has nothing left to key its addressee on.
+                let owner = state.tabs.borrow().get(id).map(|tab| tab.owner.clone());
+                let closed = state.tabs.borrow_mut().close(id);
+                if let (true, Some(owner)) = (closed, owner) {
+                    state.queue_event(&owner, talaria_protocol::Event::TabClosed { tab_id: id });
                 }
             },
             UiAction::SelectTab(id) => {
@@ -1043,9 +1237,14 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
         },
         Command::TabsClose { tab_id } => {
+            // Owner before close, for the same reason as the UI close path.
+            // Note this is the tab's owner, not the requesting session: an
+            // agent may close a tab it does not own, and the notification
+            // still belongs to whoever owned it.
+            let owner = state.tabs.borrow().get(tab_id).map(|tab| tab.owner.clone());
             let closed = state.tabs.borrow_mut().close(tab_id);
-            if closed {
-                state.broadcast_event(talaria_protocol::Event::TabClosed { tab_id });
+            if let (true, Some(owner)) = (closed, owner) {
+                state.queue_event(&owner, talaria_protocol::Event::TabClosed { tab_id });
             }
             let _ = reply.send(if closed {
                 Outcome::Ok { result: ResultPayload::Empty {} }
@@ -1088,13 +1287,22 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             if script == "__talaria_sim_crash__"
                 && std::env::var("TALARIA_TEST_HOOKS").as_deref() == Ok("1")
             {
-                if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
+                // Read the owner from the tab it marks, exactly as the real
+                // notify_crashed does: the hook is only useful to the suite
+                // if it exercises the same addressed path.
+                let marked = state.tabs.borrow_mut().get_mut(tab_id).map(|tab| {
                     tab.crashed = true;
-                    state.window.request_redraw();
-                    state.broadcast_event(talaria_protocol::Event::TabCrashed { tab_id });
-                    let _ = reply.send(Outcome::Ok { result: ResultPayload::Empty {} });
-                } else {
-                    let _ = reply.send(Outcome::Error { message: format!("no tab {tab_id}") });
+                    tab.owner.clone()
+                });
+                match marked {
+                    Some(owner) => {
+                        state.window.request_redraw();
+                        state.queue_event(&owner, talaria_protocol::Event::TabCrashed { tab_id });
+                        let _ = reply.send(Outcome::Ok { result: ResultPayload::Empty {} });
+                    },
+                    None => {
+                        let _ = reply.send(Outcome::Error { message: format!("no tab {tab_id}") });
+                    },
                 }
                 return;
             }
@@ -1660,26 +1868,28 @@ impl servo::WebViewDelegate for Shared {
         if let Ok(mut tabs) = self.tabs.try_borrow_mut() {
             if let Some(tab) = tabs.find_by_webview_mut(&webview) {
                 tab.crashed = true;
-                crashed_tab = Some(tab.id);
+                crashed_tab = Some((tab.id, tab.owner.clone()));
             }
         }
-        if let Some(tab_id) = crashed_tab {
-            self.broadcast_event(talaria_protocol::Event::TabCrashed { tab_id });
+        if let Some((tab_id, owner)) = crashed_tab {
+            self.queue_event(&owner, talaria_protocol::Event::TabCrashed { tab_id });
         }
         self.window.request_redraw();
     }
 
     fn notify_closed(&self, webview: WebView) {
-        if let Ok(tabs) = self.tabs.try_borrow() {
+        let mut closed = None;
+        if let Ok(mut tabs) = self.tabs.try_borrow_mut() {
+            // Owner before close, as on every other close path.
             if let Some(id) = tabs.find_by_webview(&webview) {
-                drop(tabs);
-                if let Ok(mut tabs) = self.tabs.try_borrow_mut() {
-                    if tabs.close(id) {
-                        drop(tabs);
-                        self.broadcast_event(talaria_protocol::Event::TabClosed { tab_id: id });
-                    }
+                let owner = tabs.get(id).map(|tab| tab.owner.clone());
+                if let (Some(owner), true) = (owner, tabs.close(id)) {
+                    closed = Some((id, owner));
                 }
             }
+        }
+        if let Some((tab_id, owner)) = closed {
+            self.queue_event(&owner, talaria_protocol::Event::TabClosed { tab_id });
         }
         self.window.request_redraw();
     }
