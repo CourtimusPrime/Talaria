@@ -43,7 +43,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 - [ ] **MCP-09**: Agents cannot navigate to `file://` URLs (scheme allowlist enforced on `navigate` and `evaluate`) — *Must Have* — **partial** (plan 02-02): `parse_agent_url` now allowlists `http`/`https`/`data`/`about:blank`, so `tabs_open` and `navigate` refuse `file:` naming the scheme (`tests/e2e/scheme_refusal_test.py`). The `evaluate` half is still open — `location.href='file://…'` and `window.open('file://…')` from a script reach the filesystem and the content reads straight back out. Closing it needs `WebViewDelegate::request_navigation` + `request_create_new` policy on agent-owned tabs.
 - [ ] **MCP-10**: A heavy-JS page does not wedge `evaluate` — *Must Have* — **partial**: a blanket command timeout bounds it (`crates/talaria-shell/src/control.rs:185-201`) but there is no per-tab script isolation
 - [ ] **MCP-11**: One slow or wedged tool call does not block tool calls against other tabs — *Must Have* — `ShellConnection`'s single mutex serializes every call, compounding MCP-10
-- [ ] **MCP-12**: `download` is bounded — enforced size cap and no silent overwrite of an existing file — *Should Have*
+- [x] **MCP-12**: `download` is bounded — enforced size cap and no silent overwrite of an existing file — *Should Have*
 
 ### Security & Local IPC (SEC)
 
@@ -140,7 +140,7 @@ Deferred. Tracked but not in the current roadmap.
 | MCP-09 | Phase 2 | Pending |
 | MCP-10 | Phase 2 | Pending |
 | MCP-11 | Phase 2 | Pending |
-| MCP-12 | Phase 2 | Pending |
+| MCP-12 | Phase 2 | Complete |
 | SEC-01 | Phase 2 | Complete |
 | SEC-02 | Phase 2 | Pending |
 | AGENT-04 | Phase 2 | Pending |
