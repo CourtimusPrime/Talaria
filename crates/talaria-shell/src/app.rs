@@ -835,16 +835,48 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
     }
 }
 
+/// Which URLs an agent may hand to `tabs_open` / `navigate`.
+///
+/// `http` and `https` are the web, which is what an agent is here to drive.
+/// `data` is admitted because it grants an agent nothing it cannot already
+/// produce through `evaluate` on a page it already controls — refusing it
+/// would remove capability without removing risk.
+///
+/// The blank page is admitted by an exact match on the whole URL string
+/// rather than by scheme, because popup adoption registers and compares that
+/// exact literal (`register(..., "about:blank")`, `notify_url_changed`), and
+/// admitting the whole `about` scheme would widen the surface to the engine's
+/// internal pages.
+///
+/// Everything else is refused: `file` (the user's disk, readable straight back
+/// out through `evaluate`), the `javascript` pseudo-scheme (script in a
+/// document the agent holds no evaluate handle on), `blob` object URLs, and any
+/// custom scheme Servo may register. The human's own URL bar is deliberately
+/// unaffected — see `resolve_location`.
+fn agent_scheme_allowed(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https" | "data") || url.as_str() == "about:blank"
+}
+
 /// Agent-supplied URLs: accept scheme-less hosts ("example.com") by assuming
 /// https, but never fall back to a search query — an agent that meant to
-/// search should do so explicitly.
-fn parse_agent_url(input: &str) -> Result<Url, url::ParseError> {
-    match Url::parse(input) {
+/// search should do so explicitly. Anything that parses is then held to
+/// `agent_scheme_allowed`; the refusal names the rejected scheme so the agent
+/// can tell policy apart from a typo.
+fn parse_agent_url(input: &str) -> Result<Url, String> {
+    let parsed = match Url::parse(input) {
         Ok(url) => Ok(url),
         Err(url::ParseError::RelativeUrlWithoutBase) if !input.contains(' ') => {
             Url::parse(&format!("https://{input}"))
         },
         Err(error) => Err(error),
+    };
+    match parsed {
+        Ok(url) if agent_scheme_allowed(&url) => Ok(url),
+        Ok(url) => Err(format!(
+            "scheme {} is not allowed for agents — use http, https, data:, or about:blank",
+            url.scheme()
+        )),
+        Err(error) => Err(format!("bad url: {error}")),
     }
 }
 
@@ -920,8 +952,8 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                     // to act on.
                     state.reply_after_load(id, false, reply);
                 },
-                Err(error) => {
-                    let _ = reply.send(Outcome::Error { message: format!("bad url: {error}") });
+                Err(message) => {
+                    let _ = reply.send(Outcome::Error { message });
                 },
             }
         },
@@ -960,8 +992,8 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                 (Err(outcome), _) => {
                     let _ = reply.send(outcome);
                 },
-                (_, Err(error)) => {
-                    let _ = reply.send(Outcome::Error { message: format!("bad url: {error}") });
+                (_, Err(message)) => {
+                    let _ = reply.send(Outcome::Error { message });
                 },
             }
         },
