@@ -5,8 +5,8 @@ milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
 status: executing
-stopped_at: Completed 02-08-PLAN.md
-last_updated: "2026-08-16T08:47:46.358Z"
+stopped_at: Completed 02-09-PLAN.md
+last_updated: "2026-08-16T09:21:40.006Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
-Plan: 9 of 11
+Plan: 10 of 11
 Status: Ready to execute
 Last activity: 2026-08-16 — Phase 02 execution started
 
@@ -66,6 +66,7 @@ Progress: [███████░░░] 73%
 | Phase 02 P06 | 41min | 3 tasks | 3 files |
 | Phase 02 P07 | 47min | 3 tasks | 2 files |
 | Phase 02 P08 | 29min | 3 tasks | 3 files |
+| Phase 02 P09 | 33m | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -99,6 +100,9 @@ Recent decisions affecting current work:
 - [Phase ?]: 02-08: MCP tab lifecycle notifications ride notifications/message via McpServer::notify_log_message, with ServerCapabilities.logging declared; the payload is the serialized protocol Event so no follow-up tabs_list is needed
 - [Phase ?]: 02-08: The proxy's event sink lives on ShellConnection and the reader forwards without filtering — the shell already addressed each event to the owning session, and a fan-out here would re-broaden it
 - [Phase ?]: 02-08: AGENT-04 stays In Progress: close and crash reach MCP clients, but talaria_protocol::Event has no tab-open variant, so a popup adopted under an agent's tab is still poll-only (deferred-items.md)
+- [Phase ?]: Vault write path keys on the entry URL's host plus username, not the whole URL, so re-saving the same login from a different page updates it (02-09)
+- [Phase ?]: Plaintext vault import removes the source only after re-reading, decrypting and entry-count-matching the encrypted file; a failed verification chmods the source 0600 and logs at error level (02-09)
+- [Phase ?]: Vault one-shot notices (plaintext import, keychain downgrade) live on Vault itself with read/clear accessors, so app.rs needed no change; the chrome that renders them is plan 02-10 (02-09)
 
 ### Pending Todos
 
@@ -121,6 +125,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T08:47:39.593Z
-Stopped at: Completed 02-08-PLAN.md
+Last session: 2026-08-16T09:21:39.999Z
+Stopped at: Completed 02-09-PLAN.md
 Resume file: None
