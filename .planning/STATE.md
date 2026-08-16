@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
 status: executing
-stopped_at: Completed 02-04-PLAN.md
-last_updated: "2026-08-16T06:25:22.662Z"
+stopped_at: Completed 02-05-PLAN.md
+last_updated: "2026-08-16T07:19:38.031Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
   total_phases: 1
   completed_phases: 0
   total_plans: 11
-  completed_plans: 4
+  completed_plans: 5
 ---
 
 # Project State
@@ -28,11 +28,11 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
-Plan: 5 of 11
+Plan: 6 of 11
 Status: Ready to execute
 Last activity: 2026-08-16 — Phase 02 execution started
 
-Progress: [████░░░░░░] 36%
+Progress: [█████░░░░░] 45%
 
 ## Performance Metrics
 
@@ -62,6 +62,7 @@ Progress: [████░░░░░░] 36%
 | Phase 02 P02 | 23m | 2 tasks | 3 files |
 | Phase 02 P03 | 24min | 3 tasks | 9 files |
 | Phase 02 P04 | 26min | 3 tasks | 4 files |
+| Phase 02 P05 | 49min | 3 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -83,6 +84,9 @@ Recent decisions affecting current work:
 - [Phase ?]: download cap and byte count are computed from bytes read/written, never from content-length (attacker-controlled)
 - [Phase ?]: an unparseable TALARIA_MAX_DOWNLOAD_BYTES falls back to the 2 GiB default, never to zero or unbounded
 - [Phase ?]: tokio oneshot Sender::is_closed() is the cancellation handle for off-thread work — the control socket already drops the receiver on command timeout
+- [Phase ?]: 02-05: the MCP retry is expressed as a two-state Attempt enum — NotSent is reachable only from a failed send on the outbound channel, so a request a live connection accepted is structurally un-retryable
+- [Phase ?]: 02-05: bounding each control-socket write by the command timeout is what makes awaiting the writer at teardown safe instead of stranding it
+- [Phase ?]: 02-05: MCP tool calls are dispatched concurrently by rust-mcp-sdk, so a back-to-back ordering assertion passes against a serialising connection half the time — the slow call needs a head start for the test to bind
 
 ### Pending Todos
 
@@ -104,6 +108,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T06:25:16.594Z
-Stopped at: Completed 02-04-PLAN.md
+Last session: 2026-08-16T07:19:38.025Z
+Stopped at: Completed 02-05-PLAN.md
 Resume file: None
