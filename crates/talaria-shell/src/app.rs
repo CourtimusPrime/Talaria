@@ -803,6 +803,16 @@ impl ApplicationHandler<AppEvent> for App {
                 .is_none_or(|p| (p.y / state.window.scale_factor()) < state.toolbar_height.get() as f64)
         };
 
+        // When the chrome has replaced the page — the credentials panel, or a
+        // crashed tab's recovery page — the area below the toolbar belongs to
+        // egui, not to a webview. Without this, a click down there is
+        // forwarded to a page nobody can see and the panel's own buttons are
+        // unreachable by mouse.
+        let chrome_replaces_page = |state: &Shared| {
+            GUI.with_borrow(|gui| gui.as_ref().is_some_and(|gui| gui.credentials_open()))
+                || state.tabs.borrow().displayed().is_some_and(|tab| tab.crashed)
+        };
+
         let mut repaint_now = false;
         match &event {
             WindowEvent::CloseRequested => {
@@ -838,7 +848,9 @@ impl ApplicationHandler<AppEvent> for App {
                     forward_mouse_move(&state, *position);
                 }
             },
-            WindowEvent::MouseInput { button, state: element_state, .. } if !over_toolbar(&state) => {
+            WindowEvent::MouseInput { button, state: element_state, .. }
+                if !over_toolbar(&state) && !chrome_replaces_page(&state) =>
+            {
                 GUI.with_borrow_mut(|gui| {
                     if let Some(gui) = gui.as_mut() {
                         gui.surrender_focus();
@@ -846,7 +858,9 @@ impl ApplicationHandler<AppEvent> for App {
                 });
                 forward_mouse_button(&state, *button, *element_state);
             },
-            WindowEvent::MouseWheel { delta, .. } if !over_toolbar(&state) => {
+            WindowEvent::MouseWheel { delta, .. }
+                if !over_toolbar(&state) && !chrome_replaces_page(&state) =>
+            {
                 forward_wheel(&state, *delta);
             },
             WindowEvent::KeyboardInput { event: key_event, .. }
@@ -902,7 +916,8 @@ fn set_wait(event_loop: &ActiveEventLoop, state: &Rc<Shared>) {
 /// Standard browser keyboard shortcuts, intercepted before both egui and the
 /// page: Ctrl+L (focus URL bar), Ctrl+T (new tab), Ctrl+W (close tab),
 /// Ctrl+R / F5 (reload), Alt+Left / Alt+Right (back / forward),
-/// Ctrl+Tab / Ctrl+Shift+Tab (cycle tabs). Returns true when consumed.
+/// Ctrl+Tab / Ctrl+Shift+Tab (cycle tabs), Ctrl+K (credentials panel).
+/// Returns true when consumed.
 fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEvent) -> bool {
     use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamedKey};
 
@@ -921,6 +936,14 @@ fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEven
                 });
                 state.window.request_redraw();
                 return true;
+            },
+            "k" => {
+                // Human-only surface: the toggle is a keystroke and a toolbar
+                // button, never a command an agent can send.
+                let open = GUI.with_borrow(|gui| {
+                    gui.as_ref().is_some_and(|gui| gui.credentials_open())
+                });
+                Some(UiAction::SetCredentialsPanel(!open))
             },
             "t" => Some(UiAction::NewTab),
             "w" => state
@@ -1094,6 +1117,37 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                     tab.crashed = false;
                     tab.webview.reload();
                 }
+            },
+            UiAction::SaveCredential(entry) => {
+                let mut vault = state.vault.borrow_mut();
+                vault.upsert(entry);
+                drop(vault);
+                state.window.request_redraw();
+            },
+            UiAction::DeleteCredential { host, username } => {
+                let mut vault = state.vault.borrow_mut();
+                let removed = vault.delete(&host, &username);
+                drop(vault);
+                if !removed {
+                    // Not fatal, but the user just pressed a delete and
+                    // nothing went — say so rather than looking like it did.
+                    log::warn!("no stored credential for {username} at {host}");
+                }
+                state.window.request_redraw();
+            },
+            UiAction::SetCredentialsPanel(open) => {
+                GUI.with_borrow_mut(|gui| {
+                    if let Some(gui) = gui.as_mut() {
+                        gui.set_credentials_panel(open);
+                    }
+                });
+                state.window.request_redraw();
+            },
+            UiAction::DismissVaultNotice => {
+                let mut vault = state.vault.borrow_mut();
+                vault.clear_notices();
+                drop(vault);
+                state.window.request_redraw();
             },
         }
     }

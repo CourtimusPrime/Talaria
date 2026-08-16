@@ -29,10 +29,6 @@ const MAGIC: &[u8; 8] = b"TALARIA1";
 /// outcomes the user got. A `source_removed` of `false` means a readable
 /// plaintext copy of their passwords is still sitting on disk, which is
 /// exactly the thing they must not be left believing was cleaned up.
-// Allowed dead for the same reason as [`Vault::upsert`]: the chrome that reads
-// these fields lands in plan 02-10, and this crate is a binary, so until then
-// they read as unreachable from the crate root.
-#[allow(dead_code)]
 pub struct ImportNotice {
     /// The plaintext file that was imported.
     pub path: PathBuf,
@@ -332,10 +328,6 @@ impl Vault {
     /// so it is appended rather than replacing anything. A user typing a bare
     /// hostname into a credentials panel is a real case, and keeping an
     /// unmatched entry is better than silently discarding their input.
-    // Allowed dead: this is the storage half of the credentials capture path.
-    // The chrome that calls it lands in plan 02-10, and this crate is a binary,
-    // so until then a `pub` method reads as unreachable from the crate root.
-    #[allow(dead_code)]
     pub fn upsert(&mut self, entry: CredentialEntry) {
         let host = entry_host(&entry.url);
         let existing = host.and_then(|host| {
@@ -353,8 +345,6 @@ impl Vault {
 
     /// Remove the entry keyed on `host` and `username`, reporting whether one
     /// was there. Persists only when something was actually removed.
-    // Allowed dead for the same reason as [`Vault::upsert`].
-    #[allow(dead_code)]
     pub fn delete(&mut self, host: &str, username: &str) -> bool {
         let host = normalise_domain(host);
         let before = self.entries.len();
@@ -372,31 +362,22 @@ impl Vault {
     /// Every stored entry, borrowed so a UI can list them without cloning the
     /// whole vector. Pairs with [`Vault::matching`], which clones because its
     /// result crosses the control socket.
-    // Allowed dead for the same reason as [`Vault::upsert`].
-    #[allow(dead_code)]
     pub fn entries(&self) -> &[CredentialEntry] {
         &self.entries
     }
 
     /// The one-shot plaintext-import notice, when this load imported one.
-    // Allowed dead for the same reason as [`Vault::upsert`]: the chrome that
-    // renders these notices lands in plan 02-10.
-    #[allow(dead_code)]
     pub fn import_notice(&self) -> Option<&ImportNotice> {
         self.import_notice.as_ref()
     }
 
     /// Whether data-at-rest protection was downgraded to a key file beside
     /// the encrypted vault during this load.
-    // Allowed dead for the same reason as [`Vault::import_notice`].
-    #[allow(dead_code)]
     pub fn key_downgraded(&self) -> bool {
         self.key_downgraded
     }
 
     /// Clear both one-shot notices, once the chrome has shown them.
-    // Allowed dead for the same reason as [`Vault::import_notice`].
-    #[allow(dead_code)]
     pub fn clear_notices(&mut self) {
         self.import_notice = None;
         self.key_downgraded = false;

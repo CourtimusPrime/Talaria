@@ -13,6 +13,7 @@ use egui::{LayerId, PaintCallback};
 use egui_glow::CallbackFn;
 use egui_glow::winit::EguiGlow;
 use servo::{RenderingContext, WindowRenderingContext};
+use talaria_protocol::CredentialEntry;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
@@ -32,6 +33,21 @@ pub enum UiAction {
     Reload,
     /// Reload a crashed tab: clears the crashed flag and reloads the page.
     ReloadCrashed(u64),
+    /// Store a credential the user typed into the credentials panel. The
+    /// panel cannot write the vault itself — a `borrow_mut` inside the egui
+    /// closure is the named anti-pattern, so the write leaves as an intent
+    /// and lands in `apply_ui_actions` once egui's borrows are released.
+    SaveCredential(CredentialEntry),
+    /// Remove the stored credential keyed on a **bare host** plus a username.
+    /// `Vault::delete` normalises a domain, not an address, so the panel
+    /// passes the host parsed out of the row's URL rather than the URL.
+    DeleteCredential { host: String, username: String },
+    /// Open or close the credentials panel. Even this goes through the
+    /// round trip: teaching a later reader that "some" mutations are legal
+    /// inline is how the anti-pattern comes back.
+    SetCredentialsPanel(bool),
+    /// Clear the vault's one-shot notices, once the chrome has shown them.
+    DismissVaultNotice,
 }
 
 pub struct Gui {
@@ -40,6 +56,43 @@ pub struct Gui {
     /// Ctrl+L: select the whole URL on the frame the bar gains focus, so
     /// typing replaces it (browser behaviour) instead of appending.
     select_location: bool,
+    /// Whether the credentials panel has replaced the page. View state, so it
+    /// lives here rather than on `Shared`.
+    credentials_open: bool,
+    /// Put the caret in the panel's first field on the frame it opens, so the
+    /// panel is usable from the keyboard alone (Ctrl+K, type, Tab, Enter).
+    focus_credentials: bool,
+    /// Draft inputs for the add form, cleared once saved.
+    credential_site: String,
+    credential_username: String,
+    credential_password: String,
+    /// Which stored row, if any, currently has its password on screen. One at
+    /// a time and never across a close: a list that shows every password at a
+    /// glance is the shoulder-surfing surface the encryption exists to avoid.
+    revealed_entry: Option<usize>,
+}
+
+/// The bare host of a stored entry's URL — what [`UiAction::DeleteCredential`]
+/// and `Vault::delete` key on. An entry whose URL has no parseable host (a
+/// hand-written `vault.json` can hold one) falls back to the raw string, so
+/// the row still shows something and still names itself.
+fn entry_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| url.trim().to_ascii_lowercase())
+}
+
+/// The URL a typed site becomes. A user types `example.com`; stored as typed,
+/// that entry has no parseable host, so it would never match a domain and
+/// could never be deleted again. Completing it to https keeps every entry the
+/// panel creates addressable by the same key the vault matches on.
+fn credential_url(site: &str) -> String {
+    let site = site.trim();
+    match url::Url::parse(site) {
+        Ok(url) if url.host_str().is_some() => url.to_string(),
+        _ => format!("https://{site}"),
+    }
 }
 
 impl Gui {
@@ -58,7 +111,17 @@ impl Gui {
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         context.egui_ctx.set_fonts(fonts);
-        Self { context, rendering_context, select_location: false }
+        Self {
+            context,
+            rendering_context,
+            select_location: false,
+            credentials_open: false,
+            focus_credentials: false,
+            credential_site: String::new(),
+            credential_username: String::new(),
+            credential_password: String::new(),
+            revealed_entry: None,
+        }
     }
 
     pub fn on_window_event(
@@ -81,6 +144,23 @@ impl Gui {
         self.select_location = true;
     }
 
+    /// Whether the credentials panel is currently showing. Read by the
+    /// Ctrl+K shortcut so the toggle it emits is an intent like any other.
+    pub fn credentials_open(&self) -> bool {
+        self.credentials_open
+    }
+
+    /// Show or hide the credentials panel. Only [`UiAction::SetCredentialsPanel`]
+    /// calls this, from `apply_ui_actions` — never the egui closure.
+    ///
+    /// A revealed password never survives the panel closing, and opening puts
+    /// the caret in the first field so the whole panel is keyboard-reachable.
+    pub fn set_credentials_panel(&mut self, open: bool) {
+        self.credentials_open = open;
+        self.revealed_entry = None;
+        self.focus_credentials = open;
+    }
+
     pub fn surrender_focus(&self) {
         self.context.egui_ctx.memory_mut(|memory| {
             if let Some(id) = memory.focused() {
@@ -99,6 +179,15 @@ impl Gui {
         let _ = self.rendering_context.make_current();
         let mut actions: Vec<UiAction> = Vec::new();
         let mut select_location = std::mem::take(&mut self.select_location);
+        // The closure cannot see `self` (its `context` field is borrowed for
+        // the whole frame), so the panel's view state travels in and out as
+        // locals — the same shape `select_location` already uses.
+        let credentials_open = self.credentials_open;
+        let mut focus_credentials = std::mem::take(&mut self.focus_credentials);
+        let mut revealed_entry = self.revealed_entry;
+        let mut credential_site = std::mem::take(&mut self.credential_site);
+        let mut credential_username = std::mem::take(&mut self.credential_username);
+        let mut credential_password = std::mem::take(&mut self.credential_password);
 
         self.context.run(&shared.window, |ctx| {
             let mut tabs = shared.tabs.borrow_mut();
@@ -133,6 +222,21 @@ impl Gui {
                     let new_tab = ui.button(egui_phosphor::regular::PLUS).on_hover_text("New tab (Ctrl+T)").clicked();
                     if new_tab {
                         actions.push(UiAction::NewTab);
+                    }
+
+                    // The credentials surface is human-only. It opens from
+                    // this button and from Ctrl+K, and from nowhere else: no
+                    // control-socket command reaches it, so an agent cannot
+                    // drive the human's own takeover affordance as a tool.
+                    if ui
+                        .add(
+                            egui::Button::new(egui_phosphor::regular::KEY)
+                                .selected(credentials_open),
+                        )
+                        .on_hover_text("Credentials (Ctrl+K)")
+                        .clicked()
+                    {
+                        actions.push(UiAction::SetCredentialsPanel(!credentials_open));
                     }
 
                     if let Some(tab) = tabs.displayed() {
@@ -303,13 +407,178 @@ impl Gui {
                 .displayed()
                 .filter(|tab| tab.crashed)
                 .map(|tab| tab.id);
+            // The credentials panel replaces the page, so the tab is neither
+            // painted nor blitted while it is up.
             let displayed = tabs
                 .displayed()
-                .filter(|tab| !tab.crashed)
+                .filter(|tab| !tab.crashed && !credentials_open)
                 .map(|tab| (tab.webview.clone(), tab.rendering_context.clone()));
             drop(tabs);
 
-            if let Some(tab_id) = crashed_tab {
+            if credentials_open {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let vault = shared.vault.borrow();
+
+                        // The one-shot notices: things a `log::warn!` cannot
+                        // tell a user who has no terminal open. Shown here
+                        // once, then cleared through the dismiss intent.
+                        let mut notice_shown = false;
+                        if let Some(notice) = vault.import_notice() {
+                            let path = notice.path.display();
+                            let text = match notice.source_removed {
+                                true => format!(
+                                    "Imported credentials from {path} and removed that \
+                                     plaintext file — they are encrypted now."
+                                ),
+                                false => format!(
+                                    "Imported credentials from {path}, but that file could \
+                                     not be removed: a readable plaintext copy of these \
+                                     passwords is still on disk there (now owner-only). \
+                                     Delete it yourself."
+                                ),
+                            };
+                            ui.label(text);
+                            notice_shown = true;
+                        }
+                        if vault.key_downgraded() {
+                            ui.label(
+                                "The OS keychain was unavailable, so the vault key now sits \
+                                 in an owner-only file beside the encrypted vault. Anyone \
+                                 who can read your home directory can decrypt it.",
+                            );
+                            notice_shown = true;
+                        }
+                        if notice_shown {
+                            if ui.button("Dismiss").clicked() {
+                                actions.push(UiAction::DismissVaultNotice);
+                            }
+                            ui.separator();
+                        }
+
+                        ui.heading(format!("{} Credentials", egui_phosphor::regular::KEY));
+                        ui.label(
+                            "Saved logins are encrypted at rest and offered back in the \
+                             toolbar when you visit a matching site. They are never typed \
+                             into a page for you.",
+                        );
+                        ui.add_space(8.0);
+
+                        let field = |ui: &mut egui::Ui,
+                                     label: &str,
+                                     id: &'static str,
+                                     text: &mut String| {
+                            ui.horizontal(|ui| {
+                                ui.label(label);
+                                ui.add(
+                                    egui::TextEdit::singleline(text)
+                                        .id(egui::Id::new(id))
+                                        .desired_width(320.0),
+                                )
+                            })
+                            .inner
+                        };
+                        let site = field(ui, "Site", "credential-site", &mut credential_site);
+                        if focus_credentials {
+                            site.request_focus();
+                            focus_credentials = false;
+                        }
+                        field(
+                            ui,
+                            "Username",
+                            "credential-username",
+                            &mut credential_username,
+                        );
+                        // Masked as it is typed, like every other password
+                        // field the user has ever met — and so a screen share
+                        // or a shoulder does not capture it on the way in.
+                        let secret = ui
+                            .horizontal(|ui| {
+                                ui.label("Password");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut credential_password)
+                                        .id(egui::Id::new("credential-password"))
+                                        .password(true)
+                                        .desired_width(320.0),
+                                )
+                            })
+                            .inner;
+
+                        let complete = !credential_site.trim().is_empty()
+                            && !credential_username.trim().is_empty()
+                            && !credential_password.is_empty();
+                        // Enter in the password field is the save, following
+                        // the location bar's lost-focus-then-Enter idiom.
+                        let entered = secret.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        let saved = ui
+                            .add_enabled(complete, egui::Button::new("Save"))
+                            .clicked();
+                        if complete && (saved || entered) {
+                            actions.push(UiAction::SaveCredential(CredentialEntry {
+                                url: credential_url(&credential_site),
+                                username: credential_username.trim().to_owned(),
+                                password: std::mem::take(&mut credential_password),
+                                cookies: Vec::new(),
+                            }));
+                            credential_site.clear();
+                            credential_username.clear();
+                        }
+
+                        ui.separator();
+                        ui.heading("Stored");
+                        let entries = vault.entries();
+                        if entries.is_empty() {
+                            ui.label("Nothing saved yet.");
+                        }
+                        for (index, entry) in entries.iter().enumerate() {
+                            let host = entry_host(&entry.url);
+                            ui.horizontal(|ui| {
+                                ui.label(&host);
+                                ui.label(&entry.username);
+                                // Masked by default: a credentials list that
+                                // shows every password at a glance is the
+                                // shoulder-surfing surface the vault's
+                                // encryption was meant to avoid, so revealing
+                                // one is a deliberate, one-at-a-time act.
+                                let revealed = revealed_entry == Some(index);
+                                let glyph = match revealed {
+                                    true => egui_phosphor::regular::EYE_SLASH,
+                                    false => egui_phosphor::regular::EYE,
+                                };
+                                if ui
+                                    .selectable_label(revealed, glyph)
+                                    .on_hover_text("Show password")
+                                    .clicked()
+                                {
+                                    revealed_entry = match revealed {
+                                        true => None,
+                                        false => Some(index),
+                                    };
+                                }
+                                match revealed {
+                                    true => ui.label(&entry.password),
+                                    false => ui.label("••••••••"),
+                                };
+                                if ui
+                                    .button(egui_phosphor::regular::TRASH)
+                                    .on_hover_text("Delete")
+                                    .clicked()
+                                {
+                                    // A removal renumbers the rows below it,
+                                    // so a reveal must not outlive it and
+                                    // uncover a different entry.
+                                    revealed_entry = None;
+                                    actions.push(UiAction::DeleteCredential {
+                                        host: host.clone(),
+                                        username: entry.username.clone(),
+                                    });
+                                }
+                            });
+                        }
+                    });
+                });
+            } else if let Some(tab_id) = crashed_tab {
                 // Crashed state replaces the page (same shape as "Aw, Snap").
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
@@ -348,6 +617,12 @@ impl Gui {
                 }
             }
         });
+
+        self.focus_credentials = focus_credentials;
+        self.revealed_entry = revealed_entry;
+        self.credential_site = credential_site;
+        self.credential_username = credential_username;
+        self.credential_password = credential_password;
 
         if self.context.egui_ctx.has_requested_repaint() {
             shared.window.request_redraw();
