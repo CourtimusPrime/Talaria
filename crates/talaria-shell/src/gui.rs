@@ -239,6 +239,44 @@ impl Gui {
                         actions.push(UiAction::SetCredentialsPanel(!credentials_open));
                     }
 
+                    // Autofill (D-23) is a *suggestion in the chrome*, matched
+                    // on the host the human is actually looking at. It never
+                    // writes into the page: no script is evaluated, no form
+                    // field is located, no DOM node is touched. Injection
+                    // would collide with an agent's own `evaluate` on the same
+                    // form, and it would put the user's password inside a
+                    // document every script on that page can read. Filling the
+                    // form directly looks friendlier, and is the change most
+                    // likely to be made by someone who has not read this.
+                    //
+                    // It is also driven entirely by what the human is looking
+                    // at: an agent has no way to make it appear and no way to
+                    // read what it shows.
+                    let suggestion_host = tabs.displayed().and_then(|tab| {
+                        let address = tab
+                            .webview
+                            .url()
+                            .map(|url| url.to_string())
+                            .filter(|url| !url.is_empty())
+                            .unwrap_or_else(|| tab.location.clone());
+                        url::Url::parse(&address)
+                            .ok()
+                            .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+                    });
+                    // Exact-or-subdomain matching, borrowed from the vault
+                    // rather than reimplemented here, so a lookalike host does
+                    // not match on a substring.
+                    let suggestions = suggestion_host
+                        .as_deref()
+                        .map(|host| shared.vault.borrow().matching(host))
+                        .unwrap_or_default();
+                    // Reserve room before the location bar claims the rest of
+                    // the row, so the suggestion has somewhere to sit.
+                    let suggestion_width = match suggestions.is_empty() {
+                        true => 0.0,
+                        false => 168.0,
+                    };
+
                     if let Some(tab) = tabs.displayed() {
                         if tab.webview.load_status() != servo::LoadStatus::Complete
                             && !tab.crashed
@@ -250,7 +288,7 @@ impl Gui {
                         let output = egui::TextEdit::singleline(&mut tab.location)
                             .id(egui::Id::new("location-bar"))
                             .hint_text("Search or enter address")
-                            .desired_width(ui.available_width())
+                            .desired_width((ui.available_width() - suggestion_width).max(80.0))
                             .show(ui);
                         let response = output.response;
                         if select_location && response.has_focus() {
@@ -283,6 +321,51 @@ impl Gui {
                         }
                     } else {
                         ui.label("No tab open");
+                    }
+
+                    if let Some(host) = suggestion_host.filter(|_| !suggestions.is_empty()) {
+                        // Named, so the user sees which login they are about
+                        // to copy before a lookalike host can borrow one.
+                        let label = match suggestions.len() {
+                            1 => format!(
+                                "{} {}",
+                                egui_phosphor::regular::KEY,
+                                suggestions[0].username
+                            ),
+                            count => {
+                                format!("{} {count} logins", egui_phosphor::regular::KEY)
+                            },
+                        };
+                        ui.menu_button(label, |ui| {
+                            ui.label(format!("Saved for {host}"));
+                            for entry in &suggestions {
+                                ui.horizontal(|ui| {
+                                    ui.label(&entry.username);
+                                    // A clipboard write is not shell state, so
+                                    // it needs no intent — and no other inline
+                                    // mutation belongs here.
+                                    if ui.button("Copy username").clicked() {
+                                        ui.ctx().copy_text(entry.username.clone());
+                                        ui.close();
+                                    }
+                                    // T-02-10-04, accepted: this puts the
+                                    // password on the system clipboard, where
+                                    // other applications can read it. It is an
+                                    // explicit act on an obviously-labelled
+                                    // control, and it is exactly what the user
+                                    // would otherwise do by hand out of a
+                                    // password manager.
+                                    if ui.button("Copy password").clicked() {
+                                        ui.ctx().copy_text(entry.password.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Saved logins for this site — copied, never typed into the page",
+                        );
                     }
                 });
             });
