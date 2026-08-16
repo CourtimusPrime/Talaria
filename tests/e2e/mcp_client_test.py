@@ -125,6 +125,73 @@ r = call("evaluate", {"tab_id": 9999, "script": "1"})
 assert r.get("isError") or "_rpc_error" in r, r
 print("error path (bad tab) ok:", json.dumps(r)[:120])
 
+# Concurrency (MCP-11): two tool calls in flight at once on one session, with
+# no read between them. The tabs_list must come back first and fast — if the
+# proxy holds its connection lock across a round trip, it cannot.
+#
+# The second call is issued a beat after the first rather than in the same
+# breath. Both are dispatched concurrently by the server runtime, so with a
+# serialising connection it is a coin flip which one reaches the lock first;
+# the beat makes the slow call the definite holder, and the assertion then
+# fails on a serialising connection every time instead of half the time.
+
+def send_call(tool, args):
+    """Write one tools/call without waiting for its response."""
+    global msg_id
+    msg_id += 1
+    proc.stdin.write(json.dumps({
+        "jsonrpc": "2.0", "id": msg_id, "method": "tools/call",
+        "params": {"name": tool, "arguments": args},
+    }) + "\n")
+    proc.stdin.flush()
+    return msg_id
+
+
+def next_response(wanted):
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            sys.exit(f"talaria-mcp died: {proc.stderr.read()[-800:]}")
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("id") in wanted:
+            return r
+
+
+r = call("tabs_open", {"url": "https://example.com/"})
+assert not r.get("isError"), r
+slow_tab = json.loads(r["content"][0]["text"])["tab"]["tab_id"]
+time.sleep(6)
+
+# A synchronous busy-wait, so no promise polling is involved and the call
+# still finishes inside the shared shell's 3s command timeout.
+slow = send_call("evaluate", {
+    "tab_id": slow_tab,
+    "script": "var t=Date.now();while(Date.now()-t<1500){};'slow'",
+})
+time.sleep(0.4)
+t0 = time.monotonic()
+fast = send_call("tabs_list", {})
+order, seen, fast_dt = [], {}, None
+while len(seen) < 2:
+    r = next_response({slow, fast})
+    if r["id"] == fast:
+        fast_dt = time.monotonic() - t0
+    order.append(r["id"])
+    seen[r["id"]] = r
+assert not seen[slow]["result"].get("isError"), seen[slow]
+assert not seen[fast]["result"].get("isError"), seen[fast]
+assert json.loads(seen[slow]["result"]["content"][0]["text"])["value"] == "slow", seen[slow]
+assert order[0] == fast, f"tabs_list was gated on the slow evaluate: {order}"
+assert fast_dt < 0.5, f"tabs_list took {fast_dt:.1f}s — it waited on the evaluate"
+print(f"CONCURRENT tool calls: tabs_list returned in {fast_dt:.2f}s "
+      "while the evaluate was still outstanding")
+
+r = call("tabs_close", {"tab_id": slow_tab})
+assert not r.get("isError"), r
+
 proc.stdin.close()
 proc.wait(timeout=5)
 print("ALL MCP CLIENT CHECKS PASSED")
