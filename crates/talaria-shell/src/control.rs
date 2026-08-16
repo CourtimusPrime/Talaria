@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use talaria_protocol::{
-    ensure_socket_dir, socket_dir, socket_path, ClientMessage, Command, Outcome, ServerMessage,
+    current_uid, ensure_socket_dir, socket_dir, socket_path, ClientMessage, Command, Outcome,
+    ServerMessage,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -128,6 +129,14 @@ async fn serve(proxy: EventLoopProxy<AppEvent>) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
+                // Before the spawn, so a rejected peer never reaches the
+                // handshake and never consumes a session id.
+                if let Err(reason) = peer_uid_ok(&stream) {
+                    // Nothing is written back: the peer gets a closed
+                    // connection, not a hint about what the check was.
+                    log::warn!("control connection refused: {reason}");
+                    continue;
+                }
                 let proxy = proxy.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, proxy).await {
@@ -139,6 +148,26 @@ async fn serve(proxy: EventLoopProxy<AppEvent>) {
                 log::warn!("control accept error: {error}");
             },
         }
+    }
+}
+
+/// Accept only peers running as the same OS user as the shell.
+///
+/// Scope: this stops *another local user* from driving the browser — the
+/// `Hello` line is self-asserted and was the only identity on the wire. It is
+/// deliberately not a per-agent permission layer: every accepted peer keeps
+/// the same full tool surface it has today.
+///
+/// Fails closed. A peer whose credentials the kernel will not vouch for is
+/// exactly the case this gate exists for, so a lookup error is a rejection.
+fn peer_uid_ok(stream: &UnixStream) -> Result<(), String> {
+    let ours = current_uid();
+    match stream.peer_cred() {
+        Ok(credential) if credential.uid() == ours => Ok(()),
+        Ok(credential) => {
+            Err(format!("peer uid {} is not ours ({ours})", credential.uid()))
+        },
+        Err(error) => Err(format!("peer credentials unavailable: {error}")),
     }
 }
 
