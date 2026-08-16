@@ -5,8 +5,8 @@ milestone_name: milestone
 current_phase: 02
 current_phase_name: harden-the-agent-surface
 status: executing
-stopped_at: Completed 02-01-PLAN.md — baseline GREEN, branch lock enforced
-last_updated: "2026-08-16T05:27:45.775Z"
+stopped_at: Completed 02-02-PLAN.md
+last_updated: "2026-08-16T05:54:35.378Z"
 last_activity: 2026-08-16
 last_activity_desc: Phase 02 execution started
 progress:
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 02 (harden-the-agent-surface) — EXECUTING
-Plan: 2 of 11
+Plan: 3 of 11
 Status: Ready to execute
 Last activity: 2026-08-16 — Phase 02 execution started
 
@@ -59,6 +59,7 @@ Progress: [█░░░░░░░░░] 9%
 | Plan | Duration | Tasks | Files |
 |------|----------|-------|-------|
 | Phase 02 P01 | 15m | 3 tasks | 3 files |
+| Phase 02 P02 | 23m | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -73,6 +74,8 @@ Recent decisions affecting current work:
 - Phase 2: D-28: overnight lock records os.getppid() (or explicit --pid) instead of os.getpid(), so PID liveness is meaningful; dead owners self-clear, live ones still refuse
 - Phase 2: D-29: .githooks/pre-commit calls overnight_lock.py check via core.hooksPath, making the branch-lock preflight non-optional
 - Phase 2: Phase 2 baseline verdict GREEN — all 9 e2e suites pass at 16411ee, so later failures in this phase are attributable
+- [Phase ?]: 02-02: agent URL allowlist is http, https, data, and the exact about:blank literal; the about: scheme as a whole is not admitted because popup adoption depends on that one string
+- [Phase ?]: 02-02: resolve_location now names file: alongside about: so the human omnibox can open a local file — D-02's unrestricted human path did not actually work before
 
 ### Pending Todos
 
@@ -83,6 +86,7 @@ None yet.
 - **REL-02 has no chosen approach** — Tauri's updater plugin no longer applies to the egui shell. Decide before Phase 7; does not block Phases 2–6.
 - ~~**`.overnight-lock` is advisory**~~ — RESOLVED by plan 02-01. `.githooks/pre-commit` enforces the lock at commit time via `core.hooksPath`, and a lock whose owning PID is dead now self-clears instead of refusing. The stale `c85a1ef3` / pid 2796577 lock was cleared.
 - **Verification weight sits almost entirely in the Python e2e suite** — only three Rust unit tests exist, and there is no CI (TEST-03, Phase 2).
+- MCP-09 half closed: parse_agent_url refuses file:/javascript:/blob:, but an agent with an evaluate handle still reaches the filesystem via location.href='file://...' or window.open('file://...') — proven readable end to end. Needs WebViewDelegate::request_navigation + request_create_new policy on agent-owned tabs; out of 02-02's scope. Do not mark MCP-09 complete until a follow-up plan lands.
 
 ## Deferred Items
 
@@ -93,6 +97,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-16T05:27:39.873Z
-Stopped at: Completed 02-01-PLAN.md — baseline GREEN, branch lock enforced
+Last session: 2026-08-16T05:54:35.372Z
+Stopped at: Completed 02-02-PLAN.md
 Resume file: None
