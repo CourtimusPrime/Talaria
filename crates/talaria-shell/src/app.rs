@@ -1770,19 +1770,10 @@ impl servo::WebViewDelegate for Shared {
         // window.open / target=_blank: a new tab in the parent's view with the
         // parent's owner (an agent's popups stay that agent's). No popup
         // blocking — Talaria isn't a policy layer.
-        let Ok(mut tabs) = self.tabs.try_borrow_mut() else {
-            log::warn!("dropping popup request: tab table busy");
-            return;
-        };
-        let Some(parent_id) = tabs.find_by_webview(&parent_webview) else {
-            return;
-        };
-        let owner = tabs.get(parent_id).map(|t| t.owner.clone()).expect("just found");
-        // A popup fronts its own view when its opener was the active tab
-        // there (browser behaviour), and stays behind an opener that was
-        // already in the background. Which view is *displayed* is irrelevant:
-        // an agent's popup must not drag the human out of the Me view.
-        let parent_active = tabs.active_id(owner.view()) == Some(parent_id);
+        //
+        // Build the framebuffer and the webview first: neither needs the tab
+        // table, so the callback always gets this far and a busy table costs
+        // a deferral rather than the whole popup.
         let rendering_context =
             Rc::new(self.window_rendering_context.offscreen_context(self.window.inner_size()));
         let webview = request
@@ -1790,47 +1781,73 @@ impl servo::WebViewDelegate for Shared {
             .hidpi_scale_factor(euclid::Scale::new(self.hidpi_scale()))
             .delegate(parent_webview.delegate())
             .build();
-        // The popup's real URL arrives via notify_url_changed; until then the
-        // URL bar shows what a `window.open()` with no argument keeps forever.
-        let id = tabs.register(
-            webview,
-            rendering_context,
-            owner,
-            "about:blank".into(),
-            parent_active,
-            true,
-        );
-        drop(tabs);
-        log::info!("popup from tab {parent_id} opened as tab {id}");
+        match self.tabs.try_borrow_mut() {
+            Ok(mut tabs) => {
+                self.adopt_popup(&mut tabs, &parent_webview, webview, rendering_context)
+            },
+            Err(_) => {
+                // Routine churn, not a degraded condition: the adoption
+                // happens on the next loop turn instead of never.
+                log::debug!("popup adoption deferred: tab table busy");
+                self.pending_tab_work.borrow_mut().push(TabWork::AdoptPopup {
+                    parent: parent_webview,
+                    webview,
+                    rendering_context,
+                });
+            },
+        }
         self.window.request_redraw();
     }
 
     fn notify_new_frame_ready(&self, webview: WebView) {
         // Runs inside servo's painter borrow: only mark state, never paint
         // or toggle visibility here.
-        if let Ok(mut pending) = self.pending_captures.try_borrow_mut() {
-            for capture in pending.iter_mut().filter(|c| c.webview == webview) {
-                capture.ready = true;
-            }
+        match self.pending_captures.try_borrow_mut() {
+            Ok(mut pending) => {
+                for capture in pending.iter_mut().filter(|c| c.webview == webview) {
+                    capture.ready = true;
+                }
+            },
+            // This queue is only ever borrowed inside a scope that makes no
+            // call into servo, so contention here is an invariant violation
+            // rather than routine churn — and the cost is a capture that
+            // waits out its deadline and returns a stale frame. Loud, so it
+            // is never invisible again.
+            Err(_) => log::error!("capture-ready mark lost: pending_captures busy"),
         }
         self.window.request_redraw();
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: servo::LoadStatus) {
         // Only mark state here; replies are built from the event loop.
-        let tab_id = self.tabs.try_borrow().ok().and_then(|tabs| tabs.find_by_webview(&webview));
-        if let (Some(tab_id), Ok(mut pending)) = (tab_id, self.pending_loads.try_borrow_mut()) {
-            for load in pending.iter_mut().filter(|l| l.tab_id == tab_id) {
-                match status {
-                    servo::LoadStatus::Started | servo::LoadStatus::HeadParsed => {
-                        load.started = true;
-                    },
-                    servo::LoadStatus::Complete => {
-                        if load.started || !load.needs_start {
-                            load.ready = true;
+        let tab_id = match self.tabs.try_borrow() {
+            Ok(tabs) => tabs.find_by_webview(&webview),
+            Err(_) => {
+                log::error!("load-status mark lost: tab table busy");
+                None
+            },
+        };
+        if let Some(tab_id) = tab_id {
+            match self.pending_loads.try_borrow_mut() {
+                Ok(mut pending) => {
+                    for load in pending.iter_mut().filter(|l| l.tab_id == tab_id) {
+                        match status {
+                            servo::LoadStatus::Started | servo::LoadStatus::HeadParsed => {
+                                load.started = true;
+                            },
+                            servo::LoadStatus::Complete => {
+                                if load.started || !load.needs_start {
+                                    load.ready = true;
+                                }
+                            },
                         }
-                    },
-                }
+                    }
+                },
+                // Same invariant as above: this queue is never borrowed
+                // across a call into servo, so a failure here means a
+                // tabs_open / navigate reply waits out LOAD_WAIT instead of
+                // answering when the page actually finished.
+                Err(_) => log::error!("load-status mark lost for tab {tab_id}: pending_loads busy"),
             }
         }
         // Wakes the loop so pending loads get serviced; also refreshes the
@@ -1844,33 +1861,38 @@ impl servo::WebViewDelegate for Shared {
     }
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
-        if let Ok(mut tabs) = self.tabs.try_borrow_mut() {
-            if let Some(tab) = tabs.find_by_webview_mut(&webview) {
-                if !tab.location_dirty {
-                    tab.location = url.to_string();
-                }
-                // The navigation an adopted popup was waiting for has begun,
-                // so its blank grace window is over and `load_status` alone
-                // tells the truth from here. Servo runs a whole
-                // Started→Complete cycle on the popup's *own* blank document
-                // first, which is why load status can't be that signal.
-                if url.as_str() != "about:blank" {
-                    tab.initial_blank_until = None;
-                }
-            }
+        match self.tabs.try_borrow_mut() {
+            Ok(mut tabs) => apply_url_change(&mut tabs, &webview, &url),
+            // Skipping would leave the URL bar showing the previous page and,
+            // for an adopted popup, leave the blank grace window open so the
+            // tab keeps reporting as loading.
+            Err(_) => {
+                self.pending_tab_work
+                    .borrow_mut()
+                    .push(TabWork::UrlChanged { webview, url });
+            },
         }
         self.window.request_redraw();
     }
 
     fn notify_crashed(&self, webview: WebView, reason: String, backtrace: Option<String>) {
         log::error!("tab crashed: {reason} {backtrace:?}");
-        let mut crashed_tab = None;
-        if let Ok(mut tabs) = self.tabs.try_borrow_mut() {
-            if let Some(tab) = tabs.find_by_webview_mut(&webview) {
+        let crashed_tab = match self.tabs.try_borrow_mut() {
+            Ok(mut tabs) => tabs.find_by_webview_mut(&webview).map(|tab| {
                 tab.crashed = true;
-                crashed_tab = Some((tab.id, tab.owner.clone()));
-            }
-        }
+                (tab.id, tab.owner.clone())
+            }),
+            // Deferring keeps both halves. Skipping the mark would leave a
+            // dead tab looking healthy to tabs_list and to the crash page,
+            // and skipping the event would leave the agent to discover the
+            // crash from its next tool call.
+            Err(_) => {
+                self.pending_tab_work
+                    .borrow_mut()
+                    .push(TabWork::MarkCrashed { webview });
+                None
+            },
+        };
         if let Some((tab_id, owner)) = crashed_tab {
             self.queue_event(&owner, talaria_protocol::Event::TabCrashed { tab_id });
         }
@@ -1879,14 +1901,24 @@ impl servo::WebViewDelegate for Shared {
 
     fn notify_closed(&self, webview: WebView) {
         let mut closed = None;
-        if let Ok(mut tabs) = self.tabs.try_borrow_mut() {
-            // Owner before close, as on every other close path.
-            if let Some(id) = tabs.find_by_webview(&webview) {
-                let owner = tabs.get(id).map(|tab| tab.owner.clone());
-                if let (Some(owner), true) = (owner, tabs.close(id)) {
-                    closed = Some((id, owner));
+        match self.tabs.try_borrow_mut() {
+            Ok(mut tabs) => {
+                // Owner before close, as on every other close path.
+                if let Some(id) = tabs.find_by_webview(&webview) {
+                    let owner = tabs.get(id).map(|tab| tab.owner.clone());
+                    if let (Some(owner), true) = (owner, tabs.close(id)) {
+                        closed = Some((id, owner));
+                    }
                 }
-            }
+            },
+            // The drain resolves the owner and raises the event from the
+            // loop, where the table is never contended. Skipping would leave
+            // a closed webview listed as a live tab forever.
+            Err(_) => {
+                self.pending_tab_work
+                    .borrow_mut()
+                    .push(TabWork::Close { webview });
+            },
         }
         if let Some((tab_id, owner)) = closed {
             self.queue_event(&owner, talaria_protocol::Event::TabClosed { tab_id });
