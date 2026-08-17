@@ -2,17 +2,17 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 02
-current_phase_name: harden-the-agent-surface
-status: verifying
-stopped_at: Completed 02-11-PLAN.md
-last_updated: "2026-08-16T10:29:16.223Z"
-last_activity: 2026-08-16
-last_activity_desc: Phase 02 execution started
+current_phase: 03
+current_phase_name: table-stakes-browsing
+status: ready-to-plan
+stopped_at: Phase 02 complete; Phase 03 not started
+last_updated: "2026-08-17T10:30:00.000Z"
+last_activity: 2026-08-17
+last_activity_desc: Phase 02 closed - CI green on a self-hosted runner, 14/14 e2e
 progress:
-  total_phases: 1
-  completed_phases: 1
-  total_plans: 11
+  total_phases: 7
+  completed_phases: 2
+  total_plans: 15
   completed_plans: 11
 ---
 
@@ -23,16 +23,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-15)
 
 **Core value:** An agent can drive a real, already-logged-in browsing session, and a human can take over instantly the moment it hits something only a human can clear.
-**Current focus:** Phase 02 — harden-the-agent-surface
+**Current focus:** Phase 03 — table-stakes-browsing (the last v1 phase)
 
 ## Current Position
 
-Phase: 02 (harden-the-agent-surface) — EXECUTING
+Phase: 02 (harden-the-agent-surface) — COMPLETE
 Plan: 11 of 11
-Status: Phase complete — ready for verification
-Last activity: 2026-08-16 — Phase 02 execution started
+Status: Complete and verified. Next: Phase 03 (table-stakes browsing), the last v1 phase.
+Last activity: 2026-08-17 — Phase 02 closed; CI and e2e both green on the self-hosted runner
 
-Progress: [██████████] 100%
+v1 (Phases 1-3): [███████░░░] 2 of 3 phases complete
+All phases (1-7): [███░░░░░░░] 2 of 7 complete
 
 ## Performance Metrics
 
@@ -120,12 +121,25 @@ None yet.
 
 ### Blockers/Concerns
 
-- **REL-02 has no chosen approach** — Tauri's updater plugin no longer applies to the egui shell. Decide before Phase 7; does not block Phases 2–6.
-- ~~**`.overnight-lock` is advisory**~~ — RESOLVED by plan 02-01. `.githooks/pre-commit` enforces the lock at commit time via `core.hooksPath`, and a lock whose owning PID is dead now self-clears instead of refusing. The stale `c85a1ef3` / pid 2796577 lock was cleared.
-- **Verification weight sits almost entirely in the Python e2e suite** — only three Rust unit tests exist, and there is no CI (TEST-03, Phase 2).
-- MCP-09 half closed: parse_agent_url refuses file:/javascript:/blob:, but an agent with an evaluate handle still reaches the filesystem via location.href='file://...' or window.open('file://...') — proven readable end to end. Needs WebViewDelegate::request_navigation + request_create_new policy on agent-owned tabs; out of 02-02's scope. Do not mark MCP-09 complete until a follow-up plan lands.
-- MCP-10 half closed: 02-06 added per-tab in-flight tracking, so a SECOND evaluate on a wedged tab is refused instantly and screenshot/tabs_close/tabs_focus/tabs_list keep working. The FIRST evaluate still runs to the command timeout and never completes — that needs a SpiderMonkey slow-script interrupt exposed through libservo (upstream, out of Phase 2). Do not mark MCP-10 complete in this phase.
-- Neither GitHub Actions workflow has ever run — the repository has no git remote. TEST-03 needs a remote, a push, and a green run before it can be marked complete. Likely first-run risks: apt list insufficient on a hosted image, Servo under software GL, and the xdotool-driven vault suites being flaky on a slower machine.
+- **`Vault::load()` can hang the shell's main thread where no session D-Bus exists** — found by the
+  first real CI run on 2026-08-17. The keychain lookup falls into D-Bus autolaunch and blocks
+  startup indefinitely; the control thread keeps answering `hello`, so the shell looks alive while
+  serving nothing. CI works around it with `dbus-run-session`. **This is a real user-facing hang on
+  any headless box, container, or SSH session**, and the real fix changes `vault.rs`. See
+  `.planning/phases/02-harden-the-agent-surface/deferred-items.md`. Candidate v1 blocker.
+- **REL-02 has no chosen approach** — Tauri's updater plugin no longer applies to the egui shell.
+  Phase 7, which is now v2. Does not block v1.
+- **Verification weight sits almost entirely in the Python e2e suite** — 14 Xvfb suites against 9
+  Rust unit tests. TEST-04 (meaningful Rust unit coverage) remains deferred to v2.
+- ~~**`.overnight-lock` is advisory**~~ — RESOLVED by plan 02-01.
+- ~~**MCP-09 / MCP-10 half closed**~~ — RECLASSIFIED 2026-08-17. Neither is blocked on effort:
+  MCP-09 needs navigation provenance designed (it conflicts with D-02's human-trust-root rule) and
+  MCP-10 needs a SpiderMonkey interrupt libservo does not expose. Both are now published in
+  `SECURITY.md` as known limitations rather than carried as open work.
+- ~~**Neither workflow has ever run — no git remote**~~ — RESOLVED 2026-08-17. Remote added, `main`
+  pushed, `ci.yml` green (run `32019859735`), `e2e.yml` green 14/14 (run `32019859744`). The
+  predicted hosted-runner risks were real: a 42 GB `target/` cannot enter a 10 GB `actions/cache`,
+  so the gate moved to a self-hosted runner and the cold hosted build became a weekly canary.
 
 ## Deferred Items
 
@@ -133,9 +147,17 @@ None yet.
 |----------|------|--------|-------------|
 | Testing | TEST-04 — meaningful Rust unit coverage across `talaria-shell` | v2 | 2026-08-15 |
 | Agent UX | AGENT-05 — per-agent session naming in the Agents view | v2 | 2026-08-15 |
+| Agent UX | AGENT-04 — wire-level `TabOpened` event so adopted popups are not poll-only | v2 | 2026-08-17 |
+| Reliability | `Vault::load()` D-Bus autolaunch hang — needs the keychain lookup off the startup path | Phase 3 | 2026-08-17 |
+
+## Quick Tasks Completed
+
+| Date | Task | Outcome |
+|------|------|---------|
+| 2026-08-17 | `260817-jec` unblock CI and close Phase 2 | Remote + self-hosted runner; CI split into fast/e2e/cold-canary; `SECURITY.md`; Phase 2 closed on green runs `32019859735` and `32019859744` (14/14 e2e); v1 declared as Phases 1-3. Found a real `Vault::load()` D-Bus startup hang. |
 
 ## Session Continuity
 
-Last session: 2026-08-16T10:29:08.160Z
-Stopped at: Completed 02-11-PLAN.md
+Last session: 2026-08-17T10:30:00.000Z
+Stopped at: Phase 02 closed; Phase 03 ready to plan
 Resume file: None

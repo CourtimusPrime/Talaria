@@ -105,7 +105,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 
 - [x] **TEST-01**: An end-to-end suite runs headless (Xvfb) and passes cleanly, with a shared harness avoiding display/socket race conditions — *Must Have*
 - [x] **TEST-02**: Autonomous overnight loops cannot run two sessions against the same branch concurrently — *Must Have* — `tests/e2e/overnight_lock.py`, commit `ff0000a`. Advisory: nothing auto-enforces the call.
-- [ ] **TEST-03**: CI runs build, clippy, Rust unit tests, and the e2e suite on every push — *Should Have* — plan 02-01 landed the branch-lock half (D-28/D-29); plan 02-11 wrote both workflows (D-26/D-27) and made the tree clippy-clean, so all four checks exit 0 locally at the phase tip (e2e 14/14, `cargo test` 9/9). **Still open because nothing has run:** the repository has no git remote, so `.github/workflows/ci.yml` has never executed — no run identifier, no green tick. The requirement's verb is "runs". Remaining step: add a remote, push, confirm the run is green. See `02-11-SUMMARY.md` for the shape/mutation verification that was possible without a runner, and for the first-run risks.
+- [x] **TEST-03**: CI runs build, clippy, Rust unit tests, and the e2e suite on every push — *Should Have* — plan 02-01 landed the branch-lock half (D-28/D-29); plan 02-11 wrote both workflows (D-26/D-27) and made the tree clippy-clean, so all four checks exit 0 locally at the phase tip (e2e 14/14, `cargo test` 9/9). **Still open because nothing has run:** the repository has no git remote, so `.github/workflows/ci.yml` has never executed — no run identifier, no green tick. The requirement's verb is "runs". **Closed 2026-08-17.** Remote added (`git@github.com:CourtimusPrime/Talaria.git`), `main` pushed, and both workflows have executed green on a self-hosted runner: `ci.yml` run `32019859735` (build + clippy + `cargo test`, 2m54s) and `e2e.yml` run `32019859744` (14/14 suites PASS, 0 fail). The gate was reshaped in the process — the e2e suite runs on merges to `main` and nightly rather than on every push, because the runner is one machine with one job slot and a timing-sensitive xdotool suite should not block a push that changed no Rust; see the deviation recorded against Phase 2 success criterion 6 in `ROADMAP.md`. The first run also found a real bug the local suite could never have found — `Vault::load()` hanging the main thread on D-Bus autolaunch where no session bus exists — logged in `deferred-items.md`.
 
 ## v2 Requirements
 
@@ -159,7 +159,7 @@ Deferred. Tracked but not in the current roadmap.
 | AGENT-04 | Phase 2 | Deferred (v2) |
 | CRED-02 | Phase 2 | Complete |
 | CRED-03 | Phase 2 | Complete |
-| TEST-03 | Phase 2 | In Progress |
+| TEST-03 | Phase 2 | Complete |
 | BROWSE-01 | Phase 3 | Pending |
 | BROWSE-02 | Phase 3 | Pending |
 | BROWSE-03 | Phase 3 | Pending |
