@@ -124,3 +124,45 @@ tests for the new behaviour.
 **Why deferred:** it changes the key semantics plan 02-09 defined, documented and
 unit-tested three plans ago, from inside a UI plan. It belongs in a vault change,
 not a chrome change.
+
+## `Vault::load()` can hang the shell's main thread on a machine with no session D-Bus
+
+Found on 2026-08-17, by the first real CI run — the failure this whole phase's
+CI work existed to make possible.
+
+`Shared` construction calls `Vault::load()` on the main thread
+(`crates/talaria-shell/src/app.rs:734`), and `vault.rs:108` asks the OS keychain
+for the vault key through `keyring::Entry::new("talaria", "vault")`. On Linux
+that is the Secret Service over D-Bus. When `DBUS_SESSION_BUS_ADDRESS` is unset,
+libdbus falls back to **autolaunch**: it tries to *start* a session bus itself.
+
+If no bus can be reached, that call blocks the main thread indefinitely. Observed
+directly: the process sat at one thread in `sigsuspend`, having created
+`dbus-1/`, `at-spi/`, `dconf/` and `keyring/` directories inside the runtime dir,
+and never returned. The control-socket thread is separate, so it kept answering
+`hello` — the shell looked alive while its event loop had not started serving.
+Every command, including `tabs_list`, died on the command timeout regardless of
+how high the timeout was set (verified at 3s and at 40s).
+
+**Why it never showed up before.** On a normal desktop login, autolaunch finds
+the session bus already running at `/run/user/$UID/bus` and returns immediately.
+Every previous e2e run inherited that. The failure needs `XDG_RUNTIME_DIR` to
+point somewhere with no bus in it, which is exactly what a CI job does.
+
+**Worked around, not fixed.** `.github/workflows/e2e.yml` wraps the suite in
+`dbus-run-session`, which gives the job a real bus with no Secret Service on it,
+so the lookup fails fast and `Vault::load` takes its documented key-file
+fallback. That makes CI honest, and leaves the shell itself unchanged.
+
+**Why the real fix is deferred.** This is not only a CI artifact — it is a
+genuine hang for any user on a headless box, a minimal window manager, a
+container, or an SSH session with no session bus: Talaria starts, paints nothing
+useful, and answers no agent command. Fixing it properly means the keychain
+lookup must not be able to block startup — either move `Vault::load` off the main
+thread and let the vault resolve asynchronously, or put a timeout around the
+keyring call. Both change `vault.rs`, which is the security surface, so per the
+planning-artifact policy in `PROJECT.md` this needs a PLAN.md and a threat
+register, not an inline patch during a CI fix.
+
+**Where it belongs:** an early Phase 3 plan, or a v1 blocker if Talaria is
+expected to start on a headless machine.
