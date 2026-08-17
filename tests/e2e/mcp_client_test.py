@@ -18,7 +18,10 @@ import sys
 import time
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-BINARY = os.path.join(REPO, "target/release/talaria-mcp")
+# See the TARGET comment in harness.py: cargo writes to $CARGO_TARGET_DIR when
+# it is set, and CI sets it.
+TARGET = os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
+BINARY = os.path.join(TARGET, "release/talaria-mcp")
 T = os.environ.get("TALARIA_E2E_OUT", "/tmp/talaria-e2e")
 os.makedirs(T, exist_ok=True)
 

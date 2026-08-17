@@ -1,0 +1,114 @@
+name: End-to-end
+
+# The e2e suite is where essentially all behavioural coverage lives — there are
+# only a handful of #[test] functions in the workspace — so this workflow is not
+# optional extra credit. It is separated from the fast gate for one reason: the
+# suites drive a real browser under Xvfb with xdotool, and a single timing-
+# sensitive suite going red would otherwise block every push, including pushes
+# that changed no Rust at all. Here, a flake blocks a merge to main and shows up
+# in the nightly run, which is where a flake should show up.
+#
+# No paths filter, for the same reason ci.yml has none: GitHub reports a filtered
+# -out run as a green tick, and a commit that verified nothing must never look
+# verified.
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 03:00 UTC daily. The runner is a personal laptop; this is a time it is
+    # plausibly idle and plugged in.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two e2e runs on one machine would fight over the X display and the control
+# socket even with both pinned per-job, because Xvfb lock files and the engine
+# profile directory are process-global. Serialise instead, and do not cancel:
+# a nightly run superseded by a merge is a result nobody collected.
+concurrency:
+  group: e2e
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    name: Xvfb end-to-end suite
+    runs-on: [self-hosted, linux, thinkpad]
+
+    # PUBLIC REPOSITORY + SELF-HOSTED RUNNER. See the equivalent block in
+    # ci.yml for the full reasoning. Short version: this condition is the
+    # in-repository half of a two-control defence that keeps a fork's pull
+    # request from executing on a personal machine. The other half is a
+    # repository setting that lives outside version control and can be changed
+    # without review. Do not remove this on the grounds that the setting covers
+    # it.
+    #
+    # `schedule` and `workflow_dispatch` are admitted explicitly: neither carries
+    # a pull_request context, so the fork check would otherwise evaluate false
+    # and silently skip every nightly run.
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Build the workspace in release mode
+        run: cargo build --release --locked
+
+      # Resolved through CARGO_TARGET_DIR rather than hardcoded to ./target, for
+      # the reason given in ci.yml: this runner shares one warm dependency build
+      # rather than rebuilding 934 crates into a throwaway checkout.
+      - name: Assert both release binaries exist
+        run: |
+          set -euo pipefail
+          target="${CARGO_TARGET_DIR:-target}"
+          test -x "$target/release/talaria"
+          test -x "$target/release/talaria-mcp"
+          echo "both release binaries present in $target/release"
+
+      # TALARIA_E2E_DISPLAY pins the display the harness creates with Xvfb rather
+      # than relying on its :99 default, and XDG_RUNTIME_DIR points the shell at a
+      # job-private, owner-only directory so it gets a private control socket.
+      # Both matter more here than on a hosted runner: this machine has a real
+      # user session, a real ~/.config/talaria, and possibly a real Talaria
+      # running. Pinning the display and the runtime dir is what keeps the suite
+      # from touching either.
+      #
+      # The orchestrator exits with the number of failed suites, so its exit code
+      # is the gate directly: 0 passes, and any non-zero value — including 1,
+      # meaning exactly one suite failed — fails the job. It is deliberately not
+      # piped, not wrapped in a conditional, and not followed by `|| true`;
+      # nothing can swallow it.
+      - name: End-to-end suite under Xvfb
+        env:
+          TALARIA_E2E_DISPLAY: ":98"
+          TALARIA_E2E_OUT: ${{ runner.temp }}/talaria-e2e-out
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="${{ runner.temp }}/talaria-e2e-rt"
+          mkdir -p "$XDG_RUNTIME_DIR" "$TALARIA_E2E_OUT"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          python3 tests/e2e/run_all.py
+
+      # Failure only, and scoped to the e2e output directory and nothing else.
+      #
+      # Do NOT widen this path. The home and configuration directories hold the
+      # credential vault, its key file, and the engine profile; a debugging
+      # convenience that publishes the user's secrets is not a convenience. This
+      # warning is stronger here than it was on a hosted runner: on this machine
+      # those directories belong to a real person, and the artifact is public.
+      - name: Upload end-to-end logs and screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-output
+          path: ${{ runner.temp }}/talaria-e2e-out
+          if-no-files-found: warn
+          retention-days: 7

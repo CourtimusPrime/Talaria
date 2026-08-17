@@ -20,7 +20,12 @@ import time
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 DISPLAY = os.environ.get("TALARIA_E2E_DISPLAY", ":99")
-BINARY = os.path.join(REPO, "target", "release", "talaria")
+# Cargo writes to $CARGO_TARGET_DIR when it is set, not to ./target. CI sets it
+# so the runner's throwaway checkout shares one warm dependency build instead of
+# recompiling 934 crates per run, and the binary then does not exist under REPO
+# at all. Honour the same variable rather than assuming the default location.
+TARGET = os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
+BINARY = os.path.join(TARGET, "release", "talaria")
 
 
 def socket_path():

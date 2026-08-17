@@ -1,0 +1,108 @@
+name: Cold build canary
+
+# What the fast gate cannot tell you.
+#
+# ci.yml runs on a self-hosted machine whose Servo build directory is warm and
+# whose Servo build prerequisites were installed by hand, months ago, and are
+# never reinstalled. That machine will keep reporting green long after the
+# repository has stopped being buildable by anyone else: a dependency that needs
+# a system library nobody lists in the README, a toolchain assumption baked into
+# one developer's environment, a build script that only works because some
+# artifact is already sitting in target/.
+#
+# This job is the control for that. It starts from a stock ubuntu-latest image
+# with nothing installed and nothing cached, installs only what the README and
+# this file claim is needed, and builds the workspace from source. It is the only
+# job in the repository that can catch "works on the maintainer's laptop".
+#
+# It is weekly, not per-push, because a from-scratch Servo release build takes
+# hours and cannot be cached: target/ is ~42 GB and an actions/cache entry is
+# capped at 10 GB per repository, so the cache silently never writes and every
+# run is cold regardless.
+on:
+  schedule:
+    # 04:00 UTC on Sundays.
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cold-build
+  cancel-in-progress: false
+
+jobs:
+  cold-build:
+    name: from-scratch build on a stock image
+    runs-on: ubuntu-latest
+
+    # This limit sits well above the observed duration on purpose: a job killed
+    # mid-build is indistinguishable from a broken build, and that ambiguity
+    # costs more than the wasted minutes.
+    timeout-minutes: 300
+
+    steps:
+      # A Servo release build plus its dependency graph is large relative to a
+      # hosted runner's free space, and exhausting it surfaces as a confusing
+      # linker error rather than as "out of disk". Reclaim first, and print df
+      # on both sides so a future disk-exhaustion failure is diagnosable from
+      # the log rather than by guesswork.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      # Servo's build prerequisites. `apt-get install` exits non-zero when a
+      # package cannot be located, so a package that disappears from the Ubuntu
+      # archive is an install failure here rather than a build failure later.
+      #
+      # Deliberately narrower than the old combined workflow's list: the X
+      # utilities and xdotool were only ever needed by the e2e suite, which does
+      # not run here. If this list drifts out of step with the README's stated
+      # prerequisites, the README is what is wrong.
+      #
+      # Package names are the Ubuntu 24.04 (noble) names, which is what
+      # ubuntu-latest resolves to.
+      - name: Install system packages
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake clang python3 \
+            libssl-dev libdbus-1-dev \
+            libfontconfig-dev libfreetype-dev \
+            libgl1-mesa-dev libegl1-mesa-dev \
+            libx11-dev libxcb1-dev
+
+      - name: Record toolchain and tool versions
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          python3 --version
+
+      # No cache step, on purpose. Caching would defeat the entire point of this
+      # job — and could not work anyway, for the reasons in the header.
+      - name: Build the workspace in release mode
+        run: cargo build --release --locked
+
+      - name: Assert both release binaries exist
+        run: |
+          set -euo pipefail
+          test -x target/release/talaria
+          test -x target/release/talaria-mcp
+          echo "both release binaries present"
+
+      - name: Report final disk usage
+        if: always()
+        run: |
+          df -h /
+          du -sh target || true
