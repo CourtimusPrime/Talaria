@@ -13,6 +13,19 @@ Statuses below were verified against the working tree at commit `5b1f4db` on 202
 over from the originating brief — see `.planning/codebase/CONCERNS.md` for evidence and
 `.planning/BRIEF.md` for the original claims.
 
+## Status vocabulary
+
+`Complete` and `Pending` mean what they say. Three others do not:
+
+- **Documented Limitation** — the tractable work is done and the remainder is
+  blocked on something outside a scheduling decision: an unresolved design
+  conflict, or a capability an upstream dependency does not expose. These are
+  published in `SECURITY.md` rather than carried as open rows, because "not yet
+  scheduled" and "cannot currently be built" are different facts and only one of
+  them is actionable.
+- **Deferred (v2)** — buildable, understood, and deliberately not in v1 scope.
+- **In Progress** — actually being worked on right now.
+
 ## v1 Requirements
 
 ### Core Engine & Shell (ENGINE / SHELL)
@@ -28,7 +41,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 - [x] **AGENT-01**: User can toggle between "Me" tabs and "Agents" tabs from a single control — *Must Have*
 - [x] **AGENT-02**: While viewing an agent's tab, user input (click/scroll/type) drives that same live session (takeover) — *Must Have*
 - [x] **AGENT-03**: Multiple concurrent agent sessions are each visible and distinguishable in the Agents view — *Should Have*
-- [ ] **AGENT-04**: Tab open/close/crash events reach MCP clients as MCP notifications, not only via polling — *Should Have* — **partial**: **close and crash are delivered**. Plan 02-07 addressed each event to the one session that owns the tab; plan 02-08 forwards it out of the proxy reader, declares the `logging` capability and emits it as a `notifications/message` carrying `{"event":…,"tab_id":…}`, proved end-to-end in `tests/e2e/mcp_client_test.py` (own-session delivery, second-session silence, and the second session's own event to show that silence is addressing). **`open` is not delivered**: `talaria_protocol::Event` has no tab-open variant and no producer raises one, so a popup adopted under an agent's tab is still discoverable only by polling `tabs_list`. Closing that slice is a wire-format change — see `.planning/phases/02-harden-the-agent-surface/deferred-items.md`
+- [ ] **AGENT-04**: Tab open/close/crash events reach MCP clients as MCP notifications, not only via polling — *Should Have* — **partial**: **close and crash are delivered**. Plan 02-07 addressed each event to the one session that owns the tab; plan 02-08 forwards it out of the proxy reader, declares the `logging` capability and emits it as a `notifications/message` carrying `{"event":…,"tab_id":…}`, proved end-to-end in `tests/e2e/mcp_client_test.py` (own-session delivery, second-session silence, and the second session's own event to show that silence is addressing). **`open` is not delivered**: `talaria_protocol::Event` has no tab-open variant and no producer raises one, so a popup adopted under an agent's tab is still discoverable only by polling `tabs_list`. Closing that slice is a wire-format change — see `.planning/phases/02-harden-the-agent-surface/deferred-items.md`. **Status: Deferred (v2)** — small and unblocked (one `Event` variant, one `queue_event` call at the adoption site, two test assertions), but it is a protocol change and the close/crash slice already delivers the value. Pick it up in the next protocol-touching plan
 
 ### MCP Tool Surface (MCP)
 
@@ -40,8 +53,8 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 - [x] **MCP-06**: An agent can read stored session cookies for a given domain via `cookies_read` — *Must Have* — `crates/talaria-mcp/src/tools.rs:78-87`
 - [x] **MCP-07**: An agent can download a file via `download(url, filename)` — *Should Have* — `crates/talaria-mcp/src/tools.rs:89-98`
 - [x] **MCP-08**: Popup/new-tab requests from a page (`window.open`, `target=_blank`) open a real tab under the parent's owner — *Must Have* — commit `5b1f4db`, e2e `tests/e2e/popup_test.py`
-- [ ] **MCP-09**: Agents cannot navigate to `file://` URLs (scheme allowlist enforced on `navigate` and `evaluate`) — *Must Have* — **partial** (plan 02-02): `parse_agent_url` now allowlists `http`/`https`/`data`/`about:blank`, so `tabs_open` and `navigate` refuse `file:` naming the scheme (`tests/e2e/scheme_refusal_test.py`). The `evaluate` half is still open — `location.href='file://…'` and `window.open('file://…')` from a script reach the filesystem and the content reads straight back out. Closing it needs `WebViewDelegate::request_navigation` + `request_create_new` policy on agent-owned tabs.
-- [ ] **MCP-10**: A heavy-JS page does not wedge `evaluate` — *Must Have* — **partial**: plan 02-06 added per-tab in-flight tracking (`Shared::evaluating`), so a second `evaluate` on a tab whose script thread is already busy is refused instantly with `tab {id} busy — a previous evaluate is still running` instead of burning the command timeout, and `screenshot`/`tabs_close`/`tabs_focus`/`tabs_list` keep answering on that tab. The *first* evaluate still runs to the timeout and never completes: making the evaluate itself complete needs a SpiderMonkey slow-script interrupt exposed through libservo, which is upstream work outside Phase 2
+- [ ] **MCP-09**: Agents cannot navigate to `file://` URLs (scheme allowlist enforced on `navigate` and `evaluate`) — *Must Have* — **partial** (plan 02-02): `parse_agent_url` now allowlists `http`/`https`/`data`/`about:blank`, so `tabs_open` and `navigate` refuse `file:` naming the scheme (`tests/e2e/scheme_refusal_test.py`). The `evaluate` half is still open — `location.href='file://…'` and `window.open('file://…')` from a script reach the filesystem and the content reads straight back out. Closing it needs `WebViewDelegate::request_navigation` + `request_create_new` policy on agent-owned tabs. **Status: Documented Limitation** — the hook that would carry the policy cannot tell a script-initiated navigation on an agent tab apart from one the human triggered by clicking during takeover, so a naive policy there would break the human-is-trust-root rule. Needs provenance in the navigation decision, which is a design change, not an unscheduled task. Published in `SECURITY.md`.
+- [ ] **MCP-10**: A heavy-JS page does not wedge `evaluate` — *Must Have* — **partial**: plan 02-06 added per-tab in-flight tracking (`Shared::evaluating`), so a second `evaluate` on a tab whose script thread is already busy is refused instantly with `tab {id} busy — a previous evaluate is still running` instead of burning the command timeout, and `screenshot`/`tabs_close`/`tabs_focus`/`tabs_list` keep answering on that tab. The *first* evaluate still runs to the timeout and never completes: making the evaluate itself complete needs a SpiderMonkey slow-script interrupt exposed through libservo, which is upstream work outside Phase 2. **Status: Documented Limitation** — not fixable in this repository at any effort level until libservo exposes the interrupt. Published in `SECURITY.md`
 - [x] **MCP-11**: One slow or wedged tool call does not block tool calls against other tabs — *Must Have* — `ShellConnection`'s single mutex serializes every call, compounding MCP-10
 - [x] **MCP-12**: `download` is bounded — enforced size cap and no silent overwrite of an existing file — *Should Have*
 
@@ -137,13 +150,13 @@ Deferred. Tracked but not in the current roadmap.
 | REL-01 | Phase 1 | Complete |
 | TEST-01 | Phase 1 | Complete |
 | TEST-02 | Phase 1 | Complete |
-| MCP-09 | Phase 2 | Pending |
-| MCP-10 | Phase 2 | In Progress |
+| MCP-09 | Phase 2 | Documented Limitation |
+| MCP-10 | Phase 2 | Documented Limitation |
 | MCP-11 | Phase 2 | Complete |
 | MCP-12 | Phase 2 | Complete |
 | SEC-01 | Phase 2 | Complete |
 | SEC-02 | Phase 2 | Complete |
-| AGENT-04 | Phase 2 | In Progress |
+| AGENT-04 | Phase 2 | Deferred (v2) |
 | CRED-02 | Phase 2 | Complete |
 | CRED-03 | Phase 2 | Complete |
 | TEST-03 | Phase 2 | In Progress |

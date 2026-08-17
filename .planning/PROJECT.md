@@ -108,6 +108,25 @@ challenge), without either side sacrificing performance.
   Servo/SpiderMonkey's MPL 2.0 (file-level weak copyleft, doesn't force Talaria's own code into any
   particular license).
 
+## Planning artifact policy
+
+**A PLAN.md up front is required only for work touching the security or protocol surface.
+Everything else gets a SUMMARY.md after the fact and no plan.**
+
+The security-or-protocol surface means: `crates/talaria-protocol/`, `control.rs`, `vault.rs`, the
+MCP tool surface in `crates/talaria-mcp/src/tools.rs`, `parse_agent_url` and the navigation policy
+around it, and anything that would carry a threat register. For those, the plan is doing real work —
+it is where a threat gets named before the code exists, and Phase 2's plans repeatedly caught
+problems at that stage rather than in review.
+
+For UI work, mechanical refactors, docs, and CI changes, it is not. Phase 2 produced roughly 10,000
+lines of PLAN and SUMMARY markdown against a 4,734-line Rust codebase. The artifacts were good; the
+ratio was not, and on a solo project the up-front plan for a chrome tweak mostly restates what the
+diff will show anyway.
+
+Keep writing SUMMARY.md for everything. The summaries are what later sessions actually read, and
+`deferred-items.md` — the record of what was found and consciously not done — earned its keep.
+
 ## Key Decisions
 
 | Decision | Rationale | Outcome |

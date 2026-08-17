@@ -16,6 +16,24 @@ same session.
 distributed mode. Local stdio transport needs no auth — auth's actual driver is remote access, and
 it depends on adding an HTTP transport that doesn't exist yet.
 
+## Release boundary: v1 is Phases 1–3
+
+**v1 = Phases 1, 2, 3.** v2 = Phases 4, 5, 6, 7.
+
+Phases 1–3 produce the thing described at the top of this file: a Servo-based browser a person can
+use every day, that an agent can drive over MCP, with live takeover, a hardened agent surface, and
+the table-stakes features (history, bookmarks, search, downloads) whose absence would otherwise make
+"daily driver" a false claim. That is shippable, and it is the whole core value proposition.
+
+Phases 4–7 are not phases in the same sense — each is its own product. Phase 4 is an OAuth 2.1
+authorization server. Phase 5 is a distributed remote-framebuffer protocol held to a 30–60ms
+interaction budget. Phase 6 is a Windows port of a Servo application. Phase 7 depends on REL-02, an
+update mechanism that has had no chosen approach since project init. Any one of them could take
+longer than Phases 1–3 combined did.
+
+Holding v1 hostage to all four is how a working browser never ships. They keep their numbers and
+their detail below; they are simply not v1.
+
 ## Phases
 
 **Phase Numbering:**
@@ -24,12 +42,12 @@ it depends on adding an HTTP transport that doesn't exist yet.
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
 - [x] **Phase 1: Foundation & Core Engine** — Servo rendering, egui shell, live agent takeover, a fast MCP tool surface, credential vault, and an Xvfb e2e harness. **Complete.**
-- [ ] **Phase 2: Harden the Agent Surface** — Close the audit's open gaps: scheme allowlist, `evaluate` wedging and the serializing mutex, control-socket peer auth, bounded downloads, real MCP notifications, a usable vault, and CI.
-- [ ] **Phase 3: Table-Stakes Browsing** — History, bookmarks, configurable search, and a downloads UI, so Talaria works as a real daily driver.
-- [ ] **Phase 4: Authenticated Remote Transport** — An HTTP/SSE MCP transport plus the OAuth 2.1 authorization server that becomes possible once it exists.
-- [ ] **Phase 5: Distributed Mode** — Client and server split across machines over Tailscale, with remote live-viewing and takeover.
-- [ ] **Phase 6: Platform Coverage** — Confirm macOS, then Windows.
-- [ ] **Phase 7: Release Readiness** — An update mechanism, manual accessibility verification, and a live landing page.
+- [x] **Phase 2: Harden the Agent Surface** — Close the audit's open gaps: scheme allowlist, `evaluate` wedging and the serializing mutex, control-socket peer auth, bounded downloads, real MCP notifications, a usable vault, and CI.
+- [ ] **Phase 3: Table-Stakes Browsing** *(v1)* — History, bookmarks, configurable search, and a downloads UI, so Talaria works as a real daily driver.
+- [ ] **Phase 4: Authenticated Remote Transport** *(v2)* — An HTTP/SSE MCP transport plus the OAuth 2.1 authorization server that becomes possible once it exists.
+- [ ] **Phase 5: Distributed Mode** *(v2)* — Client and server split across machines over Tailscale, with remote live-viewing and takeover.
+- [ ] **Phase 6: Platform Coverage** *(v2)* — Confirm macOS, then Windows.
+- [ ] **Phase 7: Release Readiness** *(v2)* — An update mechanism, manual accessibility verification, and a live landing page.
 
 ## Phase Details
 
@@ -60,8 +78,17 @@ it depends on adding an HTTP transport that doesn't exist yet.
   4. A tab crash or close arrives at a connected MCP client as a notification without the client polling
   5. A user can save a credential in Talaria and have it offered back by domain match on a later visit, with no plaintext credential file left on disk
   6. CI runs build, clippy, unit tests, and the e2e suite on every push, and is green
+     — **met with a recorded deviation.** Build, clippy and unit tests run on every push
+     (`ci.yml`). The e2e suite runs on every merge to `main`, nightly, and on demand
+     (`e2e.yml`) rather than on every push. Two reasons, both discovered when CI first ran
+     against a real runner: the suite drives a real browser under Xvfb with `xdotool`, so a
+     timing-sensitive suite going red would block pushes that changed no Rust at all; and the
+     self-hosted runner is one machine with one job slot, so an e2e run on every push
+     serialises every later push behind it. The coverage is not reduced — no commit reaches
+     `main` without the full suite having run against it. Neither workflow carries a `paths:`
+     filter, so no push can produce a green tick by verifying nothing.
 
-**Plans**: 11/11 plans executed
+**Plans**: 11/11 plans executed — **Phase complete 2026-08-17**
 
 Plans:
 
@@ -98,7 +125,7 @@ Plans:
 - [ ] 03-03: Configurable default search engine, replacing the hardcoded DuckDuckGo fallback
 - [ ] 03-04: Downloads list UI, wired to the `download` tool's storage
 
-### Phase 4: Authenticated Remote Transport
+### Phase 4: Authenticated Remote Transport *(v2)*
 
 **Goal**: Talaria's MCP endpoint is reachable over the network and protected by its own OAuth 2.1 authorization server, with per-client tokens a user can revoke individually.
 **Depends on**: Phase 2
@@ -118,7 +145,7 @@ Plans:
 - [ ] 04-02: OAuth 2.1 authorization server — metadata discovery, dynamic client registration, PKCE, token issuance
 - [ ] 04-03: Per-client token storage, revocation, and a connected-agents management UI in the shell
 
-### Phase 5: Distributed Mode
+### Phase 5: Distributed Mode *(v2)*
 
 **Goal**: Client and server can run on separate machines over Tailscale, with remote live-viewing and takeover hitting the same latency targets as local mode.
 **Depends on**: Phase 4
@@ -139,7 +166,7 @@ Plans:
 - [ ] 05-03: Reconnect/resync logic (session grace period, client tab-list resync)
 - [ ] 05-04: Session manifest persistence + restore-on-restart for distributed mode
 
-### Phase 6: Platform Coverage
+### Phase 6: Platform Coverage *(v2)*
 
 **Goal**: Talaria is confirmed working on macOS and Windows, alongside the existing Linux baseline.
 **Depends on**: Phase 3, Phase 5
@@ -157,7 +184,7 @@ Plans:
 - [ ] 06-01: macOS verification + e2e pass (harness currently assumes Xvfb/`xdotool`)
 - [ ] 06-02: Windows port + e2e pass
 
-### Phase 7: Release Readiness
+### Phase 7: Release Readiness *(v2)*
 
 **Goal**: Talaria is shippable to the public, with a working update path and a live landing page.
 **Depends on**: Phase 6
@@ -179,12 +206,12 @@ Plans:
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
+Phases execute in numeric order: 1 → 2 → 3 (**ship v1**) → 4 → 5 → 6 → 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation & Core Engine | — | ✅ Complete | 2026-08-15 |
-| 2. Harden the Agent Surface | 11/11 | In Progress|  |
+| 2. Harden the Agent Surface | 11/11 | ✅ Complete | 2026-08-17 |
 | 3. Table-Stakes Browsing | 0/4 | Not started | - |
 | 4. Authenticated Remote Transport | 0/3 | Not started | - |
 | 5. Distributed Mode | 0/4 | Not started | - |
