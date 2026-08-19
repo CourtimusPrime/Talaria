@@ -45,7 +45,13 @@ until these seven are resolved, so it should either fix them or narrow the gate.
 Whoever executes 02-11 must decide; every plan in this phase that lists the
 clippy gate as acceptance inherits the same red baseline.
 
-## No wire-level "tab opened" event, so AGENT-04's `open` slice is not delivered
+## ~~No wire-level "tab opened" event, so AGENT-04's `open` slice is not delivered~~
+
+**RESOLVED** by quick task `260817-kbw` (2026-08-19). `Event::TabOpened { tab_id,
+opener_tab_id }` now exists in `crates/talaria-protocol/src/lib.rs` and is raised at
+`Shared::adopt_popup`; the proxy needed no change, exactly as predicted below. Asserted
+in `tests/e2e/popup_test.py` (socket level) and `tests/e2e/mcp_client_test.py`
+(notification level). AGENT-04 is **Complete**. The original entry stands below.
 
 Found during plan 02-08 (the flagged assumption that plan carried, now resolved
 as a decline rather than left implicit).

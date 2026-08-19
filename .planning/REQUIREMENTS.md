@@ -41,7 +41,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 - [x] **AGENT-01**: User can toggle between "Me" tabs and "Agents" tabs from a single control — *Must Have*
 - [x] **AGENT-02**: While viewing an agent's tab, user input (click/scroll/type) drives that same live session (takeover) — *Must Have*
 - [x] **AGENT-03**: Multiple concurrent agent sessions are each visible and distinguishable in the Agents view — *Should Have*
-- [ ] **AGENT-04**: Tab open/close/crash events reach MCP clients as MCP notifications, not only via polling — *Should Have* — **partial**: **close and crash are delivered**. Plan 02-07 addressed each event to the one session that owns the tab; plan 02-08 forwards it out of the proxy reader, declares the `logging` capability and emits it as a `notifications/message` carrying `{"event":…,"tab_id":…}`, proved end-to-end in `tests/e2e/mcp_client_test.py` (own-session delivery, second-session silence, and the second session's own event to show that silence is addressing). **`open` is not delivered**: `talaria_protocol::Event` has no tab-open variant and no producer raises one, so a popup adopted under an agent's tab is still discoverable only by polling `tabs_list`. Closing that slice is a wire-format change — see `.planning/phases/02-harden-the-agent-surface/deferred-items.md`. **Status: Deferred (v2)** — small and unblocked (one `Event` variant, one `queue_event` call at the adoption site, two test assertions), but it is a protocol change and the close/crash slice already delivers the value. Pick it up in the next protocol-touching plan
+- [x] **AGENT-04**: Tab open/close/crash events reach MCP clients as MCP notifications, not only via polling — *Should Have* — **complete**. Plan 02-07 addressed each event to the one session that owns the tab; plan 02-08 forwards it out of the proxy reader, declares the `logging` capability and emits it as a `notifications/message`. Quick task 260817-kbw closed the remaining `open` slice: `talaria_protocol::Event::TabOpened { tab_id, opener_tab_id }` is raised at `Shared::adopt_popup`, so a popup a driven page opens is announced to the owning session instead of being discoverable only by polling `tabs_list`. `opener_tab_id` is carried because adoption is the only case that raises it — a tab the agent opened itself is already named in the reply to its own `tabs_open`, so the opener is the whole point. Proved end to end at both levels: `tests/e2e/popup_test.py` on the raw control socket, `tests/e2e/mcp_client_test.py` as an MCP `notifications/message`, with the second session's silence still asserted so the new variant cannot fan out
 
 ### MCP Tool Surface (MCP)
 
@@ -156,7 +156,7 @@ Deferred. Tracked but not in the current roadmap.
 | MCP-12 | Phase 2 | Complete |
 | SEC-01 | Phase 2 | Complete |
 | SEC-02 | Phase 2 | Complete |
-| AGENT-04 | Phase 2 | Deferred (v2) |
+| AGENT-04 | Phase 2 | Complete |
 | CRED-02 | Phase 2 | Complete |
 | CRED-03 | Phase 2 | Complete |
 | TEST-03 | Phase 2 | Complete |
