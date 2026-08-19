@@ -100,39 +100,148 @@ fn restrict_to_owner(path: &PathBuf) {
     }
 }
 
-fn load_or_create_key(dir: &PathBuf) -> KeyOutcome {
-    // Preferred: OS keychain. Every fall-through below is a downgrade in
-    // data-at-rest protection, so each one records it — not just the branch
-    // that happens to fire most often.
-    let mut downgraded = false;
+/// How long the OS keychain gets to answer before the vault stops waiting.
+///
+/// This number is bounded on both sides. It must stay *below* the shortest
+/// control-socket command timeout the e2e suite uses (3s, set by
+/// `tests/e2e/run_all.py`), or a slow keychain stops being a logged downgrade
+/// and starts being a failing test. It must stay far *above* a healthy keychain
+/// lookup, which is single-digit milliseconds, or a working keychain gets
+/// abandoned for no reason.
+const KEYCHAIN_TIMEOUT_MS: u64 = 1500;
+
+fn keychain_timeout() -> std::time::Duration {
+    // Overridable because "your keychain is slower than 1.5s" is a real machine
+    // configuration, and the answer to it should be a longer wait rather than a
+    // forced downgrade to a key file.
+    let millis = std::env::var("TALARIA_KEYCHAIN_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(KEYCHAIN_TIMEOUT_MS);
+    std::time::Duration::from_millis(millis)
+}
+
+/// Whether a session D-Bus exists to talk to at all.
+///
+/// This exists to avoid *provoking* D-Bus autolaunch. With no
+/// `DBUS_SESSION_BUS_ADDRESS`, libdbus does not simply fail — it tries to
+/// **start a session bus itself**, and on a machine where that cannot succeed
+/// it blocks forever rather than returning an error. `Vault::load` runs on the
+/// main thread during startup, so that hang is the whole browser: the control
+/// socket keeps answering `hello` from its own thread while the event loop
+/// never services a single command, which is precisely how it presented when CI
+/// first ran on a machine with no desktop session.
+///
+/// A `stat` is enough to tell the hopeless case apart, and it is worth doing
+/// because that case is the common one: headless servers, containers, SSH
+/// sessions, and CI jobs that pin `XDG_RUNTIME_DIR` to a private empty
+/// directory. It is *not* sufficient on its own — a bus address that is set but
+/// dead still hangs — which is why the call is also time-bounded below.
+#[cfg(target_os = "linux")]
+fn session_bus_reachable() -> bool {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+        return true;
+    }
+    dirs::runtime_dir().is_some_and(|dir| dir.join("bus").exists())
+}
+
+/// Non-Linux keychains (macOS Keychain Services, Windows Credential Manager)
+/// do not route through D-Bus, so there is nothing to pre-check. The timeout
+/// still applies to them.
+#[cfg(not(target_os = "linux"))]
+fn session_bus_reachable() -> bool {
+    true
+}
+
+/// Run `work` on a worker thread and give up on it after `timeout`.
+///
+/// Returns `None` if the work did not finish in time, or if the thread could
+/// not be spawned at all.
+///
+/// A timed-out thread is **detached and leaked** — deliberately. The work this
+/// bounds is a blocking FFI call into libdbus that owns no `Vault` state and
+/// has no cancellation point, so there is nothing to interrupt and nothing that
+/// can be corrupted by letting it run. One stranded thread for the life of the
+/// process is the price of not hanging the browser, and it is a price paid only
+/// on a machine that is already misconfigured.
+fn with_timeout<T: Send + 'static>(
+    timeout: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("talaria-keychain".into())
+        .spawn(move || {
+            // The receiver is gone on timeout; that is the expected path, not
+            // an error worth reporting from inside a thread nobody is reading.
+            let _ = sender.send(work());
+        });
+    if let Err(error) = spawned {
+        log::warn!("could not spawn keychain thread ({error}); falling back to key file");
+        return None;
+    }
+    receiver.recv_timeout(timeout).ok()
+}
+
+/// What the OS keychain had to say, once it has said anything at all.
+enum KeychainAnswer {
+    /// A usable 32-byte key, either read back or freshly stored.
+    Key(Key),
+    /// The keychain was reachable but cannot supply a key. Carries the message
+    /// to log, so the reason survives the trip back from the worker thread.
+    Unusable(String),
+}
+
+/// The whole keychain conversation, in one place, so it can be handed to a
+/// worker thread as a unit.
+fn ask_keychain() -> KeychainAnswer {
     match keyring::Entry::new("talaria", "vault") {
         Ok(entry) => match entry.get_password() {
             Ok(hex_key) => {
                 if let Ok(bytes) = hex::decode(&hex_key) {
                     if bytes.len() == 32 {
-                        return KeyOutcome { key: Some(*Key::from_slice(&bytes)), downgraded };
+                        return KeychainAnswer::Key(*Key::from_slice(&bytes));
                     }
                 }
-                log::warn!("keychain vault key malformed; falling back to key file");
-                downgraded = true;
+                KeychainAnswer::Unusable("keychain vault key malformed".into())
             },
             Err(keyring::Error::NoEntry) => {
                 let key = ChaCha20Poly1305::generate_key(&mut OsRng);
                 if entry.set_password(&hex::encode(key)).is_ok() {
-                    return KeyOutcome { key: Some(key), downgraded };
+                    return KeychainAnswer::Key(key);
                 }
-                log::warn!("could not store vault key in keychain; falling back to key file");
+                KeychainAnswer::Unusable("could not store vault key in keychain".into())
+            },
+            Err(error) => KeychainAnswer::Unusable(format!("keychain unavailable ({error})")),
+        },
+        Err(error) => KeychainAnswer::Unusable(format!("keyring init failed ({error})")),
+    }
+}
+
+fn load_or_create_key(dir: &PathBuf) -> KeyOutcome {
+    // Preferred: OS keychain. Every fall-through below is a downgrade in
+    // data-at-rest protection, so each one records it — not just the branch
+    // that happens to fire most often.
+    let mut downgraded = false;
+    if !session_bus_reachable() {
+        log::warn!("no session D-Bus; skipping the OS keychain and using a key file");
+        downgraded = true;
+    } else {
+        match with_timeout(keychain_timeout(), ask_keychain) {
+            Some(KeychainAnswer::Key(key)) => return KeyOutcome { key: Some(key), downgraded },
+            Some(KeychainAnswer::Unusable(reason)) => {
+                log::warn!("{reason}; falling back to key file");
                 downgraded = true;
             },
-            Err(error) => {
-                log::warn!("keychain unavailable ({error}); falling back to key file");
+            None => {
+                log::warn!(
+                    "OS keychain did not answer within {:?}; falling back to key file",
+                    keychain_timeout()
+                );
                 downgraded = true;
             },
-        },
-        Err(error) => {
-            log::warn!("keyring init failed ({error}); falling back to key file");
-            downgraded = true;
-        },
+        }
     }
 
     // Fallback: key file with owner-only permissions.
@@ -411,6 +520,42 @@ mod tests {
             password: "p".into(),
             cookies: Vec::new(),
         }
+    }
+
+    #[test]
+    fn with_timeout_returns_work_that_finishes_in_time() {
+        let answer = with_timeout(std::time::Duration::from_secs(30), || 7u8);
+        assert_eq!(answer, Some(7));
+    }
+
+    /// The case the whole fix exists for: work that never returns must not
+    /// become a caller that never returns. A generous margin either side —
+    /// the wait is short, the work outlives the test — so this asserts the
+    /// behaviour rather than a race.
+    #[test]
+    fn with_timeout_gives_up_on_work_that_never_finishes() {
+        let started = std::time::Instant::now();
+        let answer = with_timeout(std::time::Duration::from_millis(50), || {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            7u8
+        });
+        assert_eq!(answer, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "with_timeout waited {:?}, so it did not bound the call",
+            started.elapsed()
+        );
+    }
+
+    /// The default is pinned from both sides, because both sides are what
+    /// make it correct: above the shortest e2e command timeout and a slow
+    /// keychain becomes a failing test instead of a logged downgrade; below a
+    /// healthy lookup and a working keychain gets abandoned for no reason.
+    #[test]
+    fn keychain_timeout_default_stays_inside_its_bounds() {
+        let default = std::time::Duration::from_millis(KEYCHAIN_TIMEOUT_MS);
+        assert!(default < std::time::Duration::from_secs(3), "must stay under the e2e command timeout");
+        assert!(default > std::time::Duration::from_millis(100), "must not abandon a healthy keychain");
     }
 
     fn login(url: &str, username: &str, password: &str) -> CredentialEntry {

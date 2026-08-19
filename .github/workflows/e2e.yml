@@ -73,28 +73,30 @@ jobs:
           test -x "$target/release/talaria-mcp"
           echo "both release binaries present in $target/release"
 
-      # dbus-run-session is load-bearing, not decoration. The shell builds its
-      # Vault on the main thread during startup, and the vault asks the OS
-      # keychain for its key through the `keyring` crate, which on Linux talks to
-      # the Secret Service over D-Bus. With no DBUS_SESSION_BUS_ADDRESS set, that
-      # call falls into D-Bus *autolaunch*: it tries to start a session bus
-      # itself, and blocks the main thread while doing it. The control socket
-      # thread is separate and keeps answering `hello`, so the shell looks alive
-      # while the event loop never services a single command — every suite then
-      # dies on the command timeout, including `tabs_list`, which touches no
-      # network and no page.
+      # This job deliberately runs with **no session D-Bus**.
       #
-      # This does not reproduce in an interactive shell, which is why it survived
-      # to CI: autolaunch finds the desktop session's existing bus at
-      # /run/user/$UID/bus and returns immediately. A CI job pins
-      # XDG_RUNTIME_DIR to a private empty directory (correctly — see below), so
-      # there is no bus there to find, and autolaunch hangs instead.
+      # It did not always. The shell builds its Vault on the main thread during
+      # startup, and the vault asks the OS keychain for its key through the
+      # `keyring` crate, which on Linux talks to the Secret Service over D-Bus.
+      # With no DBUS_SESSION_BUS_ADDRESS set, that call used to fall into D-Bus
+      # *autolaunch*: it tried to start a session bus itself and blocked the main
+      # thread while doing it. The control socket thread is separate and kept
+      # answering `hello`, so the shell looked alive while the event loop never
+      # serviced a single command — every suite then died on the command
+      # timeout, including `tabs_list`, which touches no network and no page.
+      # The job was wrapped in `dbus-run-session` to give it a real bus and make
+      # the keychain lookup fail fast instead of hanging.
       #
-      # Giving the job its own real session bus makes the keychain lookup fail
-      # fast — the bus exists, nothing on it implements the Secret Service — and
-      # Vault::load falls back to its key file, which is the degradation path it
-      # was designed around. Do not remove this wrapper without re-reading
-      # crates/talaria-shell/src/vault.rs.
+      # crates/talaria-shell/src/vault.rs now fixes that at the source: it skips
+      # the keychain outright when no bus can exist, and time-bounds the lookup
+      # when one is merely unreachable. So the wrapper is gone on purpose. A
+      # headless server, a container, an SSH session and this job all look the
+      # same to the vault, and running bare is what proves the fallback works
+      # rather than papering over it with a bus the real deployments will not
+      # have. tests/e2e/vault_nobus_test.py asserts it directly.
+      #
+      # Do not reintroduce `dbus-run-session` here. It would hide exactly the
+      # regression this job now exists to catch.
       #
       # TALARIA_E2E_DISPLAY pins the display the harness creates with Xvfb rather
       # than relying on its :99 default, and XDG_RUNTIME_DIR points the shell at a
@@ -118,7 +120,7 @@ jobs:
           export XDG_RUNTIME_DIR="${{ runner.temp }}/talaria-e2e-rt"
           mkdir -p "$XDG_RUNTIME_DIR" "$TALARIA_E2E_OUT"
           chmod 700 "$XDG_RUNTIME_DIR"
-          dbus-run-session -- python3 tests/e2e/run_all.py
+          python3 tests/e2e/run_all.py
 
       # Failure only, and scoped to the e2e output directory and nothing else.
       #
