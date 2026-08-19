@@ -6,6 +6,7 @@ request, so page-driven tab creation was a silent no-op. The contract this
 pins down:
 
 - both routes create a real tab, owned by whoever owned the opener;
+- the owner is told, unprompted, that the tab appeared and which page made it;
 - the popup is reachable as a tab (evaluate / screenshot / close);
 - the opener stays usable, and either side can outlive the other;
 - `window.close()` from the popup removes the tab and emits `tab_closed`.
@@ -87,6 +88,24 @@ def tabs():
     return r["result"]["tabs"]
 
 
+def wait_for_event(name, timeout=10, **fields):
+    """Wait for an unsolicited event matching `name` and `fields`.
+
+    Polls tabs_list purely to pump the socket — rpc() is what drains events
+    off the shared stream. The event itself is not what polling produces; if
+    it were, it would not be worth having."""
+    deadline = time.monotonic() + timeout
+    while True:
+        for e in events:
+            if e.get("event") == name and all(e.get(k) == v for k, v in fields.items()):
+                events.remove(e)
+                return e
+        if time.monotonic() > deadline:
+            raise AssertionError(f"no {name} event matching {fields} in {timeout}s: {events}")
+        rpc("tabs_list")
+        time.sleep(0.25)
+
+
 def wait_for_tab(known, timeout=15):
     """Poll tabs_list until a tab id outside `known` shows up, loaded."""
     deadline = time.monotonic() + timeout
@@ -122,6 +141,12 @@ assert popup["owner"] == "e2e-popup", popup  # inherits the opener's owner
 assert popup["title"] == "popup child", popup
 print("WINDOW_OPEN -> tab", popup["tab_id"], popup["url"])
 
+# The adopted tab's id appears in no reply this session will ever receive, so
+# the event is the only way to learn it without polling. It names the opener
+# too, because that is the part `tabs_list` could never have supplied.
+opened = wait_for_event("tab_opened", tab_id=popup["tab_id"], opener_tab_id=parent)
+print("TAB_OPENED event:", json.dumps(opened))
+
 # The opener was this agent's active tab, so its popup fronts the Agents view
 # — without disturbing the human's Me view, which still has its own active tab.
 assert popup["focused"] is True, popup
@@ -149,6 +174,7 @@ before = {t["tab_id"] for t in tabs()}
 r = rpc("evaluate", tab_id=parent, script="document.getElementById('lnk').click(); 'clicked'")
 assert r["outcome"] == "ok", r
 blank = wait_for_tab(before)
+assert wait_for_event("tab_opened", tab_id=blank["tab_id"], opener_tab_id=parent)
 assert "via=link" in blank["url"], blank
 assert blank["owner"] == "e2e-popup", blank
 assert blank["focused"] is False, blank

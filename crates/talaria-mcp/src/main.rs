@@ -142,6 +142,7 @@ async fn notify_tab_events(
         let level = match event {
             Event::TabCrashed { .. } => LoggingLevel::Warning,
             Event::TabClosed { .. } => LoggingLevel::Info,
+            Event::TabOpened { .. } => LoggingLevel::Info,
         };
         let params = LoggingMessageNotificationParams {
             data,

@@ -604,12 +604,19 @@ impl Shared {
         let id = tabs.register(
             webview,
             rendering_context,
-            owner,
+            owner.clone(),
             "about:blank".into(),
             parent_active,
             true,
         );
         log::info!("popup from tab {parent_id} opened as tab {id}");
+        // Adoption is the one way a tab joins an agent's session without the
+        // agent asking, so it is the one that needs announcing; everything
+        // else the agent opened, it already knows about from its own reply.
+        self.queue_event(&owner, talaria_protocol::Event::TabOpened {
+            tab_id: id,
+            opener_tab_id: parent_id,
+        });
     }
 }
 

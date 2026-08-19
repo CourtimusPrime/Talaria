@@ -180,6 +180,15 @@ pub struct Cookie {
 pub enum Event {
     TabCrashed { tab_id: u64 },
     TabClosed { tab_id: u64 },
+    /// A tab appeared in the session without the agent asking for it: a page
+    /// it was driving called `window.open`, and the popup was adopted into
+    /// the opener's session.
+    ///
+    /// Only adoption raises this. A tab the agent opened itself is already
+    /// named in the reply to its own `tabs_open`, so `opener_tab_id` is the
+    /// whole point of the notification — it is the only way to learn which
+    /// page produced the tab.
+    TabOpened { tab_id: u64, opener_tab_id: u64 },
 }
 
 #[cfg(test)]

@@ -138,6 +138,29 @@ class Client:
             if m is not None and "id" not in m:
                 self.notes.append(m)
 
+    def expect_adoption(self, opener_tab_id, why, seconds=20):
+        """The adoption notification, matched by opener rather than by tab.
+
+        The new tab's id cannot be known in advance — no reply to this session
+        ever carries it, which is the whole reason the event exists — so this
+        matches on the opener and returns what it learned."""
+        deadline = time.monotonic() + seconds
+        while True:
+            for note in self.notes:
+                data = note.get("params", {}).get("data", {})
+                if data.get("event") == "tab_opened" \
+                        and data.get("opener_tab_id") == opener_tab_id:
+                    assert note.get("method") == "notifications/message", note
+                    self.notes.remove(note)
+                    print(f"{self.name} notified: {json.dumps(note['params'])}")
+                    return data["tab_id"]
+            left = deadline - time.monotonic()
+            assert left > 0, (f"{self.name}: no tab_opened notification for opener "
+                              f"{opener_tab_id} within {seconds}s ({why}); saw {self.notes}")
+            m = self.readline(left)
+            if m is not None and "id" not in m:
+                self.notes.append(m)
+
     def expect_silence(self, why, seconds=2.0):
         """No unsolicited message of ANY shape — not merely none naming a
         particular tab id, so a regression leaking a differently-shaped
@@ -298,10 +321,30 @@ try:
     client.expect_note("tab_closed", crashed, "own tab closed")
     print("tab_closed reached the owning MCP session as a notification")
 
+    # --- adoption: a tab this session never asked for ---
+    # A page the agent is driving calls window.open. The popup is adopted into
+    # the opener's session, so the agent now owns a tab whose id appears in no
+    # reply it will ever get. tabs_list could tell it *that* a tab exists; only
+    # the event tells it which page produced one, and tells it without polling.
+    opener = client.open_tab()
+    r = client.call("evaluate", {
+        "tab_id": opener,
+        "script": "typeof window.open('https://example.com/?adopted=1', '_blank')",
+    })
+    assert not r.get("isError"), r
+    adopted = client.expect_adoption(opener, "own page called window.open")
+    assert adopted != opener, adopted
+    print("tab_opened reached the owning MCP session, naming opener", opener)
+
+    for tab in (adopted, opener):
+        r = client.call("tabs_close", {"tab_id": tab})
+        assert not r.get("isError"), r
+        client.expect_note("tab_closed", tab, "cleaning up the adoption tabs")
+
     # --- cross-session silence ---
     # The observer owns none of those tabs. The shell addresses each event to
     # the session that owns the tab; the proxy must forward, never fan out.
-    observer.expect_silence("another MCP session's tab crashed and closed")
+    observer.expect_silence("another MCP session's tab crashed, opened and closed")
 
     # The observer's own close proves that silence was real addressing and not
     # a dead notification path on that process.
