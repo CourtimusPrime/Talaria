@@ -2,10 +2,11 @@
 phase: 5
 slug: distributed-mode
 # status lifecycle: draft (seeded by plan-phase) → validated (set by validate-phase §6)
-status: draft
-nyquist_compliant: false
+status: validated
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-08-21
+reconciled: 2026-08-21  # against 05-01..05-11-PLAN.md; plan-checker APPROVED at revision 3
 scope_note: "Trimmed to DIST-01/02. The DIST-03 and DIST-04 rows in 05-RESEARCH.md's map belong to Phase 5.1 (decision D-05-04) and are carried forward there, not dropped."
 ---
 
