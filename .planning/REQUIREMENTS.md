@@ -170,8 +170,8 @@ Deferred. Tracked but not in the current roadmap.
 | AUTH-02 | Phase 4 | Complete |
 | DIST-01 | Phase 5 | Pending |
 | DIST-02 | Phase 5 | Pending |
-| DIST-03 | Phase 5 | Pending |
-| DIST-04 | Phase 5 | Pending |
+| DIST-03 | Phase 5.1 | Pending |
+| DIST-04 | Phase 5.1 | Pending |
 | PLAT-02 | Phase 6 | Pending |
 | PLAT-03 | Phase 6 | Pending |
 | REL-02 | Phase 7 | Pending |

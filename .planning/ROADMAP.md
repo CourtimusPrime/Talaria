@@ -179,24 +179,46 @@ and an anti-harassment state machine — several times any peer task. It splits 
 
 ### Phase 5: Distributed Mode *(v2)*
 
-**Goal**: Client and server can run on separate machines over Tailscale, with remote live-viewing and takeover hitting the same latency targets as local mode.
+**Goal**: A remote client on another machine can watch and take over an agent's tab over Tailscale, hitting the active-takeover latency target on a direct link.
 **Depends on**: Phase 4
-**Requirements**: [DIST-01, DIST-02, DIST-03, DIST-04]
+**Requirements**: [DIST-01, DIST-02]
 **Success Criteria** (what must be TRUE):
 
-  1. Client and server on two machines connected via Tailscale can browse and drive agent tabs
-  2. Remote takeover latency stays within the ~30–60ms active-takeover target
-  3. Killing the Tailscale link mid-agent-task and restoring it does not lose the agent's tab state
-  4. Restarting a crashed distributed-mode server offers to restore the prior session's tabs
+  1. A `talaria-client` on a second machine, connected via Tailscale, can list, watch and drive the
+     server's **agent** tabs — Me tabs are refused server-side, not merely hidden (decision D-05-02)
+  2. Remote takeover latency stays within the ~30–60ms active-takeover target **on a direct
+     WireGuard path**, and on a relayed (DERP) path the client degrades the frame rate and tells the
+     user rather than silently missing the target or refusing takeover (decision D-05-06)
+  3. Local mode is provably unaffected — the existing single-process path keeps Phase 1's measured
+     latency
+
+**Plans**: TBD — scope split from the original four; see `05-CONTEXT.md` D-05-04
+
+*Originally one phase covering DIST-01…04. Split during planning: an architectural client/server
+split plus a frame pipeline plus reconnect plus persistence was more than one reviewable phase, and
+Phase 4 needed eight plans for less. Reconnect and persistence moved to Phase 5.1.*
+
+Plans:
+
+- [ ] 05-xx: TBD — set by `/gsd-plan-phase 5`
+
+### Phase 5.1: Distributed Resilience *(v2)*
+
+**Goal**: A distributed session survives a dropped link and a server restart without losing the agent's work.
+**Depends on**: Phase 5
+**Requirements**: [DIST-03, DIST-04]
+**Success Criteria** (what must be TRUE):
+
+  1. Killing the Tailscale link mid-agent-task and restoring it does not lose the agent's tab state;
+     the client resyncs on reconnect
+  2. Restarting a crashed distributed-mode server offers to restore the prior session's tabs
 
 **Plans**: TBD
 
 Plans:
 
-- [ ] 05-01: Multiplexed WebSocket protocol (frame/input/control/tabs envelope) over Tailscale
-- [ ] 05-02: Adaptive screenshot polling (passive vs. active-takeover rates) wired to the WebSocket stream
-- [ ] 05-03: Reconnect/resync logic (session grace period, client tab-list resync)
-- [ ] 05-04: Session manifest persistence + restore-on-restart for distributed mode
+- [ ] 05.1-01: Reconnect/resync logic (session grace period, client tab-list resync)
+- [ ] 05.1-02: Session manifest persistence + restore-on-restart for distributed mode
 
 ### Phase 6: Platform Coverage *(v2)*
 
