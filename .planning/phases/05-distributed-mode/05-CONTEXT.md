@@ -154,3 +154,28 @@ relaxes the layer without realising what it was load-bearing for. Do that.
   unchanged, but four of its ~11 public items are a Unix socket path and a `getuid` shim, `Hello`'s
   client string is self-asserted and safe only because `SO_PEERCRED` ran first, and `Screenshot`
   is pull/text/whole-frame/+33%. Update PROJECT.md's claim as part of this phase.
+
+## Two product questions that are the same question — record them together
+
+The plan-checker noticed these are one question wearing two hats: **what can a remote human do that
+requires being physically at the server machine?** Answering them together, in Phase 5.1 or a UI
+phase, will be cheaper than answering them apart. Neither blocks Phase 5, and the plans handle both
+honestly rather than hiding them.
+
+1. **First pairing.** OAuth consent is a server-chrome panel, so authorising the *first* remote
+   client requires someone at the ThinkPad. `05-01` records the three options and their costs in
+   `deferred-items.md`; `05-07`'s first-run copy says so plainly. Adopting RFC 8628 device-code
+   instead is a **new plan, not an adjustment** — it changes the client's first-run surface.
+
+2. **A remote human at a login wall has no address bar.** The view channel deliberately carries no
+   `Command` (D-05-02 read literally — a viewer clicks, scrolls and types into the page and cannot
+   open, navigate, evaluate, close or download), and remote input correctly cannot reach the chrome.
+   Both are right individually. Together they mean that if an agent's flow dead-ends somewhere page
+   input cannot clear, the remote human's only recovery is to ask the agent to navigate, or to walk
+   to the server machine.
+
+   This is worth stating plainly because **it sits directly against the project's core value** —
+   "a human can take over instantly the moment it hits something only a human can clear." Page input
+   clears a CAPTCHA or a login form, which is the common case. It does not clear a flow that needs a
+   different URL. `05-11` records it in `SECURITY.md` and `05-07` in the client's first-run copy;
+   the revisit condition is the first time a real takeover dead-ends.
