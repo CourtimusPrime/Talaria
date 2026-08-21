@@ -192,15 +192,36 @@ and an anti-harassment state machine — several times any peer task. It splits 
   3. Local mode is provably unaffected — the existing single-process path keeps Phase 1's measured
      latency
 
-**Plans**: TBD — scope split from the original four; see `05-CONTEXT.md` D-05-04
+**Plans**: 11 plans across 8 waves
 
 *Originally one phase covering DIST-01…04. Split during planning: an architectural client/server
 split plus a frame pipeline plus reconnect plus persistence was more than one reviewable phase, and
 Phase 4 needed eight plans for less. Reconnect and persistence moved to Phase 5.1.*
 
+*`05-RESEARCH.md` sketched ~10 plans for all four requirements and said four was "too few"; this
+phase carries roughly half that scope in eleven, because the half it carries is the dense half — a
+transport, a codec, an input channel and a whole second front end, plus five of the seventeen
+high-severity threats. Three additions over the research's own sketch: the two required spikes are
+separate plans rather than one (the WebSocket-through-Serve spike needs the dependency landed first,
+the readback spike does not, so they parallelise), the client binary is two plans rather than one
+(the graphics-context construction has no analog in this codebase and the research's own pattern map
+flags it as the single unmapped step), and the documentation the phase owes gets its own closing plan
+rather than riding on the last functional one — the arrangement Phase 4 used, where the changelog
+obligation went unaddressed until 04-08.*
+
 Plans:
 
-- [ ] 05-xx: TBD — set by `/gsd-plan-phase 5`
+- [ ] 05-01-PLAN.md — Dependency + lockfile landing (`axum` with WebSockets, one added package); spike A2, whether Tailscale Serve proxies an upgrade and what `Host` a proxied request carries; open `deferred-items.md` (wave 1) — DIST-01
+- [ ] 05-02-PLAN.md — Spike A1/A8: GL readback cost at cadence under Xvfb and on real hardware, and the tile-diff/PNG figures re-measured against real Servo output (wave 1) — DIST-02
+- [ ] 05-03-PLAN.md — `talaria-protocol`: the `wire` module (envelope, frame header, input and view messages), the Unix-only helpers moved into `local`, and the two module headers that call this crate the distributed wire (wave 1) — DIST-01
+- [ ] 05-04-PLAN.md — Advertised base URL as one source feeding the issuer, the canonical resource, the four endpoint URLs and the Host allowlist; `https` on every published OAuth URL; `BIND_HOST` unchanged; `scripts/tailscale-serve.sh` (wave 2) — DIST-01
+- [ ] 05-05-PLAN.md — The `/view` WebSocket route with **its own** bearer check, registered for revocation; the view session, the agent-only tab lookup and the attachment cap; `remote_view_test.py` and a stdlib WebSocket client in the harness (wave 3) — DIST-01
+- [ ] 05-06-PLAN.md — Remote input: the three forwarders generalised, `keyboard_event_from_wire`, `remote_input.rs` with its four structural refusals, and the chrome-unreachable and coordinate-lands assertions (wave 4) — DIST-02
+- [ ] 05-07-PLAN.md — `talaria-client`: the crate, its graphics context without Servo, the verified secure WebSocket, the connection state, the agent tab list and the honest first-run copy (wave 4) — DIST-01
+- [ ] 05-08-PLAN.md — Frame pump: the visibility hold, unconditional paint on the tick, off-thread tile diff and `Compression::Fast` encode, keyframes; `encode_screenshot` untouched (wave 5) — DIST-02
+- [ ] 05-09-PLAN.md — Client present and capture: keyframes and deltas, frame ordering, one fit transform inverted for the pointer; a real client driven by a real pointer, asserted on the server (wave 6) — DIST-01, DIST-02
+- [ ] 05-10-PLAN.md — The rung ladder in one ordered table, the hysteretic controller, the honest report, `link_shim.py` and `remote_latency_test.py` (wave 7) — DIST-02
+- [ ] 05-11-PLAN.md — `SECURITY.md`'s fifth party and the CSWSH-by-construction property, `CHANGELOG.md`, the corrected wire claim, `scripts/two-machine-check.sh`, and Success Criterion 3's collected evidence (wave 8) — DIST-01, DIST-02
 
 ### Phase 5.1: Distributed Resilience *(v2)*
 
