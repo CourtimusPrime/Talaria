@@ -68,9 +68,9 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 
 ### Auth & Credentials (AUTH / CRED)
 
-- [ ] **AUTH-01**: Talaria exposes an OAuth 2.1 authorization server for its MCP endpoint (Authorization Code + PKCE, per-client tokens) — *Must Have* — no auth/token/PKCE code exists
-- [ ] **AUTH-02**: A user can view and individually revoke a connected agent's access — *Should Have*
-- [ ] **AUTH-03**: An HTTP/SSE MCP transport exists alongside stdio — *Must Have* — prerequisite for AUTH-01; today `rust-mcp-sdk` features are `["server","macros","stdio"]` (`Cargo.toml:45`)
+- [x] **AUTH-01**: Talaria exposes an OAuth 2.1 authorization server for its MCP endpoint (Authorization Code + PKCE, per-client tokens) — *Must Have* — no auth/token/PKCE code exists
+- [x] **AUTH-02**: A user can view and individually revoke a connected agent's access — *Should Have*
+- [x] **AUTH-03**: An HTTP/SSE MCP transport exists alongside stdio — *Must Have* — prerequisite for AUTH-01; today `rust-mcp-sdk` features are `["server","macros","stdio"]` (`Cargo.toml:45`)
 - [x] **CRED-01**: Credentials are stored in a local, domain-keyed file, encrypted at rest — *Must Have* — ChaCha20-Poly1305, keychain with 0600 key-file fallback (`crates/talaria-shell/src/vault.rs`)
 - [x] **CRED-02**: Stored credentials are suggested for autofill by domain match in the shell UI; agents never use them for fresh/interactive logins (that's takeover's job) — *Must Have* — **partial**: `matching()` domain keying exists, no autofill UI in `crates/talaria-shell/src/gui.rs`
 - [x] **CRED-03**: A user can save a credential from within Talaria — *Must Have* — the vault is read-only in-app and populated only by external import
@@ -165,9 +165,9 @@ Deferred. Tracked but not in the current roadmap.
 | BROWSE-02 | Phase 3 | Complete |
 | BROWSE-03 | Phase 3 | Complete |
 | BROWSE-04 | Phase 3 | Complete |
-| AUTH-03 | Phase 4 | Pending |
-| AUTH-01 | Phase 4 | Pending |
-| AUTH-02 | Phase 4 | Pending |
+| AUTH-03 | Phase 4 | Complete |
+| AUTH-01 | Phase 4 | Complete |
+| AUTH-02 | Phase 4 | Complete |
 | DIST-01 | Phase 5 | Pending |
 | DIST-02 | Phase 5 | Pending |
 | DIST-03 | Phase 5 | Pending |

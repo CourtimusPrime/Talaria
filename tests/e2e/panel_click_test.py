@@ -463,9 +463,21 @@ try:
     # --- the hook this suite leans on is not there in an ordinary run -----
     # Where the human's own controls are on screen is not an agent's to read:
     # an agent that could would know where to aim synthetic input at the
-    # credentials button, the bookmark star or a downloads row. Started
-    # without TALARIA_TEST_HOOKS, the command has to answer the way an
-    # unrecognised one does, and say nothing about a feature being withheld.
+    # credentials button, the bookmark star or a downloads row — or, since
+    # 04-06, at `consent.approve` and `consent.deny`, the two rects behind the
+    # click that hands an agent full control of the browser. Started without
+    # TALARIA_TEST_HOOKS, the command has to answer the way an unrecognised
+    # one does, and say nothing about a feature being withheld.
+    #
+    # What this is and is not: **the gate is on the command, not on individual
+    # names.** `chrome_rects` is refused whole, so every rect any future panel
+    # adds is covered by construction and no per-name list has to be
+    # maintained. The consent names are called out here because they are the
+    # highest-value ones, not because the gate knows about them — and
+    # `04-UI-SPEC.md` Surface 1 records the other side of that tradeoff: under
+    # the hook the mechanism *can* reach `consent.approve`, which is exactly
+    # what lets `oauth_flow_test.py` drive the real decision path instead of
+    # needing a variable that approves on a human's behalf.
     stop_shell(tal)
     tal = start(hooks=None)
     refused = rpc("chrome_rects")

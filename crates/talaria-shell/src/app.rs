@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use servo::{
@@ -31,12 +32,15 @@ use talaria_protocol::{
     Command, Outcome, ResultPayload, TabInfo,
 };
 
+use crate::agents::Agents;
 use crate::bookmarks::Bookmarks;
 use crate::control::AgentRequest;
 use crate::downloads::Downloads;
 use crate::gui::{ChromePanel, Gui, UiAction};
 use crate::history::History;
+use crate::http::{RemoteAccess, ShutdownHandle, StreamRegistry};
 use crate::keyutils;
+use crate::oauth::SharedAgents;
 use crate::settings::{SearchEngine, Settings};
 use crate::tabs::{TabManager, TabOwner, ViewMode};
 use crate::vault::Vault;
@@ -80,6 +84,30 @@ pub enum AppEvent {
         bytes: u64,
         requested_by_agent: bool,
     },
+    /// The remote MCP listener bound, raised from the `talaria-http` thread.
+    ///
+    /// `addr` is the address that was **actually bound**, read back off the
+    /// socket — never the configured one. Everything the human is shown, and
+    /// the origin [`parse_agent_url`] refuses, comes from this string, which
+    /// is what stops the toolbar and the Access panel disagreeing.
+    RemoteListenerBound { addr: String },
+    /// The remote MCP listener could not bind, or stopped without being asked
+    /// to. Remote access goes back to off: the chrome never claims a listener
+    /// that is not there.
+    RemoteListenerFailed { addr: String, error: String },
+    /// An agent is asking to drive this browser, and a human has to answer.
+    ///
+    /// Raised from the `talaria-http` thread once `/authorize` has checked
+    /// every parameter the caller supplied, which is why the panel this opens
+    /// has no error state. The request carries the channel the decision goes
+    /// back down and **nothing else** — no authorization code, no token and no
+    /// PKCE verifier ever crosses into the chrome.
+    ///
+    /// This is the only [`AppEvent`] that opens a panel. It goes through
+    /// [`crate::gui::Gui::raise_consent`] rather than through
+    /// [`UiAction::SetPanel`], which refuses this panel outright — see
+    /// `apply_ui_actions`.
+    ConsentRequested(crate::oauth::ConsentRequest),
 }
 
 /// A connected control-socket client: display label + its event channel.
@@ -103,14 +131,17 @@ pub struct Shared {
     pub window_rendering_context: Rc<WindowRenderingContext>,
     /// The way back onto the main thread from work that is not on it.
     ///
-    /// The third holder of an [`EventLoopProxy`] in this codebase, after
-    /// [`Waker`] (servo's own wake mechanism) and the control thread's
-    /// independently-created one — and the first that lives on `Shared`,
-    /// because until downloads there was nothing on `Shared` a background
-    /// thread needed to tell it about. `Shared` is `Rc`-based and therefore
-    /// not `Send`, so a spawned thread cannot touch any of it; cloning this
-    /// proxy *before* the spawn and sending an [`AppEvent`] back is the only
-    /// route, and `user_event` is the only place that route lands.
+    /// The **fourth** holder of an [`EventLoopProxy`] in this codebase, after
+    /// [`Waker`] (servo's own wake mechanism), the control thread's
+    /// independently-created one, and the short-lived thread each download
+    /// runs on — and the first that lives on `Shared`, because until downloads
+    /// there was nothing on `Shared` a background thread needed to tell it
+    /// about. The fourth is [`crate::http`]'s listener, which unlike the
+    /// download threads is long-lived and holds its clone for as long as
+    /// remote access is on. `Shared` is `Rc`-based and therefore not `Send`,
+    /// so a spawned thread cannot touch any of it; cloning this proxy *before*
+    /// the spawn and sending an [`AppEvent`] back is the only route, and
+    /// `user_event` is the only place that route lands.
     pub event_proxy: EventLoopProxy<AppEvent>,
     pub tabs: RefCell<TabManager>,
     pub sessions: RefCell<BTreeMap<u64, Session>>,
@@ -132,6 +163,59 @@ pub struct Shared {
     /// else — see [`crate::downloads`] for why this store, unlike history,
     /// has no owner filter.
     pub downloads: RefCell<Downloads>,
+    /// What the remote MCP listener is doing. The one source of truth the
+    /// Access panel's status block, the toolbar's connection glyph and
+    /// [`parse_agent_url`]'s own-origin refusal all read, written only from
+    /// the listener's own [`AppEvent::RemoteListenerBound`] /
+    /// [`AppEvent::RemoteListenerFailed`] — see [`crate::http`].
+    pub remote: RefCell<RemoteAccess>,
+    /// The handle that stops the listener thread, present exactly while one
+    /// is running. Taken (not cloned) when remote access is switched off, so
+    /// the type itself makes a second shutdown of the same listener
+    /// unrepresentable.
+    pub remote_shutdown: RefCell<Option<ShutdownHandle>>,
+    /// The live response streams the listener is serving, addressable by the
+    /// client that owns them — see [`crate::http::StreamRegistry`].
+    ///
+    /// Empty whenever nothing is listening, and empty *while* a listener is
+    /// binding: a revoke in that window has no stream to close because none
+    /// can exist yet. It is the second half of `UiAction::RevokeClient`, and
+    /// the half without which "revoked" would be true of the store and false
+    /// of an agent still receiving frames.
+    pub remote_streams: RefCell<StreamRegistry>,
+    /// The registered agent clients and the digests of the tokens they hold —
+    /// see [`crate::agents`].
+    ///
+    /// **The one field on `Shared` that is not a `RefCell`, and the reason is
+    /// the whole point of it.** The four Phase 3 stores are read and written
+    /// only on the winit main thread, so a `RefCell` is exactly right for
+    /// them. This one is also read by the `talaria-http` thread, on every
+    /// single request, by [`crate::oauth::TalariaAuth`] — and it must be the
+    /// *same* store, not a second one loaded from the same file. Two
+    /// independently-loaded values would give the browser chrome and the token
+    /// verifier different answers, so a revocation a human just performed
+    /// would keep working over HTTP until the next restart. An
+    /// [`std::sync::Arc`] over a [`std::sync::Mutex`] is what makes that
+    /// unrepresentable rather than merely avoided.
+    ///
+    /// Every critical section on either side is one synchronous operation over
+    /// a `Vec` of a handful of records, with no `await` inside it, so the
+    /// listener thread cannot block the event loop.
+    pub agents: SharedAgents,
+    /// The one authorization request currently waiting for a human, if any.
+    ///
+    /// **An `Option`, and never a queue.** "At most one consent request is on
+    /// screen at a time" is the anti-harassment cap `04-UI-SPEC.md` fixes, and
+    /// parking at most one makes it structural rather than something a counter
+    /// has to keep right. The HTTP side refuses a second request outright, so
+    /// nothing is dropped by this shape — the caller is told no.
+    ///
+    /// Written from [`AppEvent::ConsentRequested`] and taken by the Approve
+    /// and Deny handlers in `apply_ui_actions`. The consent panel reads it
+    /// each frame the way every other panel reads its store, which is also
+    /// where the arm delay's `raised_at_ms` comes from — no timing state lives
+    /// on the chrome.
+    pub pending_consent: RefCell<Option<crate::oauth::ConsentRequest>>,
     /// Bottom of the chrome strip, in logical points.
     pub toolbar_height: Cell<f32>,
     /// Last cursor position, physical pixels.
@@ -878,6 +962,13 @@ impl ApplicationHandler<AppEvent> for App {
             bookmarks: RefCell::new(Bookmarks::load()),
             settings: RefCell::new(Settings::load()),
             downloads: RefCell::new(Downloads::load()),
+            remote: RefCell::new(RemoteAccess::default()),
+            remote_shutdown: RefCell::new(None),
+            remote_streams: RefCell::new(StreamRegistry::default()),
+            // Loaded once, here, and shared by clone with the listener thread
+            // — never loaded a second time anywhere. See the field's comment.
+            agents: Arc::new(Mutex::new(Agents::load())),
+            pending_consent: RefCell::new(None),
             toolbar_height: Cell::new(0.0),
             last_cursor: Cell::new(None),
             webview_point: Cell::new(euclid::Point2D::zero()),
@@ -891,6 +982,15 @@ impl ApplicationHandler<AppEvent> for App {
             pending_tab_work: RefCell::new(Vec::new()),
             pending_history_writes: RefCell::new(Vec::new()),
         });
+
+        // The switch survives a restart: a `config.json` that says remote
+        // access is on starts the listener here, before the first tab, and a
+        // fresh install (no file) starts nothing at all — D-04-04's
+        // default-off is this `if` and no other check.
+        let configured = state.settings.borrow().remote_access;
+        if configured.enabled {
+            start_remote_listener(&state, configured.port);
+        }
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
         *self = App::Running(state);
@@ -940,6 +1040,49 @@ impl ApplicationHandler<AppEvent> for App {
                         now_ms(),
                         requested_by_agent,
                     );
+                    state.window.request_redraw();
+                },
+                // Raised from the `talaria-http` thread, which cannot touch
+                // any of `Shared`. The address written here is the one the
+                // socket reported, so the two surfaces that render it and the
+                // refusal that keys on it read the same string.
+                AppEvent::RemoteListenerBound { addr } => {
+                    *state.remote.borrow_mut() = RemoteAccess::Bound { addr };
+                    state.window.request_redraw();
+                },
+                AppEvent::RemoteListenerFailed { addr, error } => {
+                    // The shutdown handle goes with it: the thread it would
+                    // have stopped is already gone.
+                    state.remote_shutdown.borrow_mut().take();
+                    *state.remote.borrow_mut() = RemoteAccess::Failed { addr, error };
+                    state.window.request_redraw();
+                },
+                // Also raised from the `talaria-http` thread. The request is
+                // parked here — at most one, ever — and the panel reads it
+                // from there each frame, so no timing state and no secret
+                // travels into the chrome.
+                AppEvent::ConsentRequested(request) => {
+                    log::info!("consent requested by client {}", request.client_id);
+                    *state.pending_consent.borrow_mut() = Some(request);
+                    // Through `raise_consent` and never through
+                    // `UiAction::SetPanel`, which refuses this panel: the two
+                    // entry points are disjoint by construction, which is what
+                    // makes "no control can open the Approve button" a
+                    // property a reviewer confirms in one place.
+                    GUI.with_borrow_mut(|gui| {
+                        if let Some(gui) = gui.as_mut() {
+                            gui.raise_consent();
+                        }
+                    });
+                    // The flow starts in an *external* browser (RFC 8252), so
+                    // the human is by definition looking somewhere else when
+                    // this arrives. Ask for their attention — and deliberately
+                    // do **not** take focus: pulling focus toward a screen
+                    // whose primary button grants full browser control is the
+                    // exact opposite of the arm delay that button carries.
+                    state.window.request_user_attention(Some(
+                        winit::window::UserAttentionType::Informational,
+                    ));
                     state.window.request_redraw();
                 },
             }
@@ -1250,6 +1393,65 @@ fn forward_wheel(state: &Shared, delta: MouseScrollDelta) {
     )));
 }
 
+/// Start the remote MCP listener, and record that it is starting.
+///
+/// A no-op when one is already bound or on its way to being bound, so a second
+/// request while a bind is in flight cannot produce a second listener
+/// (T-04-03-03). The state goes to `Starting` here rather than to `Bound`:
+/// only the listener's own event may claim an address, because only the
+/// listener knows one.
+fn start_remote_listener(state: &Rc<Shared>, port: u16) {
+    if state.remote.borrow().is_live() {
+        return;
+    }
+    // Cloned out here, before the spawn: `state` is an `Rc<Shared>` and `Rc`
+    // is not `Send`, so the closure inside `http::spawn` can never borrow it.
+    // The proxy is the whole of what crosses the thread boundary.
+    let proxy = state.event_proxy.clone();
+    // The store handle is cloned, not the store: the `Arc` is what makes the
+    // listener's verifier and the chrome's revoke one store rather than two.
+    let agents = Arc::clone(&state.agents);
+    *state.remote.borrow_mut() = RemoteAccess::Starting;
+    // The registry comes back empty and fills itself in when the bind lands —
+    // it is the listener that knows what state a revoke has to reach, and it
+    // does not know until it has an address.
+    let (shutdown, streams) = crate::http::spawn(proxy, agents, port);
+    *state.remote_shutdown.borrow_mut() = Some(shutdown);
+    *state.remote_streams.borrow_mut() = streams;
+    state.window.request_redraw();
+}
+
+/// Answer the parked consent request and close the panel.
+///
+/// `id` is checked against the parked request rather than trusted: the two can
+/// only disagree if a decision was applied a frame after the request it named
+/// was replaced, and answering the *wrong* request in that window would be a
+/// human approving one agent and granting another. A mismatch drops the taken
+/// request, which closes its channel, which the HTTP side reads as a refusal —
+/// the degrade direction is deny.
+///
+/// The panel closes through `set_panel(ChromePanel::None)`, which is allowed:
+/// only the `Consent` variant is refused there, and only as a *destination*.
+/// It closes to no panel rather than restoring whatever was open before,
+/// because panel state is a single enum and a restore stack for one screen
+/// would be new machinery for no benefit.
+fn resolve_consent(state: &Rc<Shared>, id: u64, decision: crate::oauth::ConsentDecision) {
+    match state.pending_consent.borrow_mut().take() {
+        Some(request) if request.id == id => request.resolve(decision),
+        Some(request) => log::warn!(
+            "a consent decision named request {id} but {} was parked; refusing both",
+            request.id
+        ),
+        None => log::warn!("a consent decision arrived for request {id}, which is not parked"),
+    }
+    GUI.with_borrow_mut(|gui| {
+        if let Some(gui) = gui.as_mut() {
+            gui.set_panel(ChromePanel::None);
+        }
+    });
+    state.window.request_redraw();
+}
+
 fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
     for action in actions {
         match action {
@@ -1335,6 +1537,21 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                 }
                 state.window.request_redraw();
             },
+            // The refusal. Adding `Consent` to `ChromePanel` is what made
+            // `SetPanel(Consent)` *representable*, and "no control constructs
+            // it" would otherwise be an invariant every future panel button
+            // had to maintain by discipline — one toolbar button written
+            // without thinking would open the screen whose primary control
+            // grants an agent the human's logged-in session. With the refusal
+            // here and the matching one in `Gui::set_panel`, "no control can
+            // open the Approve button" is a property a reviewer confirms in
+            // two functions rather than by auditing every call site that will
+            // ever exist. Dropped with a warning because it can only mean a
+            // bug: the consent panel is raised by `Gui::raise_consent` from
+            // `user_event`, and by nothing else.
+            UiAction::SetPanel(ChromePanel::Consent) => {
+                log::warn!("refusing a set-panel action naming the consent panel");
+            },
             UiAction::SetPanel(panel) => {
                 GUI.with_borrow_mut(|gui| {
                     if let Some(gui) = gui.as_mut() {
@@ -1342,6 +1559,17 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                     }
                 });
                 state.window.request_redraw();
+            },
+            // The two arms that answer a human. Each takes the parked request
+            // — there is at most one — and sends the decision down the channel
+            // the HTTP thread is waiting on. The *code* is minted over there,
+            // after the decision arrives, which is why neither of these arms
+            // touches a token, a code or a verifier.
+            UiAction::ApproveConsent(id) => {
+                resolve_consent(state, id, crate::oauth::ConsentDecision::Approve);
+            },
+            UiAction::DenyConsent(id) => {
+                resolve_consent(state, id, crate::oauth::ConsentDecision::Deny);
             },
             UiAction::ClearHistory => {
                 state.history.borrow_mut().clear();
@@ -1436,6 +1664,130 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                 });
                 state.window.request_redraw();
             },
+            // The one action that opens or closes a network port. Reached
+            // from the Access panel's button and from nowhere else — see
+            // `UiAction::SetRemoteAccess` for why that is a security property
+            // rather than a layout decision.
+            UiAction::SetRemoteAccess(enabled) => {
+                let mut configured = state.settings.borrow().remote_access;
+                configured.enabled = enabled;
+                // Persisted first, in both directions, so the choice survives
+                // a restart. The write applies to this session whether or not
+                // it reaches disk, which is what makes the off direction below
+                // reliable even on a read-only config directory.
+                state.settings.borrow_mut().save_remote_access(configured);
+                match enabled {
+                    // `start_remote_listener` is a no-op while one is already
+                    // bound or starting, so a second click during a bind in
+                    // flight cannot produce a second listener (T-04-03-03).
+                    true => start_remote_listener(state, configured.port),
+                    false => {
+                        // Taken, not cloned: the handle is consumed, so the
+                        // same listener cannot be shut down twice. In-flight
+                        // requests are resolved rather than stranded — each
+                        // awaiting sink holds a `oneshot` receiver, and the
+                        // runtime going away closes them, so every pending
+                        // request comes back to its caller as an error. That
+                        // is the cancellation mechanism 02-04 established,
+                        // reused here rather than reinvented.
+                        if let Some(handle) = state.remote_shutdown.borrow_mut().take() {
+                            handle.shutdown();
+                        }
+                        // Off immediately, without waiting for the thread to
+                        // finish draining: the human asked for it, and a
+                        // status block that kept saying "on" for three seconds
+                        // afterwards would be the wrong kind of honest.
+                        *state.remote.borrow_mut() = RemoteAccess::Off;
+                        state.window.request_redraw();
+                    },
+                }
+            },
+            // The other action that changes who may drive this browser, and
+            // the only one that takes access away. Reached from one Access
+            // panel row's second, confirming click and from nowhere else —
+            // see `UiAction::RevokeClient` for why that is a security property
+            // rather than a layout decision.
+            UiAction::RevokeClient(client_id) => {
+                // **Both halves, in one arm, because either alone is a lie.**
+                // The store mutation is what refuses the client's *next*
+                // request: verification is a live read of this same store, so
+                // a record dropped here is not there to be found a microsecond
+                // later. It does nothing whatever to a response stream the
+                // client already holds open — that stream has no next request
+                // to fail — so the registry's termination is the other half.
+                // A revoke that removed the row and left a stream delivering
+                // would be exactly the false completion this is written to
+                // prevent (T-7).
+                let changed = match state.agents.lock() {
+                    Ok(mut store) => store.revoke_client(&client_id),
+                    Err(_) => {
+                        // Degrade, never abort — and note that this degrades
+                        // toward *not* revoking, which is the one direction
+                        // here that is not safe. It is also unreachable
+                        // outside a panic inside the store, and the honest
+                        // answer is to say so rather than to invent a
+                        // recovery: a poisoned store already refuses every
+                        // credential (`TalariaAuth::verify`), so the client
+                        // has lost access anyway, by a worse route.
+                        log::error!(
+                            "agent store lock is poisoned; {client_id} was not revoked"
+                        );
+                        false
+                    },
+                };
+                // Attempted whichever way the store went. A stream can only
+                // exist for a client that had a token, and if the store
+                // somehow disagrees, closing the stream is still the answer.
+                state.remote_streams.borrow().terminate_client(&client_id);
+                match changed {
+                    true => log::info!("revoked agent client {client_id}"),
+                    // Not an error: revoking something already gone is a
+                    // no-op the store reports rather than refuses.
+                    false => log::debug!("nothing to revoke for agent client {client_id}"),
+                }
+                // What deliberately does **not** happen, so nobody reads the
+                // absence as an oversight: the client's existing tabs stay
+                // open. They are visible in the Agents view and the human can
+                // take any of them over, and closing a person's tabs because a
+                // credential was withdrawn would destroy state they may want.
+                // The agent cannot drive them any more, which is the whole of
+                // what a revoke is for.
+                //
+                // And the honest boundary on timing: a request that passed
+                // verification a moment before this ran will finish. That is
+                // correct — verification is per request, and a command already
+                // executing against the engine is not interruptible. What is
+                // guaranteed is the next request and the open stream.
+                state.window.request_redraw();
+            },
+            // The recovery half of CR-04. Not a revoke: it takes only
+            // registrations no human ever approved, so it cannot cost anybody
+            // access — which is why it needs no confirming click and why the
+            // panel offers it plainly.
+            UiAction::ForgetUnapprovedClients => {
+                let forgotten = match state.agents.lock() {
+                    Ok(mut store) => store.forget_unapproved(),
+                    Err(_) => {
+                        // Degrade, never abort. This one degrades toward *not*
+                        // forgetting, which is the safe direction here: a
+                        // registration that stays is inert, and a poisoned
+                        // store already refuses every credential.
+                        log::error!(
+                            "agent store lock is poisoned; no registration was forgotten"
+                        );
+                        0
+                    },
+                };
+                match forgotten {
+                    0 => log::debug!("no unapproved registrations to forget"),
+                    count => log::info!("forgot {count} unapproved registration(s)"),
+                }
+                // A parked consent request for one of them is deliberately not
+                // cancelled here: it resolves as it always would, and the
+                // approval then finds no registration and refuses the grant.
+                // The failure lands on a refused grant, never a granted one.
+                state.window.request_redraw();
+            },
             UiAction::DismissVaultNotice => {
                 let mut vault = state.vault.borrow_mut();
                 vault.clear_notices();
@@ -1468,12 +1820,53 @@ fn agent_scheme_allowed(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https" | "data") || url.as_str() == "about:blank"
 }
 
+/// Whether `url` names the address the remote MCP listener is bound to.
+///
+/// Host and port, compared against the string the listener itself reported.
+/// `localhost` is folded in when the bound host is loopback, because it
+/// resolves there and an agent typing it would otherwise walk straight past a
+/// refusal that only knew one spelling of the same machine.
+fn is_listener_origin(url: &Url, bound: &str) -> bool {
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    if format!("{host}:{port}").eq_ignore_ascii_case(bound) {
+        return true;
+    }
+    let loopback_alias = host.eq_ignore_ascii_case("localhost")
+        && bound.starts_with(&format!("{}:", crate::settings::LOOPBACK_BIND));
+    loopback_alias && bound.ends_with(&format!(":{port}"))
+}
+
 /// Agent-supplied URLs: accept scheme-less hosts ("example.com") by assuming
 /// https, but never fall back to a search query — an agent that meant to
 /// search should do so explicitly. Anything that parses is then held to
 /// `agent_scheme_allowed`; the refusal names the rejected scheme so the agent
 /// can tell policy apart from a typo.
-fn parse_agent_url(input: &str) -> Result<Url, String> {
+///
+/// `bound_origin` carries the `host:port` the remote MCP listener is bound to,
+/// or nothing when nothing is bound, and a URL matching it is refused (T-3).
+/// An agent that can `evaluate` in a tab it owns and can point that tab at
+/// Talaria's own endpoints can at minimum enumerate authorization metadata and
+/// self-register, and from 04-06 could try to drive its own consent screen
+/// from inside a page. There is no legitimate reason for an agent to browse
+/// the transport it is already speaking.
+///
+/// **This is the command half of that refusal and not the whole of it.** It
+/// guards `Command::TabsOpen` and `Command::Navigate` — the two places an
+/// agent hands this browser a URL — and it says nothing about a load a *page*
+/// starts, which is one `evaluate` away. `Shared::request_navigation` is where
+/// the invariant is actually enforced, on every navigation however it began;
+/// this stays because it refuses earlier and with a message an agent can read,
+/// not because it is the boundary (WR-03).
+///
+/// Keyed on what is **actually bound** rather than on the configured port, so
+/// it invents no rule while the listener is off: with remote access disabled
+/// there is no origin to protect and `http://127.0.0.1:8779/` is an ordinary
+/// address like any other. The refusal names the reason, in the same style as
+/// the scheme refusal above it and `validate_download_filename` below, so an
+/// agent can tell policy from a typo.
+fn parse_agent_url(input: &str, bound_origin: Option<&str>) -> Result<Url, String> {
     let parsed = match Url::parse(input) {
         Ok(url) => Ok(url),
         Err(url::ParseError::RelativeUrlWithoutBase) if !input.contains(' ') => {
@@ -1482,11 +1875,16 @@ fn parse_agent_url(input: &str) -> Result<Url, String> {
         Err(error) => Err(error),
     };
     match parsed {
-        Ok(url) if agent_scheme_allowed(&url) => Ok(url),
-        Ok(url) => Err(format!(
+        Ok(url) if !agent_scheme_allowed(&url) => Err(format!(
             "scheme {} is not allowed for agents — use http, https, data:, or about:blank",
             url.scheme()
         )),
+        Ok(url) if bound_origin.is_some_and(|bound| is_listener_origin(&url, bound)) => {
+            Err("that address is Talaria's own remote-access listener — agents may not \
+                 browse the transport they are speaking"
+                .to_owned())
+        },
+        Ok(url) => Ok(url),
         Err(error) => Err(format!("bad url: {error}")),
     }
 }
@@ -1626,6 +2024,14 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
     // backstop, not an oversight. Do not generalise this across the dispatch.
     let busy = |tab_id: u64| -> bool { state.tab_evaluating(tab_id) };
 
+    // Read once, as an owned string, rather than holding a `Ref` across the
+    // whole dispatch: the arms below take borrows of their own and a live
+    // immutable borrow of `remote` across them is a borrow-checker fight for
+    // nothing. `None` while nothing is bound, which is what keeps the refusal
+    // in `parse_agent_url` from inventing a rule the listener does not have.
+    let listener_origin: Option<String> =
+        state.remote.borrow().bound_addr().map(str::to_owned);
+
     match command {
         Command::TabsList => {
             let tabs = state.tabs.borrow();
@@ -1633,7 +2039,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             let _ = reply.send(Outcome::Ok { result: ResultPayload::Tabs { tabs: infos } });
         },
         Command::TabsOpen { url } => {
-            match parse_agent_url(&url) {
+            match parse_agent_url(&url, listener_origin.as_deref()) {
                 Ok(url) => {
                     let id = state.open_tab(url, TabOwner::Agent { session_id, client });
                     // A fresh webview has no document yet: reply once the
@@ -1695,7 +2101,7 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                 });
                 return;
             }
-            match (webview_for(tab_id), parse_agent_url(&url)) {
+            match (webview_for(tab_id), parse_agent_url(&url, listener_origin.as_deref())) {
                 (Ok(webview), Ok(url)) => {
                     if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
                         tab.location = url.to_string();
@@ -2294,14 +2700,77 @@ fn download(
 }
 
 impl servo::WebViewDelegate for Shared {
+    /// Allow every navigation but one: an agent-owned tab reaching the
+    /// listener's own origin.
+    ///
+    /// **Talaria is not a policy layer, and this is not policy.** The
+    /// listener's own address is the transport the agent is already speaking;
+    /// there is no legitimate reason for an agent to browse it, and
+    /// `parse_agent_url`'s refusal on `tabs_open` and `navigate` was worth
+    /// nothing while a page-driven navigation reached the same address in one
+    /// call — `evaluate(tab, "location.href = 'http://127.0.0.1:PORT/register'")`,
+    /// or a `window.open`, or a `<meta refresh>`, or a link click (WR-03).
+    /// A mitigation keyed on where a URL is *parsed* rather than on where a
+    /// load *happens* is the Phase 3 history-filter mistake again; this makes
+    /// the invariant structural.
+    ///
+    /// The human's own tabs are untouched, including a human's own tab
+    /// pointed at the listener — the refusal is keyed on the tab's owner, and
+    /// nothing here narrows what a person may browse.
+    ///
+    /// **Refusing means `deny()`, never `return`.** `NavigationRequest`'s
+    /// `Drop` sends *allow* when no response was sent, so dropping the value
+    /// is the opposite of a refusal.
     fn request_navigation(
         &self,
-        _webview: WebView,
+        webview: WebView,
         navigation_request: servo::NavigationRequest,
     ) {
-        // The default delegate drops the request, which blocks link-click
-        // navigation entirely. Talaria is not a policy layer: allow all.
-        navigation_request.allow();
+        // A delegate callback, so every borrow is a `try_borrow` and every
+        // failure is answered rather than panicked on — and answered in the
+        // direction that refuses, per this module's degrade rule. Both
+        // failure arms are unreachable in practice: neither `remote` nor
+        // `tabs` is held across a call into the engine.
+        let Ok(remote) = self.remote.try_borrow() else {
+            log::warn!(
+                "could not read the listener's address while deciding a navigation; \
+                 refusing it"
+            );
+            navigation_request.deny();
+            return;
+        };
+        let bound = remote.bound_addr().map(str::to_owned);
+        drop(remote);
+        // Cheapest question first, and the one that needs no tab table: with
+        // nothing bound there is no origin to protect, and a URL that is not
+        // the listener's is nobody's business here.
+        if !bound.as_deref().is_some_and(|bound| is_listener_origin(&navigation_request.url, bound))
+        {
+            navigation_request.allow();
+            return;
+        }
+        // It *is* this browser's own listener, so whose tab it is now decides.
+        let agent_owned = match self.tabs.try_borrow() {
+            Ok(tabs) => tabs
+                .find_by_webview(&webview)
+                .and_then(|id| tabs.get(id))
+                .map(|tab| tab.owner.is_agent()),
+            Err(_) => None,
+        };
+        match agent_owned {
+            // A human's tab, and a person may browse their own machine.
+            Some(false) => navigation_request.allow(),
+            // An agent's tab, or a tab table that could not say. Unanswered
+            // resolves to a refusal *at this one address*: a denied
+            // navigation is recoverable and a permitted one is not.
+            _ => {
+                log::warn!(
+                    "refused a navigation to Talaria's own remote-access listener from a \
+                     tab that is not the human's"
+                );
+                navigation_request.deny();
+            },
+        }
     }
 
     fn request_create_new(
@@ -2698,5 +3167,78 @@ mod tests {
             assert_eq!(validate_download_filename(name), Ok(()), "{name:?} was refused");
         }
     }
-}
 
+    // ---------------------------------------------------------------------
+    // parse_agent_url's own-origin refusal (T-3)
+    // ---------------------------------------------------------------------
+
+    /// The refusal itself: while something is bound, an agent may not point a
+    /// tab at it.
+    #[test]
+    fn the_listeners_own_origin_is_refused_while_it_is_bound() {
+        let bound = Some("127.0.0.1:8779");
+        for input in [
+            "http://127.0.0.1:8779/",
+            "http://127.0.0.1:8779/mcp",
+            "http://127.0.0.1:8779/.well-known/oauth-authorization-server",
+            "http://127.0.0.1:8779",
+        ] {
+            let refusal = parse_agent_url(input, bound);
+            assert!(refusal.is_err(), "{input} reached the listener");
+        }
+    }
+
+    /// `localhost` resolves to the same place, so it is the same refusal — a
+    /// gate that knew only one spelling of one machine would not be a gate.
+    #[test]
+    fn the_localhost_spelling_of_the_listener_is_refused_too() {
+        assert!(parse_agent_url("http://localhost:8779/mcp", Some("127.0.0.1:8779")).is_err());
+    }
+
+    /// Keyed on what is actually bound: with the listener off there is no
+    /// origin to protect, and the same URL is an ordinary address.
+    #[test]
+    fn the_same_address_is_allowed_when_nothing_is_bound() {
+        let allowed = parse_agent_url("http://127.0.0.1:8779/", None);
+        assert_eq!(allowed.map(|url| url.to_string()), Ok("http://127.0.0.1:8779/".to_owned()));
+    }
+
+    /// A neighbouring port on the same host is somebody else's server — very
+    /// often the thing an agent legitimately wants to look at.
+    #[test]
+    fn a_different_port_on_the_same_host_is_allowed() {
+        let bound = Some("127.0.0.1:8779");
+        for input in ["http://127.0.0.1:8080/", "http://localhost:3000/", "http://127.0.0.1/"] {
+            assert!(parse_agent_url(input, bound).is_ok(), "{input} was refused");
+        }
+    }
+
+    /// The refusal names the reason, so an agent can tell policy from a typo —
+    /// the same contract the scheme refusal beside it keeps.
+    #[test]
+    fn the_listener_refusal_names_the_reason() {
+        let refusal = parse_agent_url("http://127.0.0.1:8779/mcp", Some("127.0.0.1:8779"))
+            .expect_err("the listener's own origin must be refused");
+        assert!(refusal.contains("remote-access listener"), "{refusal}");
+        assert!(!refusal.starts_with("bad url"), "{refusal}");
+    }
+
+    /// The scheme gate still runs first: a refused scheme must not be reported
+    /// as a listener-origin problem, and must stay refused with nothing bound.
+    #[test]
+    fn the_scheme_refusal_still_comes_first() {
+        let refusal = parse_agent_url("file:///etc/passwd", Some("127.0.0.1:8779"))
+            .expect_err("file: is not an agent scheme");
+        assert!(refusal.starts_with("scheme file"), "{refusal}");
+    }
+
+    /// And every ordinary URL is untouched by the new parameter.
+    #[test]
+    fn ordinary_urls_are_unaffected_by_the_bound_origin() {
+        for bound in [None, Some("127.0.0.1:8779")] {
+            assert!(parse_agent_url("https://example.com/", bound).is_ok());
+            assert!(parse_agent_url("example.com", bound).is_ok());
+            assert!(parse_agent_url("about:blank", bound).is_ok());
+        }
+    }
+}

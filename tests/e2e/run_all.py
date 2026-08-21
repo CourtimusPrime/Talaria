@@ -6,7 +6,13 @@ serves the socket-driven suites: control_socket, scheme_refusal,
 crash_recovery, crash_event, timeout_session, wedge_fastfail, mcp_client,
 single_instance, popup.  Phase 2: the standalone suites (keyboard_nav, takeover,
 download_bounds, vault, vault_ui, history, bookmarks, downloads_list,
-panel_click, vault_nobus) each start their own shell.
+panel_click, http_transport, oauth_flow, revocation, vault_nobus) each start
+their own shell.
+
+oauth_flow_test and revocation_test are the two slow ones: each authorizes
+clients through a real consent click, and revocation_test additionally waits
+out a keep-alive interval to prove a stream is delivering before it asserts
+that revoking closes it.
 
 Honours TALARIA_E2E_DISPLAY / XDG_RUNTIME_DIR (see harness.py) so it can run
 next to a soak on the default display.  Exit code = number of failed suites.
@@ -66,7 +72,8 @@ finally:
 # that in its own process, so nothing above it sees either change.
 for name in ("keyboard_nav_test", "takeover_test", "download_bounds_test", "vault_test",
              "vault_ui_test", "history_test", "bookmarks_test", "downloads_list_test",
-             "panel_click_test", "vault_nobus_test"):
+             "panel_click_test", "http_transport_test", "oauth_flow_test",
+             "revocation_test", "vault_nobus_test"):
     run(name, [])
 
 failed = [n for n, ok in results.items() if not ok]

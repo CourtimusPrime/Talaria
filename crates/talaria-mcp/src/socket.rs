@@ -144,6 +144,20 @@ impl ShellConnection {
     }
 }
 
+/// The stdio proxy's sink: one hop over the Unix control socket.
+///
+/// This forwards to the inherent `request` and adds nothing to it. The narrow
+/// retry, the pipelining and the reconnect semantics this module's header
+/// describes all belong to that method, which already decides what is safe to
+/// re-send — a sink that retried on top of a connection that has already made
+/// that decision would re-create the double-execution bug plan 02-05 fixed.
+#[async_trait::async_trait]
+impl crate::CommandSink for ShellConnection {
+    async fn request(&self, client: &str, command: Command) -> Result<Outcome, String> {
+        ShellConnection::request(self, client, command).await
+    }
+}
+
 async fn connect(
     client: &str,
     events: mpsc::UnboundedSender<Event>,

@@ -51,6 +51,9 @@ egui-phosphor = "0.12"
 glow = "0.17"
 # Shell plumbing
 talaria-protocol = { path = "crates/talaria-protocol" }
+# The intra-workspace edge 04-01's `[lib]` target exists for: the shell links
+# the MCP tool surface rather than defining a second copy of it.
+talaria-mcp = { path = "crates/talaria-mcp" }
 tokio = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -62,8 +65,30 @@ chacha20poly1305 = "0.10"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"] }
 rand = "0.8"
 hex = "0.4"
-rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["server", "macros", "stdio"] }
+# The `sse` feature is deliberately absent from *this line* — and is enabled anyway,
+# transitively, by `rust-mcp-axum` below: `cargo tree -p talaria-shell -e features -i
+# rust-mcp-sdk` shows `rust-mcp-sdk feature "http"` pulling in `feature "sse"`, and it
+# has to, because `rust_mcp_axum::routes::sse_routes` calls the `#[cfg(feature = "sse")]`
+# handler unconditionally. Not listing it here therefore buys nothing: `/sse` and
+# `/messages` are mounted and live. The 2026-07-28 MCP revision deprecates that legacy
+# HTTP+event-stream transport, and a long-lived legacy stream is the most likely way a
+# revoked client keeps talking after its token is gone (04-RESEARCH.md Pitfall 4), so
+# `crates/talaria-shell/src/http.rs` closes those streams on a revoke explicitly rather
+# than relying on this line. Do not read this as "the routes are inert".
+rust-mcp-sdk = { version = "1.0.1", default-features = false,
+                 features = ["server", "macros", "stdio", "streamable-http", "auth"] }
+# The SDK's own supported Axum backend — `create_axum_server`, `AxumServerOptions`,
+# DNS-rebinding protection, `mcp_routes()`.
+#
+# Package Legitimacy Audit (04-RESEARCH.md, crates.io API 2026-08-20): first
+# published 2026-06-24 with ~600 downloads, flagged SUS on age and volume, and
+# cleared on provenance — same GitHub repository (rust-mcp-stack/rust-mcp-sdk) and
+# same crates.io owner as the rust-mcp-sdk above, named in that SDK's own README as
+# its supported Axum backend.
+rust-mcp-axum = "1.0.1"
 async-trait = "0.1"
+# Token hashing and PKCE S256. Already resolved at 0.11.0 through the servo tree.
+sha2 = "0.11"
 
 [profile.release]
 lto = "thin"

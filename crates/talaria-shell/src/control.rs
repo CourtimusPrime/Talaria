@@ -26,6 +26,18 @@ pub struct AgentRequest {
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
+/// The next session id, from the one counter every transport shares.
+///
+/// Exposed for [`crate::http`], which allocates ids for callers that never
+/// touch this socket. It reads from `NEXT_SESSION` rather than keeping its own
+/// counter deliberately: two allocators starting at 1 would hand out the same
+/// id twice, and a session id is what decides which agent owns a tab and which
+/// agent a lifecycle event is addressed to — so a collision would silently
+/// give one client another client's tabs.
+pub fn next_session_id() -> u64 {
+    NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// If another Talaria already owns the control socket, hand it `url` to open
 /// in the human's view and return `Ok(true)`; `Ok(false)` when no live
 /// instance answers (a stale socket file is fine — bind removes it). Runs
@@ -303,7 +315,12 @@ async fn handle_connection(
 /// produce an outcome before answering the agent with an error, default 30s.
 /// The same bound caps a single socket write, so a peer that stops reading
 /// cannot strand a connection's writer task.
-fn command_timeout_secs() -> u64 {
+///
+/// Public so [`crate::http`] bounds its own requests by the *same* clock
+/// rather than reading the environment variable a second time: two transports
+/// that could disagree about how long a command may take is a difference
+/// nobody would notice until one of them timed out and the other did not.
+pub fn command_timeout_secs() -> u64 {
     std::env::var("TALARIA_COMMAND_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse().ok())

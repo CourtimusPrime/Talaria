@@ -44,7 +44,7 @@ their detail below; they are simply not v1.
 - [x] **Phase 1: Foundation & Core Engine** — Servo rendering, egui shell, live agent takeover, a fast MCP tool surface, credential vault, and an Xvfb e2e harness. **Complete.**
 - [x] **Phase 2: Harden the Agent Surface** — Close the audit's open gaps: scheme allowlist, `evaluate` wedging and the serializing mutex, control-socket peer auth, bounded downloads, real MCP notifications, a usable vault, and CI.
 - [x] **Phase 3: Table-Stakes Browsing** *(v1)* — History, bookmarks, configurable search, and a downloads UI, so Talaria works as a real daily driver. (completed 2026-08-20)
-- [ ] **Phase 4: Authenticated Remote Transport** *(v2)* — An HTTP/SSE MCP transport plus the OAuth 2.1 authorization server that becomes possible once it exists.
+- [x] **Phase 4: Authenticated Remote Transport** *(v2)* — An HTTP/SSE MCP transport plus the OAuth 2.1 authorization server that becomes possible once it exists. (completed 2026-08-21)
 - [ ] **Phase 5: Distributed Mode** *(v2)* — Client and server split across machines over Tailscale, with remote live-viewing and takeover.
 - [ ] **Phase 6: Platform Coverage** *(v2)* — Confirm macOS, then Windows.
 - [ ] **Phase 7: Release Readiness** *(v2)* — An update mechanism, manual accessibility verification, and a live landing page.
@@ -133,17 +133,49 @@ Plans:
 **Success Criteria** (what must be TRUE):
 
   1. An MCP client can connect over HTTP/SSE, not only stdio, and drive the same tool surface
-  2. A new agent client can complete the Authorization Code + PKCE flow against Talaria's own authorization server and receive a working token
+  2. A new agent client, given only Talaria's MCP endpoint URL, receives a 401 carrying
+     `WWW-Authenticate: Bearer resource_metadata=…`, discovers Talaria's authorization server
+     through the protected-resource metadata document, completes Authorization Code + PKCE
+     (S256) with the `resource` parameter set to Talaria's canonical URI, and receives an
+     access token that Talaria accepts on `/mcp` and rejects on any other audience
+     — *reworded during Phase 4 planning; the original wording permitted a plan that minted
+     a token and never implemented discovery or audience binding, which are what make the
+     flow findable and the token non-transferable*
+
   3. A user can list connected agents and revoke one, and that agent's next request is rejected while the others keep working
   4. The stdio transport still works unauthenticated for local use
 
-**Plans**: TBD
+**Plans**: 8/8 plans executed
 
 Plans:
 
-- [ ] 04-01: Add an HTTP/SSE MCP transport alongside stdio (`rust-mcp-sdk` feature + server wiring)
-- [ ] 04-02: OAuth 2.1 authorization server — metadata discovery, dynamic client registration, PKCE, token issuance
-- [ ] 04-03: Per-client token storage, revocation, and a connected-agents management UI in the shell
+- [x] 04-01-PLAN.md
+- [x] 04-02-PLAN.md
+- [x] 04-03-PLAN.md
+- [x] 04-04-PLAN.md
+- [x] 04-05-PLAN.md
+- [x] 04-06-PLAN.md
+- [x] 04-07-PLAN.md
+- [x] 04-08-PLAN.md
+
+*Split expanded from 3 plans to 7 during planning (decision D-04-03 in `04-CONTEXT.md`), then to 8
+after plan review. The original 3-plan split put metadata discovery, DCR, PKCE and token issuance in
+a single plan. The two additions carrying the most weight are 04-01, which makes "the same tool
+surface" structurally true rather than reviewed-for, and 04-02, which lands the dependency and
+lockfile change as its own task because `Cargo.lock` is load-bearing here. The eighth plan came from
+the plan-checker: the authorization server was still one plan carrying metadata, registration, a
+five-step validation chain, a consent panel, the code store, constant-time PKCE, refresh rotation
+and an anti-harassment state machine — several times any peer task. It splits at the code: 04-06
+**writes** authorization codes, 04-07 **redeems** them.*
+
+- [x] 04-01: Extract the tool surface into `talaria-mcp/src/lib.rs` behind a `CommandSink` trait — no behaviour change (wave 1)
+- [x] 04-02: Dependency + lockfile landing; verify `primeorder 0.14.0-rc.14` survives and CI `--locked` stays green; settle the `rust-mcp-axum` routing spike (wave 1)
+- [x] 04-03: Streamable-HTTP listener in the shell — off by default, loopback-bound; `parse_agent_url` refuses its own origin (wave 2) — AUTH-03, SC 4
+- [x] 04-04: `agents.rs` — client registry and hashed opaque token store, atomic `0600` writes, no HTTP (wave 2)
+- [x] 04-05: Resource-server half — `impl AuthProvider`, RFC 9728 metadata, 401 + `WWW-Authenticate`, audience validation (wave 3) — SC 1
+- [x] 04-06: Authorization server, front half — RFC 8414 metadata, DCR, `/authorize` validation, the chrome consent panel, and the holding page (wave 4)
+- [x] 04-07: Authorization server, back half — `/token` with constant-time PKCE S256, single-use code redemption, refresh rotation (wave 5) — AUTH-01, SC 2
+- [x] 04-08: Revocation — `/revoke` (RFC 7009), the Access panel's client list, and terminating a revoked client's open streams (wave 6) — AUTH-02, SC 3
 
 ### Phase 5: Distributed Mode *(v2)*
 
@@ -213,7 +245,7 @@ Phases execute in numeric order: 1 → 2 → 3 (**ship v1**) → 4 → 5 → 6 �
 | 1. Foundation & Core Engine | — | ✅ Complete | 2026-08-15 |
 | 2. Harden the Agent Surface | 11/11 | ✅ Complete | 2026-08-17 |
 | 3. Table-Stakes Browsing | 4/4 | Complete    | 2026-08-20 |
-| 4. Authenticated Remote Transport | 0/3 | Not started | - |
+| 4. Authenticated Remote Transport | 8/8 | Complete    | 2026-08-21 |
 | 5. Distributed Mode | 0/4 | Not started | - |
 | 6. Platform Coverage | 0/2 | Not started | - |
 | 7. Release Readiness | 0/3 | Not started | - |

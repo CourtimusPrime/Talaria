@@ -17,8 +17,6 @@ use rust_mcp_sdk::tool_box;
 use serde_json::json;
 use talaria_protocol::{Command, Outcome, ResultPayload};
 
-use crate::socket::ShellConnection;
-
 #[mcp_tool(
     name = "tabs_list",
     description = "List all open browser tabs (both the user's and agent-owned), with tab_id, url, title, and owner."
@@ -102,6 +100,14 @@ pub struct DownloadTool {
     pub filename: String,
 }
 
+// This list of nine tools is what the consent screen's grant bullets
+// describe in plain language — the "Approving lets it, until you revoke it:"
+// list in the Consent panel (`04-UI-SPEC.md`, Surface: Consent Screen). Those
+// bullets were written against exactly these tools and deliberately assert no
+// exclusions, because an outdated reassurance on a consent screen is worse
+// than no reassurance. A tool added, removed, or widened here therefore
+// obliges that grant list to change with it; the unit tests below are the
+// tripwire that makes the obligation impossible to miss.
 tool_box!(
     TalariaTools,
     [
@@ -118,7 +124,7 @@ tool_box!(
 );
 
 pub async fn dispatch(
-    connection: &ShellConnection,
+    sink: &dyn crate::CommandSink,
     client: &str,
     tool: TalariaTools,
 ) -> Result<CallToolResult, CallToolError> {
@@ -134,7 +140,7 @@ pub async fn dispatch(
         TalariaTools::DownloadTool(t) => Command::Download { url: t.url.clone(), filename: t.filename.clone() },
     };
 
-    let outcome = connection
+    let outcome = sink
         .request(client, command)
         .await
         .map_err(CallToolError::from_message)?;
@@ -180,4 +186,57 @@ pub async fn dispatch(
 
 fn text_result(value: &serde_json::Value) -> CallToolResult {
     CallToolResult::text_content(vec![TextContent::from(value.to_string())])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TalariaTools;
+
+    /// The nine tools this surface serves, in sorted order.
+    ///
+    /// This is the tripwire for the coupling recorded on the `tool_box!`
+    /// invocation above: the consent screen's grant bullets
+    /// (`04-UI-SPEC.md`, Surface: Consent Screen) are written against exactly
+    /// this list and deliberately assert no exclusions, so a tool added,
+    /// removed, or renamed here has to be described there before this test can
+    /// be made green again. It is also what a second, drifting definition of
+    /// the surface would have to lie about to pass.
+    #[test]
+    fn the_surface_is_the_nine_tools_the_consent_screen_describes() {
+        let mut names: Vec<String> =
+            TalariaTools::tools().into_iter().map(|tool| tool.name).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "cookies_read",
+                "download",
+                "evaluate",
+                "navigate",
+                "screenshot",
+                "tabs_close",
+                "tabs_focus",
+                "tabs_list",
+                "tabs_open",
+            ],
+        );
+    }
+
+    /// Description and input schema are the two fields an MCP client actually
+    /// renders, and the two that would silently differ if a second surface
+    /// were ever defined. A tool that reached a client with either missing
+    /// would be unusable rather than merely undocumented.
+    #[test]
+    fn every_tool_carries_a_description_and_an_input_schema() {
+        for tool in TalariaTools::tools() {
+            let description = tool.description.unwrap_or_default();
+            assert!(!description.trim().is_empty(), "{} has no description", tool.name);
+            assert_eq!(
+                tool.input_schema.type_(),
+                "object",
+                "{} has no object input schema",
+                tool.name,
+            );
+        }
+    }
 }

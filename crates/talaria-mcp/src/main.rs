@@ -1,27 +1,29 @@
 //! Stdio MCP server for Talaria.
 //!
-//! A thin proxy: MCP tool calls are translated into control-socket requests
-//! against the running Talaria shell. Per the MCP spec (and Talaria's SPEC),
-//! a locally-spawned stdio server does not go through OAuth — connection
-//! access is implied by the ability to spawn it.
-
-mod socket;
-mod tools;
+//! A thin stdio front end over the `talaria_mcp` library: MCP tool calls are
+//! translated into control-socket requests against the running Talaria shell.
+//! The tool surface itself lives in `lib.rs` rather than here, so the HTTP
+//! transport in `talaria-shell` serves the identical set of tools instead of a
+//! second copy that can drift.
+//!
+//! Per the MCP spec (and Talaria's SPEC), a locally-spawned stdio server does
+//! not go through OAuth — connection access is implied by the ability to spawn
+//! it. That stays true when the HTTP transport arrives; OAuth guards the
+//! network listener, not this binary.
 
 use async_trait::async_trait;
 use rust_mcp_sdk::mcp_server::{server_runtime, ServerHandler};
 use rust_mcp_sdk::schema::schema_utils::CallToolError;
 use rust_mcp_sdk::schema::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeResult, ListToolsResult,
-    LoggingLevel, LoggingMessageNotificationParams, PaginatedRequestParams, ProtocolVersion,
-    RpcError, ServerCapabilities, ServerCapabilitiesTools,
+    LoggingLevel, LoggingMessageNotificationParams, PaginatedRequestParams, RpcError,
+    ServerCapabilities, ServerCapabilitiesTools,
 };
 use rust_mcp_sdk::{error::SdkResult, McpServer, StdioTransport, TransportOptions};
 use std::sync::Arc;
 use talaria_protocol::Event;
 
-use socket::ShellConnection;
-use tools::TalariaTools;
+use talaria_mcp::{dispatch, ShellConnection, TalariaTools};
 
 struct Handler {
     connection: ShellConnection,
@@ -51,7 +53,7 @@ impl ServerHandler for Handler {
             .map(|info| info.client_info.name.clone())
             .unwrap_or_else(|| "unknown-agent".to_owned());
         let tool: TalariaTools = TalariaTools::try_from(params).map_err(CallToolError::new)?;
-        tools::dispatch(&self.connection, &client, tool).await
+        dispatch(&self.connection, &client, tool).await
     }
 }
 
@@ -93,7 +95,10 @@ async fn main() -> SdkResult<()> {
              user to take over in the Talaria window rather than trying to bypass it."
                 .into(),
         ),
-        protocol_version: ProtocolVersion::V2025_11_25.into(),
+        // Read from the shared constant, never written as a literal here:
+        // see `talaria_mcp::PROTOCOL_VERSION` for why the two transports may
+        // not each spell it out.
+        protocol_version: talaria_mcp::PROTOCOL_VERSION.into(),
     };
 
     let transport = StdioTransport::new(TransportOptions::default())?;

@@ -1,12 +1,15 @@
 //! Talaria — a lightweight, lightning-fast web browser for humans and agents.
 
+mod agents;
 mod app;
 mod bookmarks;
 mod control;
 mod downloads;
 mod gui;
 mod history;
+mod http;
 mod keyutils;
+mod oauth;
 mod permissions;
 mod settings;
 mod tabs;

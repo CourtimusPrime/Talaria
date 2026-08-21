@@ -8,6 +8,61 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Fixed
 
+- **Every authorization-server endpoint is now origin- and host-checked, not just
+  `/mcp`.** `rust-mcp-sdk` dispatches its auth routes through an *empty*
+  middleware chain, so `/register`, `/authorize`, `/authorize/status`, `/token`
+  and `/revoke` carried neither the `Origin` refusal nor the `Host` validation
+  that `/mcp` carried twice over. A page served from a rebound
+  `http://rebind.evil:PORT/` is same-origin with Talaria's authorization server
+  as far as the browser is concerned, so it could register a client, read the
+  `client_id` back, drive the consent screen, and — after one human Approve —
+  read an access token out of `/token`. Both checks are now an axum layer over
+  the whole router. The two RFC 9728 / RFC 8414 discovery documents stay
+  deliberately public, because a client fetches them before it has anything to
+  present and one that could not would never find the flow; that exemption is an
+  explicit two-entry allowlist, so a route added later inherits *checked*
+  (`crates/talaria-shell/src/http.rs`).
+- **A revoked client's legacy `/sse` stream now closes too.** Stream termination
+  was keyed on the `/mcp` path, and the legacy HTTP-plus-event-stream transport
+  is live — `rust-mcp-axum` mounts it unconditionally and enables the SDK's `sse`
+  feature transitively — so a revoked agent kept receiving from the browser while
+  the Access panel showed its row gone. Closing it needed two things, not one:
+  the SDK also reads a request's verified identity *before* running the chain
+  that produces it, so every `/sse` session was created anonymous, which made it
+  unselectable by a revoke and made its tool calls arrive as
+  `unverified-client` rather than as the client that presented the token. Both
+  are supplied now, from values the SDK verified for that same request
+  (`crates/talaria-shell/src/http.rs`).
+- **The remote listener no longer leaks a file descriptor per reconnecting
+  agent.** The table binding each open stream to its connection claimed to be
+  pruned "every time the directory is listed", and the directory was listed only
+  from a revoke or a shutdown — neither of which an ordinary session performs. A
+  well-behaved client that reconnects a dropped stream was enough: one duplicated
+  descriptor stranded per reconnect, unbounded, in the process that also holds
+  the credential vault and the browser engine. Pruning now happens where a stream
+  actually opens (`crates/talaria-shell/src/http.rs`).
+- **An unauthenticated peer can no longer wedge registration, or hide from the
+  revoke mechanism.** Thirty-two `POST /register` calls — no credential needed by
+  design — used to fill the client registry permanently: refused past the cap,
+  never expiring, and rendering no row and so no button, which left hand-editing
+  `agents.json` as the only recovery. The oldest *unapproved* registration is now
+  displaced instead, so the next legitimate registration succeeds immediately,
+  while a client a human approved is still never displaced. The Access panel also
+  shows how many programs are waiting for approval and offers to forget them.
+  Separately, the connection table that a revoke closes streams through could be
+  flushed by opening enough short-lived connections, and lost track of the second
+  stream on a keep-alive connection; the descriptor now rides the connection
+  itself, so there is no table to flood and nothing to consume
+  (`crates/talaria-shell/src/agents.rs`, `gui.rs`, `app.rs`, `http.rs`).
+- **An agent can no longer reach Talaria's own listener by driving a page to it.**
+  The own-origin refusal lived in the parser for URLs an agent hands to
+  `tabs_open` and `navigate`, and page-driven navigation was allowed
+  unconditionally — so `evaluate(tab, "location.href = ...")`, a `window.open`, a
+  `<meta refresh>` or a link click walked straight around it and left the tab on
+  the authorization server's origin. The refusal now sits where navigation
+  actually happens, keyed on the tab's owner, so nothing narrows what a person may
+  browse (`crates/talaria-shell/src/app.rs`).
+
 - **An agent can no longer forge rows into the human's browsing history.**
   `tabs_list` hands an agent every tab, including the human's own, and `navigate`
   resolved any tab id without checking who owned it — so an agent could point one
@@ -85,6 +140,167 @@ cut a release yet, so everything to date sits under Unreleased.
   unreachable. Affected every headless server, container, SSH session and CI job.
 
 ### Added
+
+- **You can see every agent that may drive this browser, and take one's access
+  away** (AUTH-02). The Access panel now lists one row per authorized agent —
+  the identifier Talaria minted for it, the name it asked to be called, and how
+  long ago you approved it — with a Revoke button on each. Revoke takes two
+  clicks, in place, and the second one is armed against *that specific client*
+  rather than that row's position, so a list that changes between the two
+  clicks cannot complete the revoke against a different agent.
+
+  **Revoking closes the agent's open connections, not just its next request.**
+  That distinction is the whole of why this is a feature rather than a line of
+  code. Authorization is checked on every request, so a revoked agent's next
+  request fails for free — but an agent holding a long-lived event stream has
+  no next request, and would have carried on receiving from your browser while
+  the panel showed it gone. Talaria closes the connection that stream is riding
+  on, so it ends.
+
+  A request that was already running when you clicked stays running: it had
+  already been authorized, and a command executing against a page cannot be
+  taken back. Everything else stops. The revocation survives a restart, and it
+  takes the agent's registration with its tokens, so the row cannot reappear
+  without you approving it again.
+
+  What revoking does **not** do: close the agent's tabs. They stay open in the
+  Agents view and you can take any of them over. The agent cannot drive them
+  any more, and throwing away pages you might still want is not what "revoke"
+  should mean. Nothing else of yours is touched — no history, no bookmarks, no
+  stored credentials, no downloads.
+
+  Agents can also revoke their own tokens through the standard endpoint
+  (`/revoke`, RFC 7009), which is a well-behaved client tidying up after itself
+  rather than you withdrawing access
+  (`crates/talaria-shell/src/gui.rs`, `app.rs`, `http.rs`, `oauth.rs`).
+
+- **An agent can now ask for access, and you decide in the browser itself**
+  (AUTH-01, completing the entry below). Talaria hosts its own OAuth 2.1
+  authorization server: an agent that knows nothing but the endpoint URL can
+  register itself, ask for authorization with PKCE `S256`, and — once you say
+  yes — exchange that for a short-lived token with a refresh token beside it.
+  Refresh tokens rotate on every use, and presenting one twice revokes the
+  whole family, because two parties holding the same token means one of them
+  stole it and there is no way to tell which.
+
+  **The approval prompt is part of the browser, not a web page.** It appears in
+  Talaria's own chrome, over whatever you were doing, and the page the agent's
+  browser lands on has no form, no button and no link — nothing for a script to
+  click. Approve stays disabled for a second after the prompt appears, so a
+  click you had already started cannot land on it, and only one prompt is ever
+  on screen at a time. The name an agent asks to be called is shown in quotes,
+  marked as its own claim, and stripped of anything that could make it look
+  like Talaria's words rather than the agent's
+  (`crates/talaria-shell/src/oauth.rs`, `agents.rs`, `gui.rs`, `app.rs`).
+
+- **The remote MCP transport now accepts a real credential — and tells a client
+  how to get one** (AUTH-01). The interim provider that refused everything is
+  gone. In its place, Talaria acts as an OAuth 2.1 **resource server**: an
+  agent presents an opaque bearer token, the token is looked up **live** in the
+  agent store on every single request, and its recorded audience is compared
+  byte for byte against this server's own canonical identifier. A token minted
+  for some other service cannot be replayed here, and Talaria never forwards a
+  token it received anywhere.
+
+  Because the lookup is live and nothing is cached, revoking a token takes
+  effect on the very next request rather than at the next restart.
+
+  **Discovery works, which is the half that is easy to skip.** An
+  unauthenticated request is still answered `401`, but the refusal now carries
+  a `WWW-Authenticate: Bearer ... resource_metadata="…"` challenge, and that URL
+  serves an RFC 9728 protected-resource metadata document naming this server's
+  resource identifier and its authorization server. A client configured with
+  nothing but the MCP endpoint URL — which is all a human writes down — can
+  find its way from there. A server that minted and validated tokens while
+  publishing none of this would be one no conformant client could actually
+  connect to.
+
+  Unknown, expired and wrong-audience tokens are refused **identically**, with
+  the same status and the same body, so the endpoint cannot be used to find out
+  which tokens exist. No token material and no `Authorization` header value ever
+  reaches a log line: a log names a caller by its registered client id and a
+  token by a short digest prefix.
+
+  One more thing changes with the token: over HTTP, the browser now knows *who*
+  is calling. A tab an agent opens is labelled with the client identifier this
+  browser minted and a human approved, not with the name the caller typed into
+  `initialize`. Stdio sessions keep their self-asserted label, because over that
+  transport there is nothing better to use.
+
+  Still deliberately absent: TLS and any non-loopback bind, which are the next
+  milestone's. Staying on loopback is what makes shipping without TLS conformant
+  rather than skipped: OAuth 2.1's HTTPS requirement carries an explicit
+  loopback exception. Also absent, and on security grounds rather than
+  scheduling: Client ID Metadata Documents, which would require this browser to
+  fetch a URL an unauthenticated caller chose — see `SECURITY.md`
+  (`crates/talaria-shell/src/oauth.rs`, `http.rs`, `app.rs`).
+
+- **A remote MCP transport, off by default and loopback-only** (AUTH-03).
+  Talaria can now serve MCP over Streamable HTTP as well as over its Unix
+  control socket. The listener is **disabled unless `config.json` says
+  otherwise** — with no configuration there is no thread and no bound port at
+  all, which the e2e suite proves with a refused connection rather than by
+  reading a flag back — and when enabled it binds `127.0.0.1` and nothing else.
+  There is deliberately no bind-address setting: the bind host is a constant in
+  `crates/talaria-shell/src/http.rs`, and a hand-edited `config.json` naming any
+  other address degrades that one key to disabled without disturbing the search
+  engine beside it.
+
+  **A bearer token is the entire boundary on this transport**, and the two
+  clauses above are why. `SO_PEERCRED` has no TCP equivalent, so the kernel
+  cannot tell the listener who is connecting the way it does for the Unix
+  control socket, and `127.0.0.1:PORT` is reachable by every local account on
+  the machine. An unauthenticated request is answered `401` and touches
+  nothing; a request carrying an `Origin` header — which a command-line MCP
+  client never sends and a web page always does — is refused outright before
+  authentication even runs. See the AUTH-01 and AUTH-02 entries above for how
+  a request comes to carry a credential at all, and how you take one back.
+
+  A new **Access panel** (toolbar button, no keyboard shortcut) shows whether
+  anything is listening and on what address, and carries the switch. Turning it
+  on takes two clicks; turning it off takes one, because confirming a move
+  toward safety only teaches people to click through confirmations. The toolbar
+  button itself is the always-visible signal — an unplugged glyph when off, a
+  connected one plus the port number when bound — read from the address the
+  listener actually bound and reported back, never from the configured value, so
+  the two surfaces cannot disagree. An agent may not point a tab at that address
+  while it is bound; the refusal says so by name
+  (`crates/talaria-shell/src/http.rs`, `settings.rs`, `app.rs`, `gui.rs`,
+  `control.rs`, `crates/talaria-mcp/src/lib.rs`).
+
+- **The store that will decide which agents may drive the browser** — the
+  registered clients and the tokens they hold, in a new `agents.json` beside the
+  other stores. It was built as the half that can be tested exhaustively without
+  a server running; the endpoints that mint, check and revoke it are described in
+  the AUTH-01 and AUTH-02 entries above.
+
+  **It holds no credentials.** Only the SHA-256 of each token is written down —
+  a stolen `agents.json` yields hashes, not tokens — which is what lets the file
+  be plaintext at `0600` inside a `0700` directory rather than encrypted, and what
+  keeps it out of the credential vault. Out of the vault twice over, in fact: the
+  vault's key comes from the OS keychain, whose known startup hang on machines
+  with no session D-Bus would otherwise mean "no session bus" becomes "no agent
+  can connect"; and the vault is reachable from the `cookies_read` tool, so token
+  material must not live behind a door an agent already holds a key to.
+
+  **A damaged file admits nobody rather than everybody.** A corrupt, truncated or
+  hand-mangled `agents.json` degrades to an empty client set — every agent has to
+  re-authorize — and never to an empty *check*. The code is shaped so the other
+  answer is not writable: every decision is a search of a list, an empty list
+  finds nothing, and there is no store-is-empty branch anywhere.
+
+  Tokens are opaque 32-byte values from the operating system's random source,
+  never derived from a clock — the module contains no clock type at all, so every
+  time value is a parameter. Digests are compared over every byte rather than
+  returning at the first difference, so how long an answer takes does not reveal
+  how much of a guess was right. Refresh tokens rotate on every use and presenting
+  a spent one revokes its whole family, while a client legitimately retrying with
+  its current token is not caught by that rule. Registrations are capped, a
+  registration past the cap is refused rather than evicting a legitimate client,
+  and a registration no human approved holds no tokens and can do nothing.
+  Writes stage into a `.tmp` sibling and rename, so a process killed mid-save
+  leaves either the old set or the new one
+  (`crates/talaria-shell/src/agents.rs`, `main.rs`).
 
 - **Local browsing history** (BROWSE-01). Every navigation that completes on a
   human ("Me") tab appends a `(url, title, timestamp)` row to `history.jsonl`
@@ -186,6 +402,29 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Changed
 
+- **The HTTP and OAuth dependency stack is now available to the shell.**
+  `rust-mcp-sdk`'s feature list widened to `server`, `macros`, `stdio`,
+  `streamable-http` and `auth`, and `talaria-shell` gained `rust-mcp-sdk`,
+  `rust-mcp-axum`, `sha2`, `async-trait` and tokio's `rt-multi-thread`. The
+  legacy Server-Sent-Events transport feature is deliberately not enabled: the
+  newer MCP revision deprecates that transport, and a long-lived legacy stream
+  is the easiest way for a revoked client to keep talking. Twenty-five crates
+  entered the lockfile — `axum`, `axum-server`, `jsonwebtoken`, `reqwest`,
+  `rust-mcp-axum` and their transitives — and nothing already in it changed
+  version, so the `primeorder 0.14.0-rc.14` pin that keeps this workspace
+  buildable survived untouched. No runtime behaviour changes yet: no port is
+  opened and no route is served (`Cargo.toml`, `Cargo.lock`,
+  `crates/talaria-shell/Cargo.toml`).
+- **The MCP tool surface now lives in a library crate rather than inside the stdio
+  binary.** `crates/talaria-mcp` gained a `[lib]` target; the nine tool structs,
+  their schemas and `dispatch` are defined once there, and `dispatch` takes a
+  `CommandSink` — a one-method trait for handing a `Command` to a running shell —
+  instead of naming the control-socket connection type. The stdio proxy is now a
+  consumer of its own library, and its behaviour is unchanged: same nine tools,
+  same descriptions and schemas, same protocol revision, same errors, proven by
+  an unmodified `tests/e2e/mcp_client_test.py`. This is groundwork for serving
+  the identical tool surface over a second transport without a second copy of it
+  (`crates/talaria-mcp/src/lib.rs`, `tools.rs`, `socket.rs`, `main.rs`).
 - The e2e CI job no longer wraps the suite in `dbus-run-session`. That wrapper
   existed to hide the startup hang above; with the hang fixed at the source,
   running bare is what proves the fallback works.

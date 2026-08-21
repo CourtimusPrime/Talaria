@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Stdio MCP server proxying tool calls to a running Talaria browser"
 
+[lib]
+name = "talaria_mcp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "talaria-mcp"
 path = "src/main.rs"

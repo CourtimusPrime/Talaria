@@ -26,8 +26,14 @@ egui-phosphor = { workspace = true }
 glow = { workspace = true }
 
 talaria-protocol = { workspace = true }
-tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros", "time"] }
+talaria-mcp = { workspace = true }
+tokio = { workspace = true,
+          features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 serde_json = { workspace = true }
+rust-mcp-sdk = { workspace = true }
+rust-mcp-axum = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
 base64 = { workspace = true }
 png = { workspace = true }
 dirs = { workspace = true }

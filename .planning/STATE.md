@@ -2,18 +2,18 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 4
+current_phase: 5
 current_phase_name: v2
 status: planning
-stopped_at: Completed 03-04-PLAN.md — Phase 3 complete
-last_updated: "2026-08-20T16:47:21.523Z"
-last_activity: 2026-08-20
-last_activity_desc: Phase 03 complete, transitioned to Phase 4
+stopped_at: Completed 04-08-PLAN.md
+last_updated: "2026-08-21T04:56:15.056Z"
+last_activity: 2026-08-21
+last_activity_desc: Phase 04 complete, transitioned to Phase 5
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 15
-  completed_plans: 15
+  total_phases: 3
+  completed_phases: 3
+  total_plans: 23
+  completed_plans: 23
 ---
 
 # Project State
@@ -23,18 +23,42 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-15)
 
 **Core value:** An agent can drive a real, already-logged-in browsing session, and a human can take over instantly the moment it hits something only a human can clear.
-**Current focus:** Phase 03 — table-stakes-browsing
+**Current focus:** Phase 04 — authenticated-remote-transport-v2
 
 ## Current Position
 
-Phase: 4 — Authenticated Remote Transport *(v2)*
+Phase: 5 — Distributed Mode *(v2)*
 Plan: Not started
 Status: Ready to plan
-Next: /gsd-verify-work 3, then close the phase. **v1 (Phases 1-3) is feature-complete.**
+Next: /gsd-verify-work 4 — all eight plans are executed, AUTH-01, AUTH-02 and AUTH-03 are met,
+and `run_all.py` is 22/22. **v1 (Phases 1-3) is feature-complete and Phase 3 is closed** —
+verification passed 42/42 with 0 behaviours unverified.
+
+04-01 is done: the nine-tool MCP surface now lives in a `talaria_mcp` library crate and
+`dispatch` takes `&dyn CommandSink` instead of `&ShellConnection`, so Success Criterion 1 ("an
+HTTP client drives the same tool surface") is a type-system property rather than a review item.
+A pure refactor — `tests/e2e/mcp_client_test.py` passes unmodified, e2e is 19/19 `failed: none`,
+`cargo test` went 117 -> 119 on the two new tool-surface tests, and `Cargo.lock` is byte-identical
+so 04-02 owns every dependency change in this phase without a collision.
+
+Phase 4 is planned: 8 plans across 6 waves, plan-checker APPROVED on revision 1. Four design
+decisions were locked up front in `04-CONTEXT.md` rather than left to the planner — target MCP
+spec revision 2025-11-25 (what rust-mcp-sdk 1.0.1 implements), ship DCR but not CIMD (which would
+make the browser fetch an attacker-supplied URL), the 8-plan split, and a listener that is off by
+default and loopback-only. ROADMAP's Success Criterion 2 was reworded during planning: the original
+permitted a plan that minted a token and implemented neither discovery nor audience binding.
 
 All four plans landed sequentially, each depending on the previous, because every one of
 them touches app.rs and gui.rs. BROWSE-01 through BROWSE-04 are all delivered; the e2e
-suite is at 18/18 and `cargo test` at 83.
+suite is at 19/19 and `cargo test` at 117.
+
+Phase 3 also absorbed a code-review pass: four criticals fixed (a page `<title>` could
+crash the browser, the four new stores were world-readable, an agent could forge rows
+into the human's history, and a download's row could lie about its own name), plus the
+encrypted vault's own file mode and a download path that fell back to the CWD. A
+`chrome_rects` hook behind `TALARIA_TEST_HOOKS=1` closed the recurring toolbar-coordinate
+churn and made six previously human-only checks automatic; the last three were closed by
+reviewing the rendered chrome directly.
 
 Planned without a CONTEXT.md — /gsd-discuss-phase was not run, so the design decisions it
 would have locked were resolved by 03-RESEARCH.md and 03-UI-SPEC.md instead, each recording
@@ -45,7 +69,7 @@ Three documentation debts are queued for the phase close, listed at the end of
 component table missing the four Phase 3 stores and Shared::event_proxy, and CHANGELOG.md
 missing BROWSE-01/02/03 entries (BROWSE-04's is written).
 
-Last activity: 2026-08-20 — Phase 03 complete, transitioned to Phase 4
+Last activity: 2026-08-21 — Phase 04 complete, transitioned to Phase 5
 
 v1 (Phases 1-3): [██████████] 3 of 3 phases complete
 All phases (1-7): [████░░░░░░] 3 of 7 complete
@@ -54,7 +78,7 @@ All phases (1-7): [████░░░░░░] 3 of 7 complete
 
 **Velocity:**
 
-- Total plans completed: 4 (Phase 1 predates GSD tracking — see `OVERNIGHT_LOG.md`)
+- Total plans completed: 12 (Phase 1 predates GSD tracking — see `OVERNIGHT_LOG.md`)
 - Average duration: —
 - Total execution time: —
 
@@ -64,6 +88,7 @@ All phases (1-7): [████░░░░░░] 3 of 7 complete
 |-------|-------|-------|----------|
 | 1 | — | — | — |
 | 03 | 4 | - | - |
+| 04 | 8 | - | - |
 
 **Recent Trend:**
 
@@ -90,6 +115,14 @@ All phases (1-7): [████░░░░░░] 3 of 7 complete
 | Phase 03 P02 | 22 min | 3 tasks | 7 files |
 | Phase 03 P03 | 25 min | 3 tasks | 5 files |
 | Phase 03 P04 | 32 min | 3 tasks | 8 files |
+| Phase 04 P01 | 27min | 3 tasks | 6 files |
+| Phase 04 P02 | 31min | 3 tasks | 6 files |
+| Phase 04 P03 | 48min | 3 tasks | 15 files |
+| Phase 04 P04 | 21min | 2 tasks | 3 files |
+| Phase 04 P05 | 34min | 3 tasks | 10 files |
+| Phase 04 P06 | 64 min | 3 tasks | 8 files |
+| Phase 04 P07 | 55min | 2 tasks | 3 files |
+| Phase 04 P08 | 85 min | 3 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -145,6 +178,37 @@ Recent decisions affecting current work:
 - [Phase ?]: 03-04: Shared::event_proxy is the first EventLoopProxy on Shared and the sanctioned route from any background thread back onto the main loop; Rc-not-Send makes the discipline compiler-enforced
 - [Phase ?]: 03-04: UiAction::OpenDownload (xdg-open) has exactly one construction site and one consumer, both in chrome — the browser's only process spawn is unreachable from the MCP/control-socket surface
 - [Phase ?]: 03-04: vault_ui_test.py's CREDENTIALS_BUTTON moved 370 -> 399, measured at [[388.3 2.0] - [409.3 20.0]]; 03-03's ~29pt/button prediction confirmed exactly on the fourth move
+- [Phase ?]: dispatch takes `&dyn CommandSink` (trait object) rather than a generic parameter — object-safe, and the HTTP transport can hold the sink behind an Arc
+- [Phase ?]: The CommandSink impl for ShellConnection forwards to the inherent request and adds nothing: retry, pipelining and reconnect stay the connection's (plan 02-05's double-execution fix)
+- [Phase ?]: The nine-tool surface is pinned by a unit test that names 04-UI-SPEC.md's consent grant bullets — a tool change obliges the consent screen to change with it
+- [Phase ?]: 04-02: Resolved the lockfile with cargo metadata against edited manifests, never cargo update; primeorder 0.14.0-rc.14 survived and is now asserted by grep plus a --locked build rather than assumed
+- [Phase ?]: 04-02: The rust-mcp-sdk feature list is exactly server/macros/stdio/streamable-http/auth — the legacy SSE transport feature is deliberately omitted, with the reason recorded at the manifest line
+- [Phase ?]: 04-02: A1 CONFIRMED — rust-mcp-axum routes a self-hosted authorization server's declared endpoints to the provider's handle_request, so 04-05 and 04-06 need no re-planning
+- [Phase ?]: 04-02: The SDK never calls AuthProvider::validate_allowed_methods — 04-06 must call it itself or wrong-verb requests fall into the token-issuance path
+- [Phase 4]: Fixed listener port, default 8779 (04-CONTEXT open question closed): a human configures an MCP client with a URL once, and 8779 avoids both the common dev-server defaults and this platform's ephemeral range
+- [Phase 4]: Built the MCP router via rust-mcp-axum's BYO-server mcp_routes path rather than create_axum_server: the Origin refusal has no middleware slot in AxumServerOptions, the bound address becomes a fact, and the process keeps its own SIGTERM handling
+- [Phase 4]: The remote-access config key has no bind-address field at all — D-04-04's loopback-only constraint is structural, not validated
+- [Phase ?]: A corrupt agents.json degrades to an empty client SET, never an empty CHECK — enforced by shape (every decision is a list search; no store-is-empty branch exists), not by care
+- [Phase ?]: The agent token store stays out of the credential vault: hash-only persistence removes the cipher, which removes the key, which removes the keychain — so Vault::load()'s D-Bus hang cannot become 'no agent can connect'
+- [Phase ?]: TokenRecord carries consumed_at_ms — the plan's field list could not express reuse detection, which the same plan requires
+- [Phase ?]: Access 1h / refresh 30d / 32-client cap are conventional defaults, parameters at every call site, not specification requirements
+- [Phase ?]: AUTH-01 and AUTH-02 deliberately left unmarked: 04-05/06/07 and 04-08 close them; a store without an endpoint is not an authorization server
+- [Phase 04]: 04-05: the canonical resource identifier is http://{bound}/mcp, built by one function from the address actually bound — compared byte for byte, so a second construction site would be a way for a token to validate against one spelling and not another
+- [Phase 04]: 04-05: every token-verification failure returns one REFUSAL constant, so unknown, expired and wrong-audience are byte-identical to the caller and the endpoint is not an oracle for which tokens exist
+- [Phase 04]: 04-05: an HTTP client's tab-owner label is the verified client_id, not the self-asserted clientInfo.name; stdio sessions keep their Hello string and the two are deliberately different
+- [Phase 04]: 04-05: Shared::agents is an Arc<Mutex<Agents>> — the one non-RefCell field on Shared — because the chrome's revoke and the listener's verifier must see one store, not two
+- [Phase 04]: 04-05: AUTH-01 stays open; the resource-server half landed, the OAuth authorization server (Authorization Code + PKCE) is 04-06's
+- [Phase 04]: The consent timing override is a clamp, not a value: each of the three durations is clamped to its compiled constant as a ceiling and to a non-zero 200 ms floor, so a test-hooks-gated variable can only ever make a security window smaller — never longer, never zero, never off. The grant path takes its timings as a parameter and reads no environment variable. — At the shipped values an expiry plus the cooldown it arms is two and a half minutes, and an assertion that slow is one somebody quietly deletes — which would leave the expiry path, the one an attacker uses to hold the chrome hostage, the least-tested thing in the phase. Unit-tested by setting every override to its floor and confirming an unanswered request still resolves denied and no client is marked authorized.
+- [Phase 04]: ChromePanel::Consent is raised only by Gui::raise_consent, and UiAction::SetPanel(Consent) is refused by both apply_ui_actions and Gui::set_panel. The page served at /authorize carries no control of any kind and no request-derived value. — http is in the agent navigation allowlist, so an agent holding evaluate can open Talaria own authorization endpoint in a tab it owns. Adding the enum variant made SetPanel(Consent) representable; the two refusals turn "no control constructs it" from an invariant every future panel button must maintain into a property a reviewer confirms in two functions.
+- [Phase 04]: The holding page carries no script at all — a meta refresh instead — resolving a contradiction inside 04-UI-SPEC.md, which asks for a status-poll script and fixes default-src none in the same table. — The two cannot both hold: default-src none forbids inline script. Kept the header and dropped the script, so the page ships stricter than the approved contract describing it.
+- [Phase ?]: Token endpoint refuses with 400 invalid_grant (RFC 6749 §5.2), not 401 — one grant_refused() gives indistinguishability
+- [Phase ?]: A failed code redemption still consumes the code, so an intercepted code cannot be retried after a wrong verifier
+- [Phase ?]: CodeRecord records code_challenge_method so the S256 gate at redemption is a check, not an assumption
+- [Phase ?]: PKCE challenges are re-spelled (base64url -> hex) by challenge_as_digest rather than hashed a second time; comparison stays agents::digests_match
+- [Phase 04]: Ending an MCP session does not close a stream already open on it — measured in 04-08 by asserting the closure from the client end and watching it fail. The SDK cancels only the reader; the response body is fed from a duplex half its transport still owns. The shell closes the connection instead, at an immediate bound.
+- [Phase 04]: Revoking either half of a token pair takes the whole family (RFC 7009 leaves one direction open); the standard /revoke endpoint drops tokens and leaves the registration, while the human's Access-panel revoke removes both.
+- [Phase 04]: A revoked agent's tabs stay open, visible in the Agents view and available for takeover — closing them destroys state the human may want and buys nothing, since the agent can no longer drive them.
+- [Phase 04]: Any arm-then-confirm control acting on one row of a list that can reorder is keyed on the row's identifier, never on its index.
 
 ### Pending Todos
 
@@ -193,6 +257,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-20T09:21:53.268Z
-Stopped at: Completed 03-04-PLAN.md — Phase 3 complete
+Last session: 2026-08-21T02:13:10.944Z
+Stopped at: Completed 04-08-PLAN.md
 Resume file: None

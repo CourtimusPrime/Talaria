@@ -20,6 +20,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
 use crate::app::Shared;
+use crate::http::RemoteAccess;
 use crate::settings::SearchEngine;
 use crate::tabs::ViewMode;
 
@@ -37,6 +38,35 @@ pub enum ChromePanel {
     Bookmarks,
     Downloads,
     Settings,
+    /// Remote access: whether this browser is listening for agents over the
+    /// network, and the switch that decides it.
+    ///
+    /// Named `Access`, not `Agents`: [`crate::tabs::ViewMode::Agents`] already
+    /// exists and means "tabs an agent is driving", and two things called
+    /// Agents in one chrome is a bug waiting to be filed.
+    Access,
+    /// A human is being asked whether an agent may drive this browser.
+    ///
+    /// The one panel that differs from the other six, in exactly three ways,
+    /// each deliberate:
+    ///
+    /// - **It is transient and event-raised.** It opens because the
+    ///   authorization endpoint raised [`crate::app::AppEvent::ConsentRequested`],
+    ///   never because anybody clicked anything, and it closes on Approve, on
+    ///   Deny, or when the HTTP side gives up waiting.
+    /// - **It has no toolbar button**, and therefore no accent: there is no
+    ///   control anywhere in this chrome whose job is to open it.
+    /// - **It is not user-openable, and that is enforced rather than
+    ///   observed.** It is reachable only through [`Gui::raise_consent`];
+    ///   `UiAction::SetPanel(ChromePanel::Consent)` is **refused** by
+    ///   `apply_ui_actions` and by [`Gui::set_panel`] alike. Adding this
+    ///   variant to the enum is what made that action *representable*, and
+    ///   "no control constructs it" would otherwise be an invariant every
+    ///   future panel button had to maintain by discipline. With the refusal
+    ///   in place, "no control can open the Approve button" is a property a
+    ///   reviewer confirms in one place — the same move that makes
+    ///   [`UiAction::OpenDownload`]'s single call site checkable.
+    Consent,
 }
 
 pub enum UiAction {
@@ -110,7 +140,117 @@ pub enum UiAction {
     DismissDownloadError,
     /// Clear the vault's one-shot notices, once the chrome has shown them.
     DismissVaultNotice,
+    /// Turn the remote MCP listener on or off, and persist the choice.
+    ///
+    /// This is the click that opens a network port in a process holding a
+    /// credential vault and a logged-in browsing session, so — exactly as with
+    /// [`UiAction::OpenDownload`] — **where it can be raised from is the
+    /// security property**: one Access-panel button, applied in
+    /// `apply_ui_actions`, and nowhere else. No control-socket command reaches
+    /// it, no `talaria_protocol` variant carries it, and no MCP tool exists
+    /// for it. An agent-reachable switch would let a connected agent widen the
+    /// very boundary it is standing outside of.
+    ///
+    /// Turning it on takes two clicks and a successful bind before any surface
+    /// says it is on; turning it off takes one and applies immediately. See
+    /// [`crate::settings::Settings::save_remote_access`] for why the failed-
+    /// write case is safe in the off direction and merely forgetful in the on
+    /// direction.
+    SetRemoteAccess(bool),
+    /// Approve the parked authorization request with this id.
+    ///
+    /// This is the click that hands an agent full control of the human's
+    /// logged-in browsing session, so — exactly as with
+    /// [`UiAction::OpenDownload`] and [`UiAction::SetRemoteAccess`] —
+    /// **where it can be raised from is the security property**: one consent
+    /// panel's own button, applied in `apply_ui_actions`, and nowhere else.
+    /// No control-socket command reaches it, no `talaria_protocol` variant
+    /// carries it, and no MCP tool exists for it. That matters more here than
+    /// anywhere else in this enum: `http` is in the agent navigation
+    /// allowlist, so an agent holding `evaluate` can point a tab at this
+    /// browser's own authorization endpoint — which is why that endpoint
+    /// serves a page with no controls at all, and why the decision lives in
+    /// native chrome that page JavaScript structurally cannot reach.
+    ///
+    /// And one clause specific to this action and its sibling: it carries a
+    /// parked request id and **never** a code, a token, or a verifier. The
+    /// code is minted on the HTTP side after the decision arrives, so no
+    /// secret ever crosses into the chrome, where a panel bug could render it.
+    ApproveConsent(u64),
+    /// Drop this client's registration and every token in its family, and
+    /// terminate its open streams.
+    ///
+    /// **Both halves are the action.** Removing the client from the store is
+    /// what refuses its next request, because verification is a live read of
+    /// that store. It does nothing at all to a response stream the client
+    /// already holds open, which has no next request to fail — so a revoke
+    /// that stopped there would leave a revoked agent still receiving from
+    /// this browser while the panel showed its row gone. See
+    /// [`crate::http::StreamRegistry`].
+    ///
+    /// Everything [`UiAction::OpenDownload`], [`UiAction::SetRemoteAccess`]
+    /// and [`UiAction::ApproveConsent`] say about **where this may be raised
+    /// from** applies here too: one Access-panel row's own button, applied in
+    /// `apply_ui_actions`, and nowhere else. No control-socket command reaches
+    /// it, no `talaria_protocol` variant carries it, and no MCP tool exists
+    /// for it. A tool-reachable revoke would let one connected agent withdraw
+    /// a competitor's access — or its own — without the human.
+    ///
+    /// Emitted only by a row's **second, confirming** click, never by the
+    /// first, and it carries the `client_id` cloned verbatim out of the row's
+    /// own record: the identifier this browser minted, which the client did
+    /// not choose for itself and which no two rows share.
+    RevokeClient(String),
+    /// Drop every registration a human has not approved.
+    ///
+    /// **A recovery control, and the reason it exists is the reason it is
+    /// safe.** `/register` needs no credential, so any local account can fill
+    /// the registry; an unapproved registration renders no row, so before this
+    /// existed there was nothing in the product to press and the only way out
+    /// was to quit the browser and edit `agents.json` (CR-04).
+    ///
+    /// It takes nothing a human approved, so unlike [`UiAction::RevokeClient`]
+    /// it cannot cost anybody access and does not need a confirming click —
+    /// the same reasoning [`UiAction::RemoveBookmark`] uses for acting on one.
+    /// The worst it can do is make a client that is *at this moment* waiting
+    /// at the consent panel register again, and the panel's own wording says
+    /// so. That failure lands on a refused grant, never a granted one.
+    ForgetUnapprovedClients,
+    /// Refuse the parked authorization request with this id, and start the
+    /// post-resolution cooldown.
+    ///
+    /// Everything [`UiAction::ApproveConsent`] says about where this may be
+    /// raised from applies here too.
+    ///
+    /// **The cooldown is a property of *resolving* a request, not of this
+    /// action.** The HTTP layer is equally obliged to start it — for longer —
+    /// when a parked request expires unanswered, which is a terminal
+    /// resolution the chrome never emits an action for and therefore could
+    /// never arm from here. Arming it on Deny alone would leave the expiry
+    /// path open: a peer could raise a request, wait out a human who simply
+    /// ignores it, and re-raise the instant it expired.
+    DenyConsent(u64),
 }
+
+/// How long the consent panel's Approve control stays disabled, in
+/// milliseconds, measured from the moment the request was raised.
+///
+/// The one new interaction primitive this phase adds, and nothing else in this
+/// chrome needed it because nothing else in this chrome can appear uninvited.
+/// A consent panel is raised by an unauthenticated network peer, at a moment
+/// of that peer's choosing, over whatever the human was doing — and without a
+/// delay a click already in flight lands on a button that grants full browser
+/// control. One second: long enough that an in-flight click cannot land, short
+/// enough that a deliberate human does not notice. Deny is live immediately.
+const CONSENT_ARM_DELAY_MS: u64 = 1_000;
+
+/// How many characters of an attacker-chosen string are rendered.
+///
+/// The claimed client name and the redirect target both go through this before
+/// anything else looks at them, so a 10 KB name cannot push the button row off
+/// screen and a pathological URI cannot widen the panel. The full values live
+/// in hover text where they are one line and cannot displace a control.
+const CLAIM_LIMIT: usize = 48;
 
 /// The first `limit` characters of `text`, with an ellipsis when there was
 /// more.
@@ -154,6 +294,35 @@ pub fn is_display_unsafe(character: char) -> bool {
 pub fn sanitize_for_display(text: &str) -> String {
     text.chars()
         .map(|character| if is_display_unsafe(character) { '\u{FFFD}' } else { character })
+        .collect()
+}
+
+/// [`sanitize_for_display`], plus one rule this caller needs and that one
+/// does not: the ASCII double quote is replaced too.
+///
+/// **Here the quote is the delimiter.** A registered `client_name` is rendered
+/// inside literal quotes, so a name of `Talaria" verified by Talaria "` would
+/// otherwise render as `"Talaria" verified by Talaria ""` — Talaria appearing
+/// to vouch for a stranger, in Talaria's own voice, at the exact moment a
+/// human is deciding whether to hand over their browsing session.
+/// [`sanitize_for_display`] was written for filenames, where a quote is
+/// harmless; this is the caller for which it is not.
+///
+/// Two limits, both deliberate:
+///
+/// - **U+FFFD rather than removal**, for [`sanitize_for_display`]'s own stated
+///   reason: a dropped character lets a name shorten silently into something
+///   else plausible, where the replacement character shows the human that
+///   something was there.
+/// - **Curly quotes are left alone.** They cannot forge an ASCII delimiter,
+///   and mangling ordinary punctuation in a legitimate name costs trust for
+///   nothing.
+pub fn sanitize_claim(text: &str) -> String {
+    text.chars()
+        .map(|character| match is_display_unsafe(character) || character == '"' {
+            true => '\u{FFFD}',
+            false => character,
+        })
         .collect()
 }
 
@@ -264,6 +433,28 @@ pub struct Gui {
     /// a time and never across a close: a list that shows every password at a
     /// glance is the shoulder-surfing surface the encryption exists to avoid.
     revealed_entry: Option<usize>,
+    /// Whether the Access panel's "turn on remote access" control is in its
+    /// confirming state. Reset on every panel change like every other
+    /// confirming flag here, so a half-pressed "open a network port" cannot
+    /// survive the panel closing and be completed by a click meant for
+    /// something else.
+    confirm_enable_remote: bool,
+    /// Which authorized client's Revoke button is in its confirming state, by
+    /// `client_id`, or `None` when none is.
+    ///
+    /// **An optional identifier rather than a `bool` or a row index, and the
+    /// difference is a security property.** `confirm_clear_history` is a
+    /// `bool` because it governs one control. A per-row confirm keyed by row
+    /// *index* would follow the position rather than the client: a list that
+    /// reorders between the arming click and the confirming one — a new
+    /// authorization arrives, another row is revoked — would leave the second
+    /// click completing against a different agent than the one the human
+    /// armed. Keying on the identifier makes that unrepresentable.
+    ///
+    /// Reset on every panel change like every other confirming flag here, so a
+    /// half-pressed revoke cannot survive the panel closing and be completed
+    /// by a click meant for something else.
+    confirm_revoke: Option<String>,
     /// Whether the History panel's Clear control is in its confirming state.
     /// Reset on every panel change, exactly like `revealed_entry`, so a
     /// half-pressed clear cannot survive the panel closing and be completed
@@ -349,6 +540,8 @@ impl Gui {
             credential_password: String::new(),
             revealed_entry: None,
             confirm_clear_history: false,
+            confirm_enable_remote: false,
+            confirm_revoke: None,
             settings_name: String::new(),
             settings_template: String::new(),
             settings_draft_stale: true,
@@ -406,11 +599,61 @@ impl Gui {
     /// half-pressed Clear history. Only the credentials panel wants its first
     /// field focused on open, so the whole panel is keyboard-reachable
     /// (Ctrl+K, type, Tab, Enter); the History panel has no field to fill.
+    ///
+    /// **[`ChromePanel::Consent`] is refused here**, and the refusal is the
+    /// point rather than a guard against a mistake nobody would make. The
+    /// consent panel is raised by [`Gui::raise_consent`] and by nothing else,
+    /// so this function and that one are the two entry points and they are
+    /// disjoint *by construction*: a reviewer asking "what can open the
+    /// Approve button?" reads two functions, not every panel button that will
+    /// ever be written. `apply_ui_actions` refuses the same variant one level
+    /// up, so an action naming it never gets this far either.
     pub fn set_panel(&mut self, panel: ChromePanel) {
+        if panel == ChromePanel::Consent {
+            log::warn!(
+                "refusing to open the consent panel from a set-panel action; \
+                 it is raised only by an authorization request"
+            );
+            return;
+        }
         self.panel = panel;
+        self.focus_credentials = panel == ChromePanel::Credentials;
+        self.reset_panel_view_state();
+    }
+
+    /// Open the consent panel for the request now parked on
+    /// [`crate::app::Shared::pending_consent`].
+    ///
+    /// Called from `user_event`'s [`crate::app::AppEvent::ConsentRequested`]
+    /// arm, through the `GUI` thread-local, and from nowhere else.
+    ///
+    /// It takes **no argument**, which is a deliberate reconciliation of two
+    /// halves of `04-UI-SPEC.md`'s own contract: the spec's literal signature
+    /// is `raise_consent(request)`, and the same contract fixes that *no
+    /// timing state lives on `Gui`* — the arm delay reads `raised_at_ms` off
+    /// the parked request on `Shared`. Both cannot hold if the request is
+    /// handed to the chrome, so the request is parked where every other
+    /// panel's data lives and the panel body reads it each frame. What the
+    /// contract actually fixes is that the same view-state reset happens on
+    /// **both** paths and that `set_panel` is not one of them, and both hold.
+    ///
+    /// The reset is why this is not a bare assignment: a consent request
+    /// arrives uninvited, over whatever the human was doing, so a revealed
+    /// password or a half-armed confirm must not survive the interruption any
+    /// more than it survives an ordinary panel switch.
+    pub fn raise_consent(&mut self) {
+        self.panel = ChromePanel::Consent;
+        self.focus_credentials = false;
+        self.reset_panel_view_state();
+    }
+
+    /// Everything a panel switch forgets, in one place so the two entry points
+    /// cannot drift apart.
+    fn reset_panel_view_state(&mut self) {
         self.revealed_entry = None;
         self.confirm_clear_history = false;
-        self.focus_credentials = panel == ChromePanel::Credentials;
+        self.confirm_enable_remote = false;
+        self.confirm_revoke = None;
         // A half-typed engine does not survive the panel closing either. The
         // draft is refilled from the store on the next frame the panel is
         // drawn, so what a reopened panel shows is what is actually saved,
@@ -470,10 +713,16 @@ impl Gui {
         // The closure cannot see `self` (its `context` field is borrowed for
         // the whole frame), so the panel's view state travels in and out as
         // locals — the same shape `select_location` already uses.
-        let panel = self.panel;
+        // `mut` for one reason, and it is the consent panel's third exit: when
+        // the HTTP side has given up on a parked request the panel closes
+        // itself mid-frame, emitting nothing, and the new value is written
+        // back to `self` below with the rest of the view state.
+        let mut panel = self.panel;
         let mut focus_credentials = std::mem::take(&mut self.focus_credentials);
         let mut revealed_entry = self.revealed_entry;
         let mut confirm_clear_history = self.confirm_clear_history;
+        let mut confirm_enable_remote = self.confirm_enable_remote;
+        let mut confirm_revoke = self.confirm_revoke.clone();
         let mut credential_site = std::mem::take(&mut self.credential_site);
         let mut credential_username = std::mem::take(&mut self.credential_username);
         let mut credential_password = std::mem::take(&mut self.credential_password);
@@ -697,6 +946,50 @@ impl Gui {
                             true => ChromePanel::None,
                             false => ChromePanel::Settings,
                         }));
+                    }
+
+                    // Immediately after Settings and before Credentials,
+                    // inside the existing group — no third separator. The
+                    // glyph is the always-visible connection state: a browser
+                    // quietly listening on a port is exactly the kind of thing
+                    // a person should be able to notice without going looking
+                    // for it, and the signal is glyph shape plus a text port
+                    // label rather than a colour, so it survives anyone who
+                    // cannot tell two accents apart and any future `Visuals`.
+                    //
+                    // No keyboard shortcut, matching Settings: `Ctrl+A` is the
+                    // only free letter and taking it would break select-all in
+                    // the location bar and the credential fields.
+                    let access_open = panel == ChromePanel::Access;
+                    let bound_addr = shared.remote.borrow().bound_addr().map(str::to_owned);
+                    let (access_glyph, access_hover) = match bound_addr.as_deref() {
+                        Some(addr) => (
+                            egui_phosphor::regular::PLUGS_CONNECTED,
+                            format!("Remote access: on — {addr}"),
+                        ),
+                        None => (egui_phosphor::regular::PLUGS, "Remote access: off".to_owned()),
+                    };
+                    let access_button = ui
+                        .add(egui::Button::new(access_glyph).selected(access_open))
+                        .on_hover_text(&access_hover);
+                    record_rect(
+                        chrome_rects.as_mut(),
+                        "toolbar.access",
+                        None,
+                        access_button.rect,
+                    );
+                    if access_button.clicked() {
+                        actions.push(UiAction::SetPanel(match access_open {
+                            true => ChromePanel::None,
+                            false => ChromePanel::Access,
+                        }));
+                    }
+                    // The port, beside the glyph, only while something is
+                    // bound. Bounded by the type at `:65535`, so there is
+                    // nothing here to truncate.
+                    if let Some(addr) = bound_addr.as_deref() {
+                        let port = addr.rsplit(':').next().unwrap_or_default();
+                        ui.label(egui::RichText::new(format!(":{port}")).small());
                     }
 
                     // The credentials surface is human-only. It opens from
@@ -1577,6 +1870,622 @@ impl Gui {
                         }));
                     }
                 });
+            } else if panel == ChromePanel::Access {
+                // Like Settings, not like the list panels: a short status
+                // block plus one control, so no `ScrollArea` wraps it. The
+                // authorized-client list arrives in a later plan and brings
+                // its own scrolling with it.
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    // Cloned out of the `RefCell` rather than held as a `Ref`
+                    // for the body of the panel: the borrow would still be
+                    // live under the button handlers below.
+                    let remote = shared.remote.borrow().clone();
+                    let bound = remote.bound_addr().map(str::to_owned);
+
+                    ui.heading(format!(
+                        "{} Access",
+                        match bound.is_some() {
+                            true => egui_phosphor::regular::PLUGS_CONNECTED,
+                            false => egui_phosphor::regular::PLUGS,
+                        }
+                    ));
+                    ui.label(
+                        "Agents that can drive this browser from another program, and the \
+                         switch that lets them reach it at all.",
+                    );
+                    ui.add_space(16.0);
+
+                    // Recorded so a narrow-window check can assert the status
+                    // line stays inside the panel rather than running past its
+                    // edge — the one held-out visual item this surface has.
+                    let status = match &remote {
+                        RemoteAccess::Off => ui.label("Remote access is off."),
+                        RemoteAccess::Starting => {
+                            // The one genuinely applicable loading state in
+                            // this chrome: the bind happens on another thread,
+                            // and egui is reactive, so without this the frame
+                            // that shows the bound address might never be
+                            // drawn.
+                            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                            ui.label("Starting…")
+                        },
+                        RemoteAccess::Bound { addr } => {
+                            ui.label(format!("Remote access is on — listening on {addr}."))
+                        },
+                        RemoteAccess::Failed { addr, error } => {
+                            // Remote access stays off in this state, and the
+                            // control below offers to try again. The UI never
+                            // claims a listener that does not exist.
+                            let line = match error.to_lowercase().contains("in use") {
+                                true => {
+                                    format!("Couldn’t start remote access — {addr} is already in use.")
+                                },
+                                false => format!(
+                                    "Couldn’t start remote access at {addr} — {}.",
+                                    sanitize_for_display(error)
+                                ),
+                            };
+                            ui.label(
+                                egui::RichText::new(line).color(ui.visuals().error_fg_color),
+                            )
+                        },
+                    };
+                    record_rect(chrome_rects.as_mut(), "access.status", None, status.rect);
+
+                    match &remote {
+                        RemoteAccess::Off | RemoteAccess::Failed { .. } => {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Agents can still connect the way they do today: a \
+                                     local MCP client, over Talaria’s socket, running \
+                                     as you.",
+                                )
+                                .small(),
+                            );
+                        },
+                        RemoteAccess::Bound { .. } => {
+                            // Both directions named, neither softened. The
+                            // first sentence is the Phase 2 delta made plain —
+                            // a loopback TCP port carries no peer credentials
+                            // and is not a boundary between local accounts.
+                            // The second is what stops a reader believing the
+                            // tailnet phase already shipped.
+                            ui.label(
+                                egui::RichText::new(
+                                    "Anyone signed in to this computer can reach that \
+                                     address; the access token is the only thing stopping \
+                                     them. It is not reachable from other machines.",
+                                )
+                                .small(),
+                            );
+                        },
+                        RemoteAccess::Starting => {},
+                    }
+
+                    ui.add_space(16.0);
+                    match bound {
+                        // Two clicks to open a port. Not destructive in the
+                        // delete sense, and weighted anyway: D-04-04 exists
+                        // precisely because this click deserves it. Reuses the
+                        // control History already established, so it costs one
+                        // `bool` and introduces nothing new.
+                        None => {
+                            let enable = match confirm_enable_remote {
+                                true => ui.button(
+                                    egui::RichText::new(
+                                        "Confirm — allow network connections?",
+                                    )
+                                    .color(ui.visuals().error_fg_color),
+                                ),
+                                false => ui.button("Turn on remote access"),
+                            };
+                            // Named for which of the two states it is in, so
+                            // "the confirm armed" and "the confirm reset" are
+                            // observable rather than inferred.
+                            record_rect(
+                                chrome_rects.as_mut(),
+                                match confirm_enable_remote {
+                                    true => "access.confirm-enable",
+                                    false => "access.enable",
+                                },
+                                None,
+                                enable.rect,
+                            );
+                            if enable.clicked() {
+                                match confirm_enable_remote {
+                                    true => actions.push(UiAction::SetRemoteAccess(true)),
+                                    false => confirm_enable_remote = true,
+                                }
+                            }
+                        },
+                        // One click, no confirmation: confirming a move
+                        // toward safety trains people to click through
+                        // confirmations.
+                        Some(_) => {
+                            let disable = ui.button("Turn off remote access");
+                            record_rect(
+                                chrome_rects.as_mut(),
+                                "access.disable",
+                                None,
+                                disable.rect,
+                            );
+                            if disable.clicked() {
+                                actions.push(UiAction::SetRemoteAccess(false));
+                            }
+                        },
+                    }
+
+                    ui.add_space(16.0);
+
+                    // Cloned out from under the lock before anything is drawn,
+                    // the same reason `remote` above is cloned out of its
+                    // `RefCell`: this store is also read by the listener
+                    // thread on every single request, so a guard held for the
+                    // body of a panel would be a guard an HTTP request waits
+                    // on. A poisoned lock renders the empty state, which is
+                    // the same degrade direction `Agents::load` takes for an
+                    // unreadable file — and, as there, it degrades the
+                    // *listing*, never the check.
+                    //
+                    // Filtered to clients a human actually approved. A
+                    // registration alone is inert: it holds no tokens and can
+                    // be the subject of no operation, so it is not a row.
+                    //
+                    // The unapproved ones are counted in the same pass rather
+                    // than listed. They are still not rows — a registration on
+                    // its own can be the subject of no operation, and giving
+                    // it a row with a Revoke button would say it holds
+                    // something to take away — but the *count* is what makes a
+                    // registration flood diagnosable instead of invisible, and
+                    // it is what the recovery control below acts on (CR-04).
+                    let (clients, waiting): (Vec<crate::agents::AgentClient>, usize) = shared
+                        .agents
+                        .lock()
+                        .map(|store| {
+                            let approved = store
+                                .clients()
+                                .iter()
+                                .filter(|client| client.authorized_at_ms.is_some())
+                                .cloned()
+                                .collect();
+                            let waiting = store
+                                .clients()
+                                .iter()
+                                .filter(|client| client.authorized_at_ms.is_none())
+                                .count();
+                            (approved, waiting)
+                        })
+                        .unwrap_or_default();
+                    // Read once per frame rather than per row, so every row is
+                    // described against the same instant.
+                    let now = crate::app::now_ms();
+
+                    // Drawn only when there is something to say, so an
+                    // ordinary browser never carries a line about a state it
+                    // is not in — and, as with `access.empty`, the presence of
+                    // these rects *is* the evidence the state is on screen.
+                    if waiting > 0 {
+                        ui.horizontal(|ui| {
+                            // The whole clause varies, not just the auxiliary: an
+                            // earlier version inflected "has"/"have" and then
+                            // appended "and are waiting" unconditionally, which
+                            // read as "1 program has registered and are waiting".
+                            let sentence = match waiting {
+                                1 => "1 program has registered and is waiting for \
+                                      approval. It can do nothing until you approve it."
+                                    .to_owned(),
+                                many => format!(
+                                    "{many} programs have registered and are waiting for \
+                                     approval. They can do nothing until you approve one."
+                                ),
+                            };
+                            let note = ui.label(egui::RichText::new(sentence).small());
+                            record_rect(chrome_rects.as_mut(), "access.waiting", None, note.rect);
+                            let forget = ui.button(if waiting == 1 { "Forget it" } else { "Forget them" });
+                            record_rect(
+                                chrome_rects.as_mut(),
+                                "access.forget-unapproved",
+                                None,
+                                forget.rect,
+                            );
+                            if forget
+                                .on_hover_text(
+                                    "Removes registrations nobody approved. Anything you \
+                                     have approved is untouched; a program that still \
+                                     wants access can register again.",
+                                )
+                                .clicked()
+                            {
+                                actions.push(UiAction::ForgetUnapprovedClients);
+                            }
+                        });
+                        ui.add_space(8.0);
+                    }
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        if clients.is_empty() {
+                            let empty = ui.label("Nothing authorized yet.");
+                            // Two lines that are drawn only in this state, so
+                            // their presence in the reported rects *is* the
+                            // evidence that the empty state is on screen and
+                            // their absence is the evidence that it is not —
+                            // the same trick `downloads.dismiss-error` uses.
+                            // Without a name, "the panel showed the empty
+                            // state" could only ever be inferred from the
+                            // absence of rows, which is also what a panel that
+                            // drew nothing at all looks like.
+                            record_rect(chrome_rects.as_mut(), "access.empty", None, empty.rect);
+                            // The next step, and only when there is one to
+                            // take: telling somebody to point a client at an
+                            // address nothing is listening on is worse than
+                            // saying nothing.
+                            if let Some(addr) = &bound {
+                                let next = ui.label(
+                                    egui::RichText::new(format!(
+                                        "Point an MCP client at {addr}/mcp, then approve \
+                                         it here.",
+                                    ))
+                                    .small(),
+                                );
+                                record_rect(
+                                    chrome_rects.as_mut(),
+                                    "access.next-step",
+                                    None,
+                                    next.rect,
+                                );
+                            }
+                        } else if bound.is_none() {
+                            // The rows are real and none of them can reach
+                            // this browser right now. Said once, above the
+                            // list, rather than repeated on every row.
+                            ui.label(
+                                egui::RichText::new(
+                                    "Remote access is off, so none of these can connect \
+                                     right now.",
+                                )
+                                .small(),
+                            );
+                        }
+
+                        // Newest-authorized first, reversed at display time
+                        // exactly like the History and Bookmarks panels —
+                        // **not sorted**. The store keeps insertion order on
+                        // purpose (see `Agents::clients`), and sorting by an
+                        // authorization time would give two clients approved
+                        // in the same millisecond an order that depended on
+                        // the sort's stability rather than one that does not
+                        // depend on the clock at all.
+                        for (row, client) in clients.iter().rev().enumerate() {
+                            // Everything the client chose goes through both
+                            // helpers before anything looks at it: truncated
+                            // so a 10 KB name cannot push the Revoke button
+                            // off screen, then sanitized so it cannot take a
+                            // second line, reorder what follows it, or forge
+                            // the quotes it is rendered inside. The quotes and
+                            // the claimed-suffix carry the framing that a
+                            // single-line row has no space to fence.
+                            let claimed =
+                                sanitize_claim(&truncate_chars(&client.client_name, CLAIM_LIMIT));
+                            let hover = format!(
+                                "{}\n{}\n{}",
+                                client.client_id,
+                                sanitize_claim(&client.client_name),
+                                match client.redirect_uris.first() {
+                                    Some(uri) => sanitize_claim(uri),
+                                    None => "no registered redirect URI".to_owned(),
+                                },
+                            );
+                            let fill = match row % 2 {
+                                1 => ui.visuals().faint_bg_color,
+                                _ => egui::Color32::TRANSPARENT,
+                            };
+                            let armed =
+                                confirm_revoke.as_deref() == Some(client.client_id.as_str());
+                            let framed = egui::Frame::new().fill(fill).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            // The full values live in hover
+                                            // text, where they are one line
+                                            // and cannot displace a control.
+                                            ui.label(format!("\u{201C}{claimed}\u{201D}"))
+                                                .on_hover_text(&hover);
+                                            ui.label(
+                                                egui::RichText::new("(as claimed)").small(),
+                                            )
+                                            .on_hover_text(&hover);
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} · authorized {}",
+                                                truncate_chars(&client.client_id, 12),
+                                                relative_time(
+                                                    client.authorized_at_ms.unwrap_or_default(),
+                                                    now,
+                                                ),
+                                            ))
+                                            .small(),
+                                        )
+                                        .on_hover_text(&hover);
+                                    });
+                                    let revoke = match armed {
+                                        true => ui.button(
+                                            egui::RichText::new("Confirm revoke?")
+                                                .color(ui.visuals().error_fg_color),
+                                        ),
+                                        false => ui.button("Revoke"),
+                                    };
+                                    // Named for which of the two states it is
+                                    // in, exactly as `history.clear` /
+                                    // `history.confirm-clear` are, so "this
+                                    // row armed and no other did" is
+                                    // observable rather than inferred. The
+                                    // index suffix is `record_rect`'s.
+                                    record_rect(
+                                        chrome_rects.as_mut(),
+                                        match armed {
+                                            true => "access.confirm-revoke",
+                                            false => "access.revoke",
+                                        },
+                                        Some(row),
+                                        revoke.rect,
+                                    );
+                                    if revoke.on_hover_text("Revoke this client’s access").clicked()
+                                    {
+                                        // Two clicks, in place, and not the
+                                        // immediate row-trash the Bookmarks
+                                        // and Credentials panels use. Those
+                                        // are undone in two seconds; this one
+                                        // takes an agent's access away
+                                        // mid-task and costs a human approval
+                                        // to put back.
+                                        match armed {
+                                            true => actions.push(UiAction::RevokeClient(
+                                                client.client_id.clone(),
+                                            )),
+                                            false => {
+                                                confirm_revoke =
+                                                    Some(client.client_id.clone())
+                                            },
+                                        }
+                                    }
+                                });
+                            });
+                            record_rect(
+                                chrome_rects.as_mut(),
+                                "access.row",
+                                Some(row),
+                                framed.response.rect,
+                            );
+                        }
+                    });
+                });
+            } else if panel == ChromePanel::Consent {
+                // The request is read from `Shared` each frame, the way every
+                // other panel reads its store — and, unlike every other
+                // panel, that is also where its *timing* lives: the arm delay
+                // below is measured from `raised_at_ms` on the parked request
+                // rather than from anything on this `Gui`, so a repaint
+                // cannot restart the clock on a security delay.
+                let parked = shared.pending_consent.borrow();
+                match parked.as_ref() {
+                    // The third of the panel's three exits: the HTTP side
+                    // timed out and dropped its receiver. Nothing is emitted
+                    // — there is no longer a request for an action to name —
+                    // and the panel simply goes, which is exactly what the
+                    // caller's own holding page has already been told.
+                    None => panel = ChromePanel::None,
+                    Some(request) if request.is_abandoned() => panel = ChromePanel::None,
+                    Some(request) => {
+                        // Repainted while it is on screen, for two reasons a
+                        // reactive egui needs spelled out: the arm delay has
+                        // to enable a button without anybody touching the
+                        // mouse, and the expiry above has to be noticed
+                        // without an input event that may never come.
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                        let waited = crate::app::now_ms().saturating_sub(request.raised_at_ms);
+                        let armed = waited >= CONSENT_ARM_DELAY_MS;
+                        let target = url::Url::parse(&request.redirect_uri).ok();
+                        let host = target
+                            .as_ref()
+                            .and_then(|url| url.host_str().map(str::to_owned))
+                            .unwrap_or_default();
+                        let where_to = match target.as_ref().and_then(url::Url::port_or_known_default)
+                        {
+                            Some(port) => format!("{host}:{port}"),
+                            None => host,
+                        };
+                        let loopback = target.as_ref().is_some_and(|url| match url.host() {
+                            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                            _ => false,
+                        });
+
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            // Scrolled, with the button row last in the body
+                            // rather than pinned: a short window must not be
+                            // able to push Deny out of reach, and pinning
+                            // would be a new layout mechanism for one screen.
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.heading(format!(
+                                    "{} Authorize connection",
+                                    egui_phosphor::regular::PLUGS
+                                ));
+                                ui.label(
+                                    "Something connected to Talaria's remote access port is \
+                                     asking for full control of this browser.",
+                                );
+                                ui.add_space(16.0);
+
+                                // The untrusted-claim block. The client's
+                                // words are always inside this fence and
+                                // Talaria's are always outside it; the name
+                                // is never in the heading and never the
+                                // subject of a sentence. Two labels rather
+                                // than one, because a single line above can
+                                // be visually adopted as a heading for what
+                                // it introduces.
+                                let fill = ui.visuals().faint_bg_color;
+                                let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+                                egui::Frame::new()
+                                    .fill(fill)
+                                    .stroke(stroke)
+                                    .inner_margin(egui::Margin::same(8))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("It calls itself:")
+                                                .text_style(egui::TextStyle::Small),
+                                        );
+                                        // Truncated first, then sanitised —
+                                        // `truncate_chars`, never
+                                        // `String::truncate`, which takes a
+                                        // byte index and panics inside a
+                                        // multibyte character. `sanitize_claim`
+                                        // rather than `sanitize_for_display`
+                                        // because here the quote below is the
+                                        // delimiter: see that function.
+                                        ui.label(format!(
+                                            "\"{}\"",
+                                            sanitize_claim(&truncate_chars(
+                                                &request.client_name,
+                                                CLAIM_LIMIT
+                                            ))
+                                        ));
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Talaria did not check this name. Any program \
+                                                 on this computer can claim any name.",
+                                            )
+                                            .text_style(egui::TextStyle::Small),
+                                        );
+                                    });
+                                ui.add_space(16.0);
+
+                                // Beside the claim, the facts Talaria
+                                // actually knows. The redirect host and port
+                                // are a specification MUST, the loopback
+                                // warning a SHOULD, and the client id is the
+                                // one identifier the client did not choose
+                                // for itself.
+                                ui.label(format!(
+                                    "Sends you back to: {}",
+                                    sanitize_for_display(&truncate_chars(&where_to, CLAIM_LIMIT))
+                                ))
+                                .on_hover_text(sanitize_for_display(&truncate_chars(
+                                    &request.redirect_uri,
+                                    CLAIM_LIMIT,
+                                )));
+                                if loopback {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "That address is a program on this computer, not a \
+                                             website. Talaria cannot tell you which one.",
+                                        )
+                                        .text_style(egui::TextStyle::Small),
+                                    );
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Client ID: {}",
+                                        sanitize_for_display(&request.client_id)
+                                    ))
+                                    .text_style(egui::TextStyle::Small),
+                                );
+                                ui.add_space(16.0);
+
+                                // Written against the actual tool surface —
+                                // see the note beside `tool_box!` in
+                                // `crates/talaria-mcp/src/tools.rs`: if that
+                                // surface changes, these lines change with
+                                // it. No "it cannot…" line, deliberately: an
+                                // exclusion asserted here would have to stay
+                                // true across every later phase, and an
+                                // outdated reassurance on a consent screen is
+                                // worse than no reassurance.
+                                ui.label("Approving lets it, until you revoke it:");
+                                for grant in [
+                                    "open, close, and switch tabs",
+                                    "see the address and title of every tab, including your own",
+                                    "navigate any tab to any http or https address",
+                                    "run JavaScript in any page and read what it returns",
+                                    "take a picture of any tab",
+                                    "read the passwords and cookies you saved in this browser",
+                                    "download files into your downloads folder",
+                                ] {
+                                    ui.label(format!("• {grant}"));
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "There is no smaller amount of access to grant. \
+                                         Approve only something you started.",
+                                    )
+                                    .text_style(egui::TextStyle::Small),
+                                );
+                                ui.add_space(16.0);
+
+                                if !armed {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Approve turns on in a moment, so a click meant \
+                                             for something else can't grant this.",
+                                        )
+                                        .text_style(egui::TextStyle::Small),
+                                    );
+                                    // The frame that enables the button,
+                                    // scheduled so the transition happens
+                                    // without input.
+                                    ctx.request_repaint_after(std::time::Duration::from_millis(
+                                        CONSENT_ARM_DELAY_MS.saturating_sub(waited).max(1),
+                                    ));
+                                }
+                                ui.horizontal(|ui| {
+                                    // Deny is live immediately: the safe
+                                    // direction never needs ceremony, and a
+                                    // stray click that refuses an agent costs
+                                    // nothing but a second attempt.
+                                    let deny = ui.button("Deny");
+                                    record_rect(
+                                        chrome_rects.as_mut(),
+                                        "consent.deny",
+                                        None,
+                                        deny.rect,
+                                    );
+                                    if deny.clicked() {
+                                        actions.push(UiAction::DenyConsent(request.id));
+                                    }
+                                    // Approve is disabled for the first second
+                                    // this request is on screen. The panel
+                                    // arrives uninvited, at a moment an
+                                    // unauthenticated peer chose, over
+                                    // whatever the human was doing — without
+                                    // the delay, a click already in flight
+                                    // can grant full browser control.
+                                    let approve =
+                                        ui.add_enabled(armed, egui::Button::new("Approve"));
+                                    record_rect(
+                                        chrome_rects.as_mut(),
+                                        "consent.approve",
+                                        None,
+                                        approve.rect,
+                                    );
+                                    if approve.clicked() && armed {
+                                        actions.push(UiAction::ApproveConsent(request.id));
+                                    }
+                                });
+                                // No countdown: a visible timer pressures a
+                                // security decision. The line is what stops
+                                // the disappearance being a surprise.
+                                ui.label(
+                                    egui::RichText::new(
+                                        "This request expires if you leave it unanswered.",
+                                    )
+                                    .text_style(egui::TextStyle::Small),
+                                );
+                            });
+                        });
+                    },
+                }
+                drop(parked);
             } else if let Some(tab_id) = crashed_tab {
                 // Crashed state replaces the page (same shape as "Aw, Snap").
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -1617,9 +2526,12 @@ impl Gui {
             }
         });
 
+        self.panel = panel;
         self.focus_credentials = focus_credentials;
         self.revealed_entry = revealed_entry;
         self.confirm_clear_history = confirm_clear_history;
+        self.confirm_enable_remote = confirm_enable_remote;
+        self.confirm_revoke = confirm_revoke;
         self.credential_site = credential_site;
         self.credential_username = credential_username;
         self.credential_password = credential_password;
@@ -1886,5 +2798,63 @@ mod tests {
         // which would make an available-width bound almost vacuous.
         assert_eq!(long_width, 320.0, "the field is no longer the requested 320 points");
         assert!(available > long_width, "the harness gave the field no room to grow into");
+    }
+
+    /// T-4. The claimed name is rendered inside literal quotes, so here the
+    /// quote *is* the delimiter — and a name that could close it would let a
+    /// stranger speak in Talaria's voice on the one screen where that matters
+    /// most.
+    #[test]
+    fn a_claimed_name_cannot_close_the_quotes_it_is_rendered_inside() {
+        let hostile = "Talaria\" verified by Talaria \"";
+        let claim = sanitize_claim(hostile);
+        assert!(!claim.contains('"'), "{claim}");
+        assert_eq!(claim.matches('\u{FFFD}').count(), 2);
+        // Replaced, not dropped: the human is shown that something was there,
+        // and the name cannot shorten silently into something else plausible.
+        assert_eq!(claim.chars().count(), hostile.chars().count());
+    }
+
+    #[test]
+    fn a_claimed_name_cannot_take_a_second_line_or_reorder_the_text_around_it() {
+        assert_eq!(sanitize_claim("Agent\n\nApproved by Talaria"), "Agent\u{FFFD}\u{FFFD}Approved by Talaria");
+        assert_eq!(sanitize_claim("Agent\tvetted"), "Agent\u{FFFD}vetted");
+        // The bidirectional overrides and isolates, which reorder what
+        // follows them.
+        assert_eq!(sanitize_claim("A\u{202E}B"), "A\u{FFFD}B");
+        assert_eq!(sanitize_claim("A\u{2066}B"), "A\u{FFFD}B");
+    }
+
+    #[test]
+    fn a_claimed_name_keeps_its_curly_quotes_and_its_multibyte_characters() {
+        // Curly quotes cannot forge an ASCII delimiter, and mangling ordinary
+        // punctuation in a legitimate name costs trust for nothing.
+        assert_eq!(sanitize_claim("Ada\u{2019}s \u{201C}Agent\u{201D}"), "Ada\u{2019}s \u{201C}Agent\u{201D}");
+        assert_eq!(sanitize_claim("エージェント"), "エージェント");
+        assert_eq!(sanitize_claim("Agent 🌍"), "Agent 🌍");
+    }
+
+    #[test]
+    fn the_claim_sanitiser_is_the_display_one_plus_the_delimiter_rule() {
+        // Stated as a property rather than by example, so a later edit to
+        // `sanitize_for_display` cannot silently make the two disagree about
+        // anything except the quote.
+        for text in ["plain", "with\nnewline", "with\u{202E}override", "curly\u{2019}", "多字节"] {
+            assert_eq!(sanitize_claim(text), sanitize_for_display(text), "{text:?}");
+        }
+        assert_ne!(sanitize_claim("a\"b"), sanitize_for_display("a\"b"));
+        assert_eq!(sanitize_for_display("a\"b"), "a\"b", "filenames keep their quotes");
+    }
+
+    /// The panel truncates before it sanitises, and both are bounded, so a
+    /// name of many kilobytes cannot push the button row off screen.
+    #[test]
+    fn a_kilobyte_of_claimed_name_is_cut_to_the_rendered_limit() {
+        let huge = "A".repeat(10_000);
+        let rendered = sanitize_claim(&truncate_chars(&huge, CLAIM_LIMIT));
+        assert_eq!(rendered.chars().count(), CLAIM_LIMIT + 1, "the limit plus the ellipsis");
+        let hostile = "\u{202E}".repeat(10_000);
+        let rendered = sanitize_claim(&truncate_chars(&hostile, CLAIM_LIMIT));
+        assert!(rendered.chars().all(|character| character == '\u{FFFD}' || character == '…'));
     }
 }
