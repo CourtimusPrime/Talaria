@@ -101,6 +101,43 @@ pub enum Command {
     /// Used by a second `talaria` launch to hand its URL to the running
     /// instance (single-instance behaviour); not exposed as an MCP tool.
     OpenForUser { url: String },
+    /// **Test hook.** The logical rects of the chrome elements the shell is
+    /// currently drawing — the toolbar's controls and the rows of whichever
+    /// panel is open — so an e2e suite can click a real widget by name
+    /// instead of hardcoding a coordinate that moves whenever the toolbar
+    /// gains a button.
+    ///
+    /// Refused unless the shell was started with `TALARIA_TEST_HOOKS=1`, and
+    /// refused the way an unrecognised command is refused: where the chrome
+    /// is on screen is not something a production agent has any business
+    /// reading. It is a map of the human's own controls, and an agent that
+    /// could read it could aim synthetic input at the credentials button, the
+    /// bookmark star or a downloads row — the human-only surfaces this whole
+    /// phase kept off the tool surface on purpose. It is also a live
+    /// description of what the human is looking at right now, which is the
+    /// same class of leak as reading their history.
+    ///
+    /// Deliberately not exposed as an MCP tool, for the same reason: the
+    /// control socket carries it for tests, the agent tool surface does not
+    /// carry it at all.
+    ChromeRects,
+}
+
+/// One named chrome element's rectangle, in egui's own logical points with
+/// the window's top-left as the origin. Multiply by the
+/// [`ResultPayload::ChromeRects::scale`] the reply carries to get physical
+/// pixels, which is what a synthetic-input tool wants.
+///
+/// `name` is stable and structured: `toolbar.credentials`, `history.row.0`,
+/// `downloads.open.1`. An indexed name counts from the row the panel draws
+/// **first**, and every list panel draws newest-first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChromeRect {
+    pub name: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +173,14 @@ pub enum ResultPayload {
     Screenshot { png_base64: String, width: u32, height: u32 },
     Credentials { entries: Vec<CredentialEntry> },
     Download { path: String, bytes: u64 },
+    /// Reply to [`Command::ChromeRects`]. `scale` is the window's scale
+    /// factor, carried alongside rather than pre-multiplied into the rects so
+    /// that what is reported is what egui itself laid out.
+    ///
+    /// Ahead of `Empty {}` because this enum is `untagged`: serde tries the
+    /// variants in declaration order, and `Empty {}` ignores unknown fields,
+    /// so it matches any object put after it.
+    ChromeRects { rects: Vec<ChromeRect>, scale: f64 },
     Empty {},
 }
 
@@ -210,6 +255,47 @@ mod tests {
         match back {
             ClientMessage::Request { id: 7, command: Command::Evaluate { tab_id: 3, script } } => {
                 assert_eq!(script, "1+1")
+            },
+            other => panic!("bad round trip: {other:?}"),
+        }
+    }
+
+    /// The test hook's wire shape, both ways. `ChromeRects` sits inside an
+    /// `untagged` payload enum next to `Empty {}`, which matches any object,
+    /// so "it deserialises back into the variant it was written from" is the
+    /// property that declaration order has to keep true.
+    #[test]
+    fn chrome_rects_round_trip() {
+        let request = ClientMessage::Request { id: 4, command: Command::ChromeRects };
+        let json = serde_json::to_string(&request).expect("serializable");
+        assert!(json.contains("\"command\":\"chrome_rects\""), "{json}");
+
+        let reply = ServerMessage::Reply {
+            id: 4,
+            outcome: Outcome::Ok {
+                result: ResultPayload::ChromeRects {
+                    rects: vec![ChromeRect {
+                        name: "toolbar.credentials".into(),
+                        x: 388.3,
+                        y: 2.0,
+                        width: 21.0,
+                        height: 18.0,
+                    }],
+                    scale: 1.0,
+                },
+            },
+        };
+        let json = serde_json::to_string(&reply).expect("serializable");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserializable");
+        match back {
+            ServerMessage::Reply {
+                outcome: Outcome::Ok { result: ResultPayload::ChromeRects { rects, scale } },
+                ..
+            } => {
+                assert_eq!(scale, 1.0);
+                assert_eq!(rects.len(), 1);
+                assert_eq!(rects[0].name, "toolbar.credentials");
+                assert_eq!(rects[0].width, 21.0);
             },
             other => panic!("bad round trip: {other:?}"),
         }

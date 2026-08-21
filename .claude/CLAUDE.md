@@ -91,7 +91,12 @@ challenge), without either side sacrificing performance.
 
 ## Configuration
 
-- No `.env` files, no config file format. All configuration is environment variables plus CLI argv.
+- No `.env` files. Configuration is environment variables plus CLI argv, plus one JSON config
+  file introduced by Phase 3: `config.json` under the `dirs` config dir, holding the address
+  bar's search engine (`crates/talaria-shell/src/settings.rs`). It is read at startup and
+  written by the Settings panel; a malformed file degrades to the default engine.
+- `TALARIA_HISTORY_MAX_ENTRIES` — browsing-history retention cap, default 5000
+  (`crates/talaria-shell/src/history.rs`)
 - `XDG_RUNTIME_DIR` — determines the control-socket path; falls back to `/tmp/talaria-$UID.sock` (`crates/talaria-protocol/src/lib.rs:15`)
 - `TALARIA_COMMAND_TIMEOUT_SECS` — control-socket command timeout (`crates/talaria-shell/src/control.rs:185`, `crates/talaria-shell/src/app.rs:1075`)
 - `TALARIA_TEST_HOOKS=1` — enables test-only behavior in the shell (`crates/talaria-shell/src/app.rs:972`)
@@ -194,11 +199,15 @@ challenge), without either side sacrificing performance.
 | Component | Responsibility | File |
 |-----------|----------------|------|
 | `main` (shell) | Arg → URL, crypto provider, single-instance forward, build event loop, spawn control thread | `crates/talaria-shell/src/main.rs` |
-| `App` / `Shared` | winit `ApplicationHandler`; owns Servo, window, tabs, sessions, vault, pending queues; implements `servo::WebViewDelegate` | `crates/talaria-shell/src/app.rs` |
+| `App` / `Shared` | winit `ApplicationHandler`; owns Servo, window, tabs, sessions, vault, the four Phase 3 stores, an `event_proxy` for off-thread wake-ups, and the pending queues; implements `servo::WebViewDelegate` | `crates/talaria-shell/src/app.rs` |
 | `Gui` | egui chrome (toolbar, tab strip, Me/Agents toggle, crash page); records the blit of the displayed tab's offscreen buffer; returns `Vec<UiAction>` | `crates/talaria-shell/src/gui.rs` |
 | `TabManager` / `TabOwner` | Tab table, per-view active tab, show/hide invariant, cycling | `crates/talaria-shell/src/tabs.rs` |
 | `control` | Unix socket listener, Hello handshake, session ids, request timeout, single-instance forwarding | `crates/talaria-shell/src/control.rs` |
 | `Vault` | Encrypted credential store backing `cookies_read` | `crates/talaria-shell/src/vault.rs` |
+| `History` | Append-only browsing history for Me tabs; capped, pruned at load | `crates/talaria-shell/src/history.rs` |
+| `Bookmarks` | Flat bookmark list; atomic whole-file save via `.tmp` sibling + rename | `crates/talaria-shell/src/bookmarks.rs` |
+| `Settings` | `config.json`; the address bar's configurable `SearchEngine` | `crates/talaria-shell/src/settings.rs` |
+| `Downloads` | Completed-download list; records the path actually written | `crates/talaria-shell/src/downloads.rs` |
 | `keyutils` | winit `KeyEvent` → servo keyboard event translation | `crates/talaria-shell/src/keyutils.rs` |
 | `talaria-protocol` | Wire enums (`ClientMessage`, `Command`, `ServerMessage`, `Outcome`, `Event`), `socket_path()` | `crates/talaria-protocol/src/lib.rs` |
 | `TalariaTools` | MCP tool structs + JSON schemas + `dispatch` to `Command` | `crates/talaria-mcp/src/tools.rs` |

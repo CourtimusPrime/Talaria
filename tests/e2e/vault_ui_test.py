@@ -20,16 +20,17 @@ What this pins down, in order:
 
 Every assertion above is made over the control socket. The *input* mechanism is
 not the deliverable and is deliberately kept as coordinate-free as it can be:
-only the toolbar button's position is hardcoded (the toolbar's layout is fixed
-and other suites already depend on it), and everything inside the panel is
-driven by Tab and Enter from the field the panel focuses on open. A panel row's
+the toolbar button is found by name through the ``chrome_rects`` test hook and
+clicked where the chrome says it is, and everything inside the panel is driven
+by Tab and Enter from the field the panel focuses on open. A panel row's
 vertical position depends on whether a one-shot vault notice is showing, which
 depends on whether *this machine* has a usable keychain — not something a
 committed test may depend on.
 
-Standalone (starts its own Xvfb + shell): it needs exclusive input focus, and
-an isolated home, because the vault, the key file and the engine profile all
-live under the platform config directory.
+Standalone (starts its own Xvfb + shell, with ``TALARIA_TEST_HOOKS=1`` so the
+rect lookup answers): it needs exclusive input focus, and an isolated home,
+because the vault, the key file and the engine profile all live under the
+platform config directory.
 
 The password is generated per run rather than hardcoded, so nothing
 credential-shaped is committed.
@@ -48,12 +49,16 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
 
-# The key-glyph button in the toolbar, in logical points. It tracks the
-# toolbar's control order — Me / Agents / separator / back / forward / reload /
-# new tab / **credentials** — so a control inserted before it moves this. The
-# mode toggle at 65,11 that takeover_test.py clicks is the same kind of
-# constant.
-CREDENTIALS_BUTTON = ("239", "11")
+# The key-glyph button in the toolbar, looked up by name rather than
+# hardcoded. It used to be a coordinate that tracked the toolbar's control
+# order — Me / Agents / separator / back / forward / reload / new tab /
+# separator / history / bookmark-star / bookmarks / downloads / settings /
+# **credentials** — so every plan that inserted a control ahead of it moved
+# the constant, and every one of those moves was discovered as a red suite
+# (239 -> 283 -> 341 -> 370 -> 399, four times in Phase 3 alone). The shell
+# now reports the rect it actually laid the button out at, so the next
+# inserted button costs nothing here.
+CREDENTIALS_BUTTON = "toolbar.credentials"
 
 # Tab presses from the site field to the first stored row's delete button:
 # username, password, reveal, delete. The Save button sits between password and
@@ -75,7 +80,8 @@ def make_home():
 
 def start(home, config):
     return harness.start_shell("about:blank", rust_log="warn",
-                               HOME=home, XDG_CONFIG_HOME=config)
+                               HOME=home, XDG_CONFIG_HOME=config,
+                               TALARIA_TEST_HOOKS="1")
 
 
 def stop_shell(shell):
@@ -153,9 +159,10 @@ try:
         time.sleep(0.3)
 
     def open_panel():
-        focus()
-        key("mousemove", *CREDENTIALS_BUTTON, "click", "1")
-        time.sleep(1.5)
+        """Click the real toolbar button, at the rect the chrome reports for
+        it — still a genuine pointer click on the button this suite's
+        docstring claims to cover, just no longer at a guessed coordinate."""
+        harness.click_rect(CREDENTIALS_BUTTON, wid, X)
 
     assert read(SITE) == [], "the isolated home already had credentials in it"
 

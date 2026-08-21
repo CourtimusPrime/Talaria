@@ -63,6 +63,17 @@ pub struct Tab {
     /// first) the tab reports as loading. A `window.open()` with no URL never
     /// navigates, so this has to time out rather than wait forever.
     pub initial_blank_until: Option<Instant>,
+    /// Set when the load currently in flight on this tab was started by an
+    /// agent rather than by the human — today, by a `Command::Evaluate`
+    /// script that can navigate the tab by assigning `location.href`.
+    ///
+    /// Provenance, not permission. It exists because the human's browsing
+    /// history has to filter on who *caused* a load, not on who *owns* the
+    /// tab: an agent can act on one of the human's own tabs, and the page
+    /// that lands is not somewhere the human went. Cleared by the history
+    /// drain as it skips the row, so the human's next navigation on the same
+    /// tab is recorded normally.
+    pub load_started_by_agent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +155,10 @@ impl TabManager {
             location,
             location_dirty: false,
             initial_blank_until: adopted.then(|| Instant::now() + ADOPTED_BLANK_GRACE),
+            // A tab starts out carrying the human's own first load: `open`
+            // is reached from the address bar and from `open_for_user`, and
+            // an agent-owned tab is filtered out on its owner anyway.
+            load_started_by_agent: false,
         });
 
         // Either way the show/hide invariant is re-established, so the new

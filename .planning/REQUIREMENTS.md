@@ -23,6 +23,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
   published in `SECURITY.md` rather than carried as open rows, because "not yet
   scheduled" and "cannot currently be built" are different facts and only one of
   them is actionable.
+
 - **Deferred (v2)** — buildable, understood, and deliberately not in v1 scope.
 - **In Progress** — actually being worked on right now.
 
@@ -76,10 +77,10 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 
 ### Table-Stakes Browsing (BROWSE)
 
-- [ ] **BROWSE-01**: User has local browsing history (URL, title, timestamp) — *Should Have*
-- [ ] **BROWSE-02**: User can bookmark and revisit pages — *Should Have*
-- [ ] **BROWSE-03**: The address bar searches a **configurable** default engine when input isn't a URL — *Should Have* — **partial**: DuckDuckGo is hardcoded (`crates/talaria-shell/src/app.rs:853-869`)
-- [ ] **BROWSE-04**: Downloaded files appear in a downloads list the user can open — *Should Have*
+- [x] **BROWSE-01**: User has local browsing history (URL, title, timestamp) — *Should Have*
+- [x] **BROWSE-02**: User can bookmark and revisit pages — *Should Have*
+- [x] **BROWSE-03**: The address bar searches a **configurable** default engine when input isn't a URL — *Should Have* — **complete**. Phase 3 plan 03-03 replaced the hardcoded DuckDuckGo fallback: `resolve_location` now takes a `&SearchEngine` read from `config.json`, editable from the Settings panel, and a malformed config degrades to the default rather than panicking. The earlier note on this line ("DuckDuckGo is hardcoded at `app.rs:853-869`") described the pre-Phase-3 state and no longer holds.
+- [x] **BROWSE-04**: Downloaded files appear in a downloads list the user can open — *Should Have*
 
 ### Distributed Mode (DIST)
 
@@ -160,10 +161,10 @@ Deferred. Tracked but not in the current roadmap.
 | CRED-02 | Phase 2 | Complete |
 | CRED-03 | Phase 2 | Complete |
 | TEST-03 | Phase 2 | Complete |
-| BROWSE-01 | Phase 3 | Pending |
-| BROWSE-02 | Phase 3 | Pending |
-| BROWSE-03 | Phase 3 | Pending |
-| BROWSE-04 | Phase 3 | Pending |
+| BROWSE-01 | Phase 3 | Complete |
+| BROWSE-02 | Phase 3 | Complete |
+| BROWSE-03 | Phase 3 | Complete |
+| BROWSE-04 | Phase 3 | Complete |
 | AUTH-03 | Phase 4 | Pending |
 | AUTH-01 | Phase 4 | Pending |
 | AUTH-02 | Phase 4 | Pending |

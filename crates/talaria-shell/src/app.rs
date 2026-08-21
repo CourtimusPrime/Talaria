@@ -31,9 +31,13 @@ use talaria_protocol::{
     Command, Outcome, ResultPayload, TabInfo,
 };
 
+use crate::bookmarks::Bookmarks;
 use crate::control::AgentRequest;
-use crate::gui::{Gui, UiAction};
+use crate::downloads::Downloads;
+use crate::gui::{ChromePanel, Gui, UiAction};
+use crate::history::History;
 use crate::keyutils;
+use crate::settings::{SearchEngine, Settings};
 use crate::tabs::{TabManager, TabOwner, ViewMode};
 use crate::vault::Vault;
 
@@ -47,6 +51,35 @@ pub enum AppEvent {
     },
     SessionEnded { session_id: u64 },
     Agent(AgentRequest),
+    /// One download finished successfully, raised from the background thread
+    /// `download()` runs on so the main loop can record it.
+    ///
+    /// `path` is the path that was **actually written** — `create_unique`'s
+    /// return value, which carries a ` (1)` suffix whenever the requested
+    /// name collided — and `filename` is the name that was requested. They
+    /// are two different strings on purpose, and only the first may ever
+    /// reach the Downloads panel's Open button.
+    ///
+    /// `requested_by_agent` is provenance, not a filter. Pitfall 5 requires
+    /// the store to record *every* completed download regardless of who asked
+    /// for it — the opposite of history's Me-only filter, because a download
+    /// is about what landed on the human's filesystem, which matters whoever
+    /// caused it. That still holds, and nothing here drops a row.
+    ///
+    /// What `03-04` got wrong was dropping the fact as well as the filter.
+    /// The Downloads panel hangs a one-click handoff to the OS's default
+    /// application off each row, and an agent chose the bytes *and* the
+    /// extension that decides which application that is; the human pressing
+    /// the button is choosing with that fact or without it. It is a bool
+    /// rather than the requesting session's label because the label is a
+    /// string the agent wrote — see [`crate::downloads::DownloadEntry`].
+    DownloadCompleted {
+        path: String,
+        filename: String,
+        url: String,
+        bytes: u64,
+        requested_by_agent: bool,
+    },
 }
 
 /// A connected control-socket client: display label + its event channel.
@@ -68,9 +101,37 @@ pub struct Shared {
     pub window: Window,
     pub servo: Servo,
     pub window_rendering_context: Rc<WindowRenderingContext>,
+    /// The way back onto the main thread from work that is not on it.
+    ///
+    /// The third holder of an [`EventLoopProxy`] in this codebase, after
+    /// [`Waker`] (servo's own wake mechanism) and the control thread's
+    /// independently-created one — and the first that lives on `Shared`,
+    /// because until downloads there was nothing on `Shared` a background
+    /// thread needed to tell it about. `Shared` is `Rc`-based and therefore
+    /// not `Send`, so a spawned thread cannot touch any of it; cloning this
+    /// proxy *before* the spawn and sending an [`AppEvent`] back is the only
+    /// route, and `user_event` is the only place that route lands.
+    pub event_proxy: EventLoopProxy<AppEvent>,
     pub tabs: RefCell<TabManager>,
     pub sessions: RefCell<BTreeMap<u64, Session>>,
     pub vault: RefCell<Vault>,
+    /// The human's browsing history. Plaintext, Me-tab-only, and written one
+    /// line at a time — see [`crate::history`] for why it diverges from the
+    /// vault's whole-array shape.
+    pub history: RefCell<History>,
+    /// The pages the human chose to keep. A small whole-array store written
+    /// only when the star or a bookmark row's Trash button is pressed — see
+    /// [`crate::bookmarks`] for why every one of those writes is atomic.
+    pub bookmarks: RefCell<Bookmarks>,
+    /// The human's preferences — today, only the search engine the address
+    /// bar falls back to. Read at navigation time through a shared borrow,
+    /// never re-read from disk per keystroke; see [`crate::settings`].
+    pub settings: RefCell<Settings>,
+    /// Every download that completed, whoever asked for it. Appended from
+    /// `user_event`'s [`AppEvent::DownloadCompleted`] arm and from nowhere
+    /// else — see [`crate::downloads`] for why this store, unlike history,
+    /// has no owner filter.
+    pub downloads: RefCell<Downloads>,
     /// Bottom of the chrome strip, in logical points.
     pub toolbar_height: Cell<f32>,
     /// Last cursor position, physical pixels.
@@ -115,6 +176,36 @@ pub struct Shared {
     /// update or a whole popup, so the work is deferred to the loop instead
     /// (where the table is never contended) rather than discarded.
     pub pending_tab_work: RefCell<Vec<TabWork>>,
+    /// Completed navigations waiting to become history rows. Queued rather
+    /// than written where they are raised, because they are raised from
+    /// inside a servo delegate callback, where the tab table and the store
+    /// may both be momentarily borrowed — and a visit dropped there is a page
+    /// the user never learns their history missed. Drained by
+    /// `process_pending_history_writes()` on the event loop, which reads the
+    /// tab's URL and title fresh and applies the Me-only filter.
+    pub pending_history_writes: RefCell<Vec<HistoryWrite>>,
+}
+
+/// One completed navigation, deferred out of the delegate callback that saw it.
+///
+/// Only the tab id travels: the URL and the title are read at drain time, not
+/// captured here, so a page whose title arrived a moment after `Complete` is
+/// recorded with the title it actually ended up with.
+pub struct HistoryWrite {
+    pub tab_id: u64,
+}
+
+/// Wall-clock milliseconds since the unix epoch.
+///
+/// A clock reporting a time before the epoch yields 0 rather than an error:
+/// this is a timestamp on a history row, so a nonsensical one is a cosmetic
+/// problem and refusing to record the visit would be a worse answer to it.
+/// That is a degrade, not the genuine invariant `expect()` is reserved for.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// One unsolicited event, addressed to exactly one session.
@@ -270,6 +361,46 @@ impl Shared {
         // raises the events the second drain then delivers.
         self.process_pending_tab_work();
         self.process_pending_events();
+    }
+
+    /// Turn queued completed navigations into history rows.
+    ///
+    /// Runs on the event loop, so borrowing normally is safe here — and it is
+    /// the only place the store is written, which is what keeps file I/O out
+    /// of the delegate callback that raised the visit.
+    ///
+    /// Four things are silently skipped, all of them routine: a tab that was
+    /// closed between the callback and this drain, a tab an agent owns, a
+    /// load an agent started in one of the human's own tabs, and a tab still
+    /// sitting on the blank page.
+    ///
+    /// Borrows the tab table mutably rather than sharing it, because the
+    /// provenance flag [`belongs_in_history`] reads is taken as it is read —
+    /// see that function for why the read and the clear are one step.
+    pub fn process_pending_history_writes(&self) {
+        let writes: Vec<HistoryWrite> =
+            self.pending_history_writes.borrow_mut().drain(..).collect();
+        if writes.is_empty() {
+            return;
+        }
+        let mut tabs = self.tabs.borrow_mut();
+        let mut history = self.history.borrow_mut();
+        for write in writes {
+            let Some(tab) = tabs.get_mut(write.tab_id) else { continue };
+            // The whole of the filter, and it asks who *caused* this load
+            // rather than who owns the tab — the two are not the same
+            // question, and answering the second one let an agent write rows
+            // the human would read as their own.
+            if !belongs_in_history(&tab.owner, &mut tab.load_started_by_agent) {
+                continue;
+            }
+            let Some(url) = tab.webview.url() else { continue };
+            if url.as_str() == "about:blank" {
+                continue;
+            }
+            let title = tab.webview.page_title().unwrap_or_default();
+            history.append(url.to_string(), title, now_ms());
+        }
     }
 
     /// Drop in-flight entries that have completed or expired. Runs on the
@@ -736,9 +867,17 @@ impl ApplicationHandler<AppEvent> for App {
             window,
             servo,
             window_rendering_context,
+            // `waker` is the destructured `&Waker` from `App::Initial`,
+            // already in scope here; its proxy is cloned rather than moved
+            // because servo keeps the `Waker` itself.
+            event_proxy: waker.0.clone(),
             tabs: RefCell::new(TabManager::new()),
             sessions: RefCell::new(BTreeMap::new()),
             vault: RefCell::new(Vault::load()),
+            history: RefCell::new(History::load()),
+            bookmarks: RefCell::new(Bookmarks::load()),
+            settings: RefCell::new(Settings::load()),
+            downloads: RefCell::new(Downloads::load()),
             toolbar_height: Cell::new(0.0),
             last_cursor: Cell::new(None),
             webview_point: Cell::new(euclid::Point2D::zero()),
@@ -750,6 +889,7 @@ impl ApplicationHandler<AppEvent> for App {
             evaluating: RefCell::new(Vec::new()),
             pending_events: RefCell::new(Vec::new()),
             pending_tab_work: RefCell::new(Vec::new()),
+            pending_history_writes: RefCell::new(Vec::new()),
         });
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
@@ -760,6 +900,7 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(state) = self.state() {
             state.process_pending_captures();
             state.process_pending_evals();
+            state.process_pending_history_writes();
             set_wait(event_loop, state);
         }
     }
@@ -768,6 +909,7 @@ impl ApplicationHandler<AppEvent> for App {
         if let Some(state) = self.state() {
             state.process_pending_captures();
             state.process_pending_evals();
+            state.process_pending_history_writes();
             match event {
                 AppEvent::Wake => {},
                 AppEvent::SessionStarted { session_id, client, events } => {
@@ -783,6 +925,21 @@ impl ApplicationHandler<AppEvent> for App {
                 },
                 AppEvent::Agent(request) => {
                     execute_agent_command(state, request);
+                    state.window.request_redraw();
+                },
+                // The one arm raised from off the main thread. The store is
+                // touched here and only here, because `Shared` is `Rc`-based
+                // and the thread that learned about the download cannot hold
+                // any of it.
+                AppEvent::DownloadCompleted { path, filename, url, bytes, requested_by_agent } => {
+                    state.downloads.borrow_mut().append(
+                        path,
+                        filename,
+                        url,
+                        bytes,
+                        now_ms(),
+                        requested_by_agent,
+                    );
                     state.window.request_redraw();
                 },
             }
@@ -802,6 +959,7 @@ impl ApplicationHandler<AppEvent> for App {
         };
         state.process_pending_captures();
         state.process_pending_evals();
+        state.process_pending_history_writes();
 
         let over_toolbar = |state: &Shared| {
             state
@@ -810,13 +968,13 @@ impl ApplicationHandler<AppEvent> for App {
                 .is_none_or(|p| (p.y / state.window.scale_factor()) < state.toolbar_height.get() as f64)
         };
 
-        // When the chrome has replaced the page — the credentials panel, or a
-        // crashed tab's recovery page — the area below the toolbar belongs to
-        // egui, not to a webview. Without this, a click down there is
-        // forwarded to a page nobody can see and the panel's own buttons are
-        // unreachable by mouse.
+        // When the chrome has replaced the page — any panel, or a crashed
+        // tab's recovery page — the area below the toolbar belongs to egui,
+        // not to a webview. Without this, a click down there is forwarded to
+        // a page nobody can see and the panel's own buttons are unreachable
+        // by mouse.
         let chrome_replaces_page = |state: &Shared| {
-            GUI.with_borrow(|gui| gui.as_ref().is_some_and(|gui| gui.credentials_open()))
+            GUI.with_borrow(|gui| gui.as_ref().is_some_and(|gui| gui.panel_open()))
                 || state.tabs.borrow().displayed().is_some_and(|tab| tab.crashed)
         };
 
@@ -920,10 +1078,27 @@ fn set_wait(event_loop: &ActiveEventLoop, state: &Rc<Shared>) {
     event_loop.set_control_flow(flow);
 }
 
+/// The intent a panel's keyboard shortcut emits: show `panel`, or go back to
+/// the page when it is the one already showing.
+///
+/// Human-only surface, and deliberately so: every panel toggle is a keystroke
+/// or a toolbar button, never a command that arrives over the control socket.
+fn toggle_panel(panel: ChromePanel) -> UiAction {
+    let current = GUI.with_borrow(|gui| {
+        gui.as_ref().map_or(ChromePanel::None, |gui| gui.panel())
+    });
+    UiAction::SetPanel(match current == panel {
+        true => ChromePanel::None,
+        false => panel,
+    })
+}
+
 /// Standard browser keyboard shortcuts, intercepted before both egui and the
 /// page: Ctrl+L (focus URL bar), Ctrl+T (new tab), Ctrl+W (close tab),
 /// Ctrl+R / F5 (reload), Alt+Left / Alt+Right (back / forward),
-/// Ctrl+Tab / Ctrl+Shift+Tab (cycle tabs), Ctrl+K (credentials panel).
+/// Ctrl+Tab / Ctrl+Shift+Tab (cycle tabs), Ctrl+K (credentials panel),
+/// Ctrl+H (history panel), Ctrl+B (bookmarks panel), Ctrl+D (bookmark or
+/// un-bookmark the displayed page).
 /// Returns true when consumed.
 fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEvent) -> bool {
     use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamedKey};
@@ -944,14 +1119,27 @@ fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEven
                 state.window.request_redraw();
                 return true;
             },
-            "k" => {
-                // Human-only surface: the toggle is a keystroke and a toolbar
-                // button, never a command an agent can send.
-                let open = GUI.with_borrow(|gui| {
-                    gui.as_ref().is_some_and(|gui| gui.credentials_open())
-                });
-                Some(UiAction::SetCredentialsPanel(!open))
-            },
+            "k" => Some(toggle_panel(ChromePanel::Credentials)),
+            "h" => Some(toggle_panel(ChromePanel::History)),
+            "b" => Some(toggle_panel(ChromePanel::Bookmarks)),
+            "j" => Some(toggle_panel(ChromePanel::Downloads)),
+            // Scoped to the displayed page, so with no tab open there is
+            // nothing to bookmark and the key does nothing — the same shape
+            // Ctrl+W uses for the tab it would have closed.
+            "d" => state.tabs.borrow().displayed().map(|tab| {
+                let url = tab
+                    .webview
+                    .url()
+                    .map(|url| url.to_string())
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or_else(|| tab.location.clone());
+                let title = tab
+                    .webview
+                    .page_title()
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_else(|| url.clone());
+                UiAction::ToggleBookmark(url, title)
+            }),
             "t" => Some(UiAction::NewTab),
             "w" => state
                 .tabs
@@ -1073,7 +1261,12 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                 state.window.request_redraw();
             },
             UiAction::Go(input) => {
-                let url = resolve_location(&input);
+                // Cloned rather than held as a `Ref`: the arm below takes a
+                // mutable borrow of `tabs`, and a live immutable borrow of
+                // `settings` across it is a borrow-checker fight for nothing.
+                // A `SearchEngine` is two short strings.
+                let engine = state.settings.borrow().search_engine.clone();
+                let url = resolve_location(&input, &engine);
                 let mut tabs = state.tabs.borrow_mut();
                 if let Some(tab) = tabs.displayed_mut() {
                     tab.location = url.to_string();
@@ -1142,10 +1335,103 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                 }
                 state.window.request_redraw();
             },
-            UiAction::SetCredentialsPanel(open) => {
+            UiAction::SetPanel(panel) => {
                 GUI.with_borrow_mut(|gui| {
                     if let Some(gui) = gui.as_mut() {
-                        gui.set_credentials_panel(open);
+                        gui.set_panel(panel);
+                    }
+                });
+                state.window.request_redraw();
+            },
+            UiAction::ClearHistory => {
+                state.history.borrow_mut().clear();
+                state.window.request_redraw();
+            },
+            UiAction::ToggleBookmark(url, title) => {
+                // The whole of the toggle lives here, against the store the
+                // star drew from — never inside the egui closure that raised
+                // the intent. `Bookmarks::upsert` deliberately refuses to be
+                // the toggle itself: an add that silently overwrote would
+                // rewrite the title of a bookmark the user meant to remove.
+                let mut bookmarks = state.bookmarks.borrow_mut();
+                match bookmarks.is_bookmarked(&url) {
+                    true => {
+                        bookmarks.remove(&url);
+                    },
+                    false => bookmarks.upsert(url, title, now_ms()),
+                }
+                drop(bookmarks);
+                state.window.request_redraw();
+            },
+            UiAction::RemoveBookmark(url) => {
+                let removed = state.bookmarks.borrow_mut().remove(&url);
+                if !removed {
+                    // Not fatal, but the user just pressed a remove and
+                    // nothing went — say so rather than looking like it did.
+                    log::warn!("no bookmark for {url}");
+                }
+                state.window.request_redraw();
+            },
+            UiAction::SaveSearchEngine(engine) => {
+                // The panel's Save button is disabled until the template is
+                // valid, so nothing is re-checked here; `Settings::save`
+                // updates the running session whether or not the write lands.
+                log::info!("search engine set to {}", engine.name);
+                state.settings.borrow_mut().save(engine);
+                state.window.request_redraw();
+            },
+            // The one action in this function that starts an external
+            // process, and the only place in the codebase that does.
+            //
+            // T-03-04-01/T-03-04-02: `path` arrived here from the Downloads
+            // panel, which cloned it out of `DownloadEntry::path`, which was
+            // written by `AppEvent::DownloadCompleted`, which carried
+            // `create_unique`'s returned path — the file this shell actually
+            // wrote. No step in that chain re-derives it from the requested
+            // filename, and no step in it is reachable from the control
+            // socket: the whole chain is entered only by a human pressing a
+            // button in a human-only panel.
+            UiAction::OpenDownload(path) => {
+                match std::process::Command::new("xdg-open").arg(&path).spawn() {
+                    // Deliberately not waited on. The handler is a whole
+                    // application (a PDF viewer, a file manager) whose
+                    // lifetime is nothing to do with this event loop, and
+                    // blocking here would freeze the browser behind it.
+                    Ok(_) => {},
+                    Err(error) => {
+                        // The name to apologise with, taken from the path we
+                        // tried rather than from the entry's requested
+                        // filename — this reports what was actually attempted.
+                        let filename = std::path::Path::new(&path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone());
+                        log::warn!("could not open {path}: {error}");
+                        GUI.with_borrow_mut(|gui| {
+                            if let Some(gui) = gui.as_mut() {
+                                gui.set_download_open_error(filename, error.to_string());
+                            }
+                        });
+                    },
+                }
+                state.window.request_redraw();
+            },
+            UiAction::RemoveDownload(path) => {
+                // A list row, never the file: `Downloads::remove` touches
+                // nothing on disk, which is what the row's hover text
+                // promises.
+                let removed = state.downloads.borrow_mut().remove(&path);
+                if !removed {
+                    // Not fatal, but the user just pressed a remove and
+                    // nothing went — say so rather than looking like it did.
+                    log::warn!("no downloads entry for {path}");
+                }
+                state.window.request_redraw();
+            },
+            UiAction::DismissDownloadError => {
+                GUI.with_borrow_mut(|gui| {
+                    if let Some(gui) = gui.as_mut() {
+                        gui.clear_download_open_error();
                     }
                 });
                 state.window.request_redraw();
@@ -1205,6 +1491,37 @@ fn parse_agent_url(input: &str) -> Result<Url, String> {
     }
 }
 
+/// The name a `download` command may write its file under.
+///
+/// Two separate jobs, which is why the refusals are worded separately. `/`
+/// and `..` keep the write inside the downloads directory — that half is
+/// unchanged and its message is unchanged with it. The character classes
+/// [`crate::gui::is_display_unsafe`] names are about something else
+/// entirely: the requested name is also the row's entire visible label in
+/// the Downloads panel, and a newline makes one row render as two while a
+/// bidi override makes `report.fdp.exe` render as `report.exe.pdf`. Neither
+/// is a path problem, so neither was caught by the two checks above, and a
+/// label an agent can make lie sits directly above a button that hands the
+/// file to the OS.
+///
+/// Refused here, at the boundary, so a name that could do it never reaches
+/// the store. The panel sanitizes as well, for rows a build without this
+/// check already wrote.
+fn validate_download_filename(filename: &str) -> Result<(), String> {
+    if filename.contains('/') || filename.contains("..") {
+        // Verbatim: this is the refusal `download_bounds_test.py` pins.
+        return Err("bad filename".into());
+    }
+    match filename.chars().find(|character| crate::gui::is_display_unsafe(*character)) {
+        Some(character) => Err(format!(
+            "bad filename: U+{:04X} would let the name misrepresent itself in the \
+             downloads list",
+            character as u32
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Omnibox behavior: URL if it parses (or looks like a host), search query
 /// otherwise.
 ///
@@ -1212,7 +1529,12 @@ fn parse_agent_url(input: &str) -> Result<Url, String> {
 /// so the host test alone would send both to the search engine. The human is
 /// the trust root here: unlike `parse_agent_url`, this path allowlists
 /// nothing — a user who types a local path gets the local file.
-pub fn resolve_location(input: &str) -> Url {
+///
+/// The search engine is a parameter rather than a hardcoded literal as of
+/// BROWSE-03; it affects only the final fallback, never any of the
+/// URL-detection branches above it. Passing [`SearchEngine::default`] gives
+/// exactly the behaviour this function had before that parameter existed.
+pub fn resolve_location(input: &str, engine: &SearchEngine) -> Url {
     let input = input.trim();
     if let Ok(url) = Url::parse(input) {
         if !url.scheme().is_empty() && url.host().is_some()
@@ -1229,9 +1551,36 @@ pub fn resolve_location(input: &str) -> Url {
     }
     let query: String =
         url::form_urlencoded::byte_serialize(input.as_bytes()).collect();
-    Url::parse(&format!("https://duckduckgo.com/?q={query}")).expect("static url")
+    // `replacen(.., 1)` substitutes the first placeholder only, which is why
+    // `settings::is_valid_template` insists on exactly one. The fallback
+    // below is the second layer of that same defense: a template that never
+    // passed through `Settings::load`'s validation — built in code, or
+    // hand-edited into a file this process already had open — must degrade to
+    // a working search rather than take the navigation down with it.
+    let resolved = engine.url_template.replacen("{query}", &query, 1);
+    Url::parse(&resolved).unwrap_or_else(|_| {
+        log::warn!("search template {:?} does not parse; searching DuckDuckGo", engine.url_template);
+        Url::parse(&format!("https://duckduckgo.com/?q={query}")).expect("static url")
+    })
 }
 
+
+/// Whether one completed load belongs in the human's browsing history — and,
+/// in the same step, the taking of the provenance flag that decided it.
+///
+/// Owning the tab is necessary but not sufficient. An agent's `evaluate` can
+/// navigate one of the human's own tabs by assigning `location.href`, and the
+/// page that lands is not a page the human went to; filtering on the owner
+/// alone let exactly that row through, indistinguishable from a real visit.
+///
+/// The flag is cleared here rather than at the next navigation so that a
+/// human-initiated load on the same tab afterwards *is* recorded. That makes
+/// the failure direction "miss a row" — never "forge one", which is the
+/// direction that matters for a record a person reasons about.
+fn belongs_in_history(owner: &TabOwner, load_started_by_agent: &mut bool) -> bool {
+    let started_by_agent = std::mem::replace(load_started_by_agent, false);
+    matches!(owner, TabOwner::Me) && !started_by_agent
+}
 
 /// Agent-facing snapshot of one tab.
 fn tab_info(tabs: &TabManager, tab: &crate::tabs::Tab) -> TabInfo {
@@ -1323,6 +1672,29 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
         },
         Command::Navigate { tab_id, url } => {
+            // Refused before the URL is even looked at, because this is the
+            // boundary rather than a detail of it: an agent may drive the
+            // tabs it opened, and navigating one of the human's own tabs out
+            // from under them is a hijack, not a feature. `tabs_open` gives
+            // an agent a tab it owns, which is the whole of its legitimate
+            // need. Deliberately narrower than `Command::TabsClose`, which
+            // permits acting on a tab the requester does not own and says so
+            // in its own comment — that decision stands and this one does not
+            // touch it.
+            let is_the_humans_tab = state
+                .tabs
+                .borrow()
+                .get(tab_id)
+                .is_some_and(|tab| matches!(tab.owner, TabOwner::Me));
+            if is_the_humans_tab {
+                let _ = reply.send(Outcome::Error {
+                    message: format!(
+                        "tab {tab_id} is one of the human's own — agents may only \
+                         navigate tabs they opened with tabs_open"
+                    ),
+                });
+                return;
+            }
             match (webview_for(tab_id), parse_agent_url(&url)) {
                 (Ok(webview), Ok(url)) => {
                     if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
@@ -1385,6 +1757,18 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             }
             match webview_for(tab_id) {
                 Ok(webview) => {
+                    // Provenance, not permission — the script is allowed to
+                    // run, including on one of the human's own tabs, because
+                    // takeover works in both directions. What it may not do
+                    // is have `location.href = ...` filed as a page the human
+                    // visited, so the load it may be about to start is marked
+                    // here and the history drain reads that mark. This is the
+                    // live case: `Command::Navigate` above refuses a Me tab
+                    // outright, and every other agent command is incapable of
+                    // navigating one.
+                    if let Some(tab) = state.tabs.borrow_mut().get_mut(tab_id) {
+                        tab.load_started_by_agent = true;
+                    }
                     // Only after the lookup succeeds: a request naming a tab
                     // that does not exist must leave no entry behind.
                     let done = state.begin_evaluating(tab_id);
@@ -1444,7 +1828,11 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             let _ = reply.send(Outcome::Ok { result: ResultPayload::Credentials { entries } });
         },
         Command::OpenForUser { url } => {
-            let url = resolve_location(&url);
+            // `OpenForUser` is the single-instance forward — a second launch
+            // handing this one the URL a *human* typed on a command line, so
+            // it resolves through the human path with the human's own engine.
+            let engine = state.settings.borrow().search_engine.clone();
+            let url = resolve_location(&url, &engine);
             let id = state.open_tab(url, TabOwner::Me);
             {
                 let mut tabs = state.tabs.borrow_mut();
@@ -1457,16 +1845,80 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
             state.reply_after_load(id, false, reply);
         },
         Command::Download { url, filename } => {
-            if filename.contains('/') || filename.contains("..") {
-                let _ = reply.send(Outcome::Error { message: "bad filename".into() });
+            if let Err(message) = validate_download_filename(&filename) {
+                let _ = reply.send(Outcome::Error { message });
                 return;
             }
+            // Cloned out here, before the spawn: `state` is an `Rc<Shared>`
+            // and `Rc` is not `Send`, so the closure below can never borrow
+            // it. The proxy is the whole of what crosses the thread boundary.
+            let proxy = state.event_proxy.clone();
             std::thread::spawn(move || {
                 // `reply` doubles as the cancellation handle: `download` polls
                 // its closed state, which becomes true the moment the control
                 // socket's command timeout drops the receiving half.
                 let outcome = download(&url, &filename, &reply);
+                // Matched by reference so `outcome` is still intact for the
+                // reply below. Gated on `Outcome::Ok` specifically: a download
+                // that was capped, cancelled, timed out or failed to connect
+                // took an `Outcome::Error` path, left nothing at the
+                // destination, and must produce no list row claiming it did.
+                //
+                // `path` here is `create_unique`'s returned path — the file
+                // that was actually written, which is not `filename` whenever
+                // a name collided. Nothing downstream re-derives it.
+                if let Outcome::Ok { result: ResultPayload::Download { path, bytes } } = &outcome {
+                    // A closed receiver means the event loop is already gone,
+                    // which is shutdown rather than an error worth reporting
+                    // from a background thread — the same convention
+                    // `control.rs`'s own `send_event` call sites use.
+                    let _ = proxy.send_event(AppEvent::DownloadCompleted {
+                        path: path.clone(),
+                        filename: filename.clone(),
+                        url: url.clone(),
+                        bytes: *bytes,
+                        // This function *is* the agent path — every command
+                        // reaching it arrived on the control socket. A
+                        // human-initiated download, if one is ever added,
+                        // raises the same event with `false`, which is why
+                        // the event carries the fact rather than inferring it
+                        // from where it was raised.
+                        requested_by_agent: true,
+                    });
+                }
                 let _ = reply.send(outcome);
+            });
+        },
+        Command::ChromeRects => {
+            // Test hook: lets the e2e suites click a real chrome widget by
+            // name instead of hardcoding a coordinate that moves every time
+            // the toolbar gains a button. Gated at the point of use on the
+            // same variable the `evaluate` crash hook checks.
+            //
+            // Refused as an unrecognised command rather than as a forbidden
+            // one, because that is what it is outside a test run — a build
+            // without the hook has nothing to answer with. Serde's own
+            // unknown-variant text is not reproduced verbatim (it would go
+            // stale the moment a command is added, and it names every command
+            // that does exist); what matters is that the refusal says nothing
+            // about a feature being withheld. See `Command::ChromeRects` for
+            // why chrome geometry is not an agent's to read.
+            if std::env::var("TALARIA_TEST_HOOKS").as_deref() != Ok("1") {
+                let _ = reply.send(Outcome::Error { message: "unknown command".into() });
+                return;
+            }
+            // The last frame that was drawn, which is the only frame whose
+            // layout exists. The caller in `user_event` asks for a redraw as
+            // soon as this returns, so a client that polls gets a fresh
+            // answer on its next read.
+            let rects = GUI.with_borrow(|gui| {
+                gui.as_ref().map(|gui| gui.chrome_rects().to_vec()).unwrap_or_default()
+            });
+            let _ = reply.send(Outcome::Ok {
+                result: ResultPayload::ChromeRects {
+                    rects,
+                    scale: state.window.scale_factor(),
+                },
             });
         },
     }
@@ -1732,6 +2184,28 @@ fn abandon_download(
     Outcome::Error { message }
 }
 
+/// Where a download is allowed to land.
+///
+/// `dirs::download_dir()` returns `None` whenever XDG user directories are not
+/// configured — a headless server, a container, a minimal install, a CI job:
+/// which is to say, exactly the environments this browser is most often run in.
+/// The previous fallback was the process's current working directory, so an
+/// agent that chooses a filename also chose to write it into whatever directory
+/// the user happened to launch Talaria from. That is a poor place to put a file
+/// nobody asked for and a worse one to put a file an agent named.
+///
+/// So: the configured directory, else `~/Downloads` if it already exists, else
+/// nothing — and the caller refuses rather than inventing a location. This does
+/// not create `~/Downloads`; a browser silently creating directories in a home
+/// it was not asked to touch is its own surprise.
+fn downloads_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = dirs::download_dir() {
+        return Some(dir);
+    }
+    let fallback = dirs::home_dir()?.join("Downloads");
+    fallback.is_dir().then_some(fallback)
+}
+
 /// Fetch `url` into the user's downloads directory under `filename`: bounded in
 /// bytes, bounded in time, never clobbering an existing file, and abandoned the
 /// moment nobody is waiting for the result. `reply` is borrowed purely as a
@@ -1743,7 +2217,14 @@ fn download(
     filename: &str,
     reply: &tokio::sync::oneshot::Sender<Outcome>,
 ) -> Outcome {
-    let dir = dirs::download_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = match downloads_dir() {
+        Some(dir) => dir,
+        None => {
+            return Outcome::Error {
+                message: "no downloads directory: set XDG_DOWNLOAD_DIR or create ~/Downloads".into(),
+            };
+        },
+    };
     let max_bytes = max_download_bytes();
     let timeout = download_timeout();
     // A bare `ureq::get` has no timeouts at all, so a server that accepts and
@@ -1910,6 +2391,17 @@ impl servo::WebViewDelegate for Shared {
                 // answering when the page actually finished.
                 Err(_) => log::error!("load-status mark lost for tab {tab_id}: pending_loads busy"),
             }
+            // History capture is deliberately independent of the queue above:
+            // a page the human opened from the URL bar has no pending_loads
+            // entry at all, and it is still a visit. Gated on Complete rather
+            // than on the URL changing, so a page that never finished loading
+            // does not enter the record as though it had.
+            if matches!(status, servo::LoadStatus::Complete) {
+                match self.pending_history_writes.try_borrow_mut() {
+                    Ok(mut pending) => pending.push(HistoryWrite { tab_id }),
+                    Err(_) => log::error!("history write lost for tab {tab_id}: queue busy"),
+                }
+            }
         }
         // Wakes the loop so pending loads get serviced; also refreshes the
         // spinner.
@@ -1998,6 +2490,213 @@ impl embedder_traits::EventLoopWaker for Waker {
 
     fn wake(&self) {
         let _ = self.0.send_event(AppEvent::Wake);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An engine that is not the default, so "did the parameter reach the
+    /// fallback" is answerable without reading DuckDuckGo out of a URL.
+    fn custom() -> SearchEngine {
+        SearchEngine {
+            name: "Example".to_owned(),
+            url_template: "https://example.com/search?q={query}&lang=en".to_owned(),
+        }
+    }
+
+    /// The zero-regression guard. Whatever else this function grows, the
+    /// default engine must keep producing exactly the URL the hardcoded
+    /// literal produced before BROWSE-03 existed.
+    /// The whole point of `downloads_dir`: it may decline to name a
+    /// directory, but it must never name a relative one. The previous
+    /// behaviour resolved to `"."`, which put an agent-named file in whatever
+    /// directory Talaria was launched from.
+    #[test]
+    fn the_downloads_directory_is_never_relative() {
+        if let Some(dir) = downloads_dir() {
+            assert!(
+                dir.is_absolute(),
+                "downloads_dir returned the relative path {}",
+                dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_engine_reproduces_the_old_hardcoded_search_url() {
+        let url = resolve_location("hello world", &SearchEngine::default());
+        assert_eq!(url.as_str(), "https://duckduckgo.com/?q=hello+world");
+    }
+
+    #[test]
+    fn a_configured_engine_is_what_a_search_actually_uses() {
+        let url = resolve_location("hello world", &custom());
+        assert_eq!(url.as_str(), "https://example.com/search?q=hello+world&lang=en");
+    }
+
+    /// The engine parameter touches the fallback and nothing above it: every
+    /// URL-shaped input resolves identically no matter which engine is
+    /// passed. This is the guard against a future edit sliding the engine up
+    /// into one of the URL-detection branches.
+    #[test]
+    fn url_shaped_input_is_unaffected_by_the_engine() {
+        for input in [
+            "https://example.org/path",
+            "example.org",
+            "about:blank",
+            "file:///tmp/page.html",
+            "  https://example.org/  ",
+        ] {
+            let with_default = resolve_location(input, &SearchEngine::default());
+            let with_custom = resolve_location(input, &custom());
+            assert_eq!(
+                with_default, with_custom,
+                "{input:?} resolved differently depending on the search engine"
+            );
+            assert!(
+                !with_default.as_str().contains("example.com/search"),
+                "{input:?} was treated as a search query"
+            );
+        }
+    }
+
+    /// Defense in depth, one layer below `Settings::load`'s own validation: a
+    /// `SearchEngine` built in code (a test, a future caller) can carry a
+    /// template that never reaches the load-time check, and this function
+    /// must degrade rather than panic on any of them.
+    #[test]
+    fn a_malformed_template_still_yields_a_url_rather_than_a_panic() {
+        for template in [
+            // No placeholder: nothing to substitute.
+            "https://example.com/search",
+            // Two placeholders: `replacen(.., 1)` leaves the second behind.
+            "https://example.com/{query}?q={query}",
+            // Not a URL at all once substituted.
+            "not a url {query}",
+            "",
+        ] {
+            let engine = SearchEngine {
+                name: "Broken".to_owned(),
+                url_template: template.to_owned(),
+            };
+            let url = resolve_location("hello world", &engine);
+            assert!(
+                !url.as_str().is_empty(),
+                "template {template:?} produced no usable url"
+            );
+        }
+    }
+
+    /// `data:` in the human's address bar is *deliberately* a search, not a
+    /// navigation, and this test exists so that stays a decision rather than
+    /// an accident.
+    ///
+    /// `parse_agent_url` admits `data:`; this path does not, and the
+    /// asymmetry runs the right way. "The human typed it, so trust it" is
+    /// weakest exactly here: the paste-this-into-your-address-bar attack
+    /// makes the human a courier for someone else's payload, which is why
+    /// this function's own doc comment calls the human the trust *root*
+    /// rather than the trust *source*. An agent, by contrast, builds its own
+    /// `data:` URLs, and SEC-01 hardened that path on its own terms. Widening
+    /// this one to match would be a trust-model change with no requirement
+    /// asking for it — see `03-03-SUMMARY.md`.
+    #[test]
+    fn a_data_url_is_searched_for_rather_than_opened() {
+        let url = resolve_location("data:text/html,<h1>hi</h1>", &SearchEngine::default());
+        assert_eq!(url.scheme(), "https", "a data: url was navigated to from the address bar");
+        assert!(url.as_str().starts_with("https://duckduckgo.com/?q="));
+    }
+
+    /// CR-02's exact shape, in the one function that decides it. An agent
+    /// reaching one of the human's own tabs — through `evaluate`, the only
+    /// command that still can — must not put a row in front of the human
+    /// that reads as somewhere they went. The second half is the half that
+    /// keeps the failure direction right: the very next load on that same
+    /// tab is the human's again, and it is recorded.
+    #[test]
+    fn an_agent_caused_load_on_a_me_tab_is_skipped_and_the_next_human_one_is_recorded() {
+        let mut load_started_by_agent = true;
+
+        assert!(
+            !belongs_in_history(&TabOwner::Me, &mut load_started_by_agent),
+            "an agent-caused load on the human's own tab reached their history",
+        );
+        assert!(
+            !load_started_by_agent,
+            "the mark outlived the load that set it, so the human's next visit is lost too",
+        );
+        assert!(
+            belongs_in_history(&TabOwner::Me, &mut load_started_by_agent),
+            "a human navigation after an agent-caused one was not recorded",
+        );
+    }
+
+    /// The original owner filter, still doing its own job: an agent's own tab
+    /// is out regardless of what marked it.
+    #[test]
+    fn an_agent_owned_tab_is_out_however_its_load_started() {
+        let owner = TabOwner::Agent { session_id: 7, client: "some-agent".to_owned() };
+        for mut load_started_by_agent in [false, true] {
+            assert!(!belongs_in_history(&owner, &mut load_started_by_agent));
+        }
+    }
+
+    /// The ordinary case, asserted so the two above cannot pass by refusing
+    /// everything.
+    #[test]
+    fn an_unmarked_load_on_a_me_tab_is_recorded() {
+        let mut load_started_by_agent = false;
+        assert!(belongs_in_history(&TabOwner::Me, &mut load_started_by_agent));
+    }
+
+    /// The refusal `download_bounds_test.py` already pins, kept verbatim so
+    /// the two checks below cannot be added by changing it.
+    #[test]
+    fn a_filename_that_is_a_path_is_still_refused_with_the_same_message() {
+        assert_eq!(validate_download_filename("../escape.bin"), Err("bad filename".into()));
+        assert_eq!(validate_download_filename("sub/escape.bin"), Err("bad filename".into()));
+    }
+
+    /// CR-04(c). A newline is not a path problem, so neither of the two
+    /// checks above sees it — and the requested name is the row's entire
+    /// visible label, so a name with one in it renders as two lines and the
+    /// second reads as copy rather than as a filename.
+    #[test]
+    fn a_filename_carrying_a_newline_is_refused_at_the_command_boundary() {
+        let refusal = validate_download_filename("invoice.pdf\n\nSafe — from your bank");
+        assert!(refusal.is_err(), "a filename that renders as two rows was accepted");
+        let message = refusal.unwrap_err();
+        assert!(message.starts_with("bad filename"), "{message}");
+        assert!(message.contains("U+000A"), "the refusal did not name the character: {message}");
+    }
+
+    /// The other half: a right-to-left override reorders what follows it, so
+    /// the extension the human reads is not the extension `xdg-open` will
+    /// dispatch on. Every character here is printable, so a control-character
+    /// check alone would let it through.
+    #[test]
+    fn a_filename_carrying_a_bidi_override_is_refused_at_the_command_boundary() {
+        for name in [
+            "report\u{202E}fdp.exe",
+            "report\u{202A}.pdf",
+            "report\u{2066}.pdf",
+            "report\u{2069}.pdf",
+        ] {
+            let refusal = validate_download_filename(name);
+            assert!(refusal.is_err(), "a bidi override survived to the store: {name:?}");
+            assert!(refusal.unwrap_err().starts_with("bad filename"));
+        }
+    }
+
+    /// And the names that must keep working, including the one shape
+    /// `create_unique` produces on a collision.
+    #[test]
+    fn an_ordinary_filename_is_accepted() {
+        for name in ["report.pdf", "report (1).pdf", "\u{65E5}\u{672C}\u{8A9E}.txt", "a b c.bin"] {
+            assert_eq!(validate_download_filename(name), Ok(()), "{name:?} was refused");
+        }
     }
 }
 

@@ -164,6 +164,17 @@ pub async fn dispatch(
             text_result(&json!({ "path": path, "bytes": bytes }))
         },
         ResultPayload::Empty {} => text_result(&json!({ "ok": true })),
+        // Every payload a tool above can actually produce is named. The
+        // payload enum is shared with the control socket, which carries
+        // replies to commands this surface deliberately has no tool for, so
+        // the arm has to exist to type-check — and it errors rather than
+        // answering `{"ok": true}`, because a payload arriving here means
+        // either a tool was added without a case or something answered a tool
+        // it should never have been reachable from. Both are worth a loud
+        // failure rather than a cheerful lie.
+        _ => Err(CallToolError::from_message(
+            "the shell answered with a result this tool does not understand".to_owned(),
+        ))?,
     })
 }
 

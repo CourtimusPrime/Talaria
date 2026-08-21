@@ -43,7 +43,7 @@ their detail below; they are simply not v1.
 
 - [x] **Phase 1: Foundation & Core Engine** — Servo rendering, egui shell, live agent takeover, a fast MCP tool surface, credential vault, and an Xvfb e2e harness. **Complete.**
 - [x] **Phase 2: Harden the Agent Surface** — Close the audit's open gaps: scheme allowlist, `evaluate` wedging and the serializing mutex, control-socket peer auth, bounded downloads, real MCP notifications, a usable vault, and CI.
-- [ ] **Phase 3: Table-Stakes Browsing** *(v1)* — History, bookmarks, configurable search, and a downloads UI, so Talaria works as a real daily driver.
+- [x] **Phase 3: Table-Stakes Browsing** *(v1)* — History, bookmarks, configurable search, and a downloads UI, so Talaria works as a real daily driver. (completed 2026-08-20)
 - [ ] **Phase 4: Authenticated Remote Transport** *(v2)* — An HTTP/SSE MCP transport plus the OAuth 2.1 authorization server that becomes possible once it exists.
 - [ ] **Phase 5: Distributed Mode** *(v2)* — Client and server split across machines over Tailscale, with remote live-viewing and takeover.
 - [ ] **Phase 6: Platform Coverage** *(v2)* — Confirm macOS, then Windows.
@@ -116,14 +116,14 @@ Plans:
   3. Typing a non-URL into the address bar searches the user's configured engine, not a hardcoded one
   4. A completed download appears in a downloads list and can be opened from it
 
-**Plans**: TBD
+**Plans**: 4/4 plans executed
 
 Plans:
 
-- [ ] 03-01: Local history store + UI
-- [ ] 03-02: Bookmarks (flat list) + UI
-- [ ] 03-03: Configurable default search engine, replacing the hardcoded DuckDuckGo fallback
-- [ ] 03-04: Downloads list UI, wired to the `download` tool's storage
+- [x] 03-01-PLAN.md — Local history store (JSONL append-log) + capture queue + ChromePanel/History UI (wave 1)
+- [x] 03-02-PLAN.md — Bookmarks store (flat list) + toggle + Bookmarks UI (wave 2)
+- [x] 03-03-PLAN.md — Configurable search engine (settings.rs) replacing the hardcoded DuckDuckGo fallback + Settings UI (wave 3)
+- [x] 03-04-PLAN.md — Downloads store + EventLoopProxy plumbing + Downloads UI, wired to the `download` tool's storage (wave 4)
 
 ### Phase 4: Authenticated Remote Transport *(v2)*
 
@@ -212,7 +212,7 @@ Phases execute in numeric order: 1 → 2 → 3 (**ship v1**) → 4 → 5 → 6 �
 |-------|----------------|--------|-----------|
 | 1. Foundation & Core Engine | — | ✅ Complete | 2026-08-15 |
 | 2. Harden the Agent Surface | 11/11 | ✅ Complete | 2026-08-17 |
-| 3. Table-Stakes Browsing | 0/4 | Not started | - |
+| 3. Table-Stakes Browsing | 4/4 | Complete    | 2026-08-20 |
 | 4. Authenticated Remote Transport | 0/3 | Not started | - |
 | 5. Distributed Mode | 0/4 | Not started | - |
 | 6. Platform Coverage | 0/2 | Not started | - |

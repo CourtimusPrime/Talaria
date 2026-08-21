@@ -2,18 +2,18 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 03
-current_phase_name: table-stakes-browsing
-status: ready-to-plan
-stopped_at: Phase 02 complete; Phase 03 not started
-last_updated: "2026-08-17T10:30:00.000Z"
-last_activity: 2026-08-17
-last_activity_desc: Phase 02 closed - CI green on a self-hosted runner, 14/14 e2e
+current_phase: 4
+current_phase_name: v2
+status: planning
+stopped_at: Completed 03-04-PLAN.md — Phase 3 complete
+last_updated: "2026-08-20T16:47:21.523Z"
+last_activity: 2026-08-20
+last_activity_desc: Phase 03 complete, transitioned to Phase 4
 progress:
-  total_phases: 7
+  total_phases: 2
   completed_phases: 2
   total_plans: 15
-  completed_plans: 11
+  completed_plans: 15
 ---
 
 # Project State
@@ -23,23 +23,38 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-15)
 
 **Core value:** An agent can drive a real, already-logged-in browsing session, and a human can take over instantly the moment it hits something only a human can clear.
-**Current focus:** Phase 03 — table-stakes-browsing (the last v1 phase)
+**Current focus:** Phase 03 — table-stakes-browsing
 
 ## Current Position
 
-Phase: 02 (harden-the-agent-surface) — COMPLETE
-Plan: 11 of 11
-Status: Complete and verified. Next: Phase 03 (table-stakes browsing), the last v1 phase.
-Last activity: 2026-08-17 — Phase 02 closed; CI and e2e both green on the self-hosted runner
+Phase: 4 — Authenticated Remote Transport *(v2)*
+Plan: Not started
+Status: Ready to plan
+Next: /gsd-verify-work 3, then close the phase. **v1 (Phases 1-3) is feature-complete.**
 
-v1 (Phases 1-3): [███████░░░] 2 of 3 phases complete
-All phases (1-7): [███░░░░░░░] 2 of 7 complete
+All four plans landed sequentially, each depending on the previous, because every one of
+them touches app.rs and gui.rs. BROWSE-01 through BROWSE-04 are all delivered; the e2e
+suite is at 18/18 and `cargo test` at 83.
+
+Planned without a CONTEXT.md — /gsd-discuss-phase was not run, so the design decisions it
+would have locked were resolved by 03-RESEARCH.md and 03-UI-SPEC.md instead, each recording
+its discretionary calls explicitly.
+
+Three documentation debts are queued for the phase close, listed at the end of
+03-04-SUMMARY.md: CLAUDE.md's "no config file format" claim (false since 03-03), CLAUDE.md's
+component table missing the four Phase 3 stores and Shared::event_proxy, and CHANGELOG.md
+missing BROWSE-01/02/03 entries (BROWSE-04's is written).
+
+Last activity: 2026-08-20 — Phase 03 complete, transitioned to Phase 4
+
+v1 (Phases 1-3): [██████████] 3 of 3 phases complete
+All phases (1-7): [████░░░░░░] 3 of 7 complete
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 0 (Phase 1 predates GSD tracking — see `OVERNIGHT_LOG.md`)
+- Total plans completed: 4 (Phase 1 predates GSD tracking — see `OVERNIGHT_LOG.md`)
 - Average duration: —
 - Total execution time: —
 
@@ -48,6 +63,7 @@ All phases (1-7): [███░░░░░░░] 2 of 7 complete
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 | — | — | — |
+| 03 | 4 | - | - |
 
 **Recent Trend:**
 
@@ -70,6 +86,10 @@ All phases (1-7): [███░░░░░░░] 2 of 7 complete
 | Phase 02 P09 | 33m | 3 tasks | 3 files |
 | Phase 02 P10 | 50m | 3 tasks | 5 files |
 | Phase 02 P11 | 45m | 4 tasks | 8 files |
+| Phase 03 P01 | 34 min | 3 tasks | 8 files |
+| Phase 03 P02 | 22 min | 3 tasks | 7 files |
+| Phase 03 P03 | 25 min | 3 tasks | 5 files |
+| Phase 03 P04 | 32 min | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -114,6 +134,17 @@ Recent decisions affecting current work:
 - [Phase ?]: 02-11: #[allow] on a macro invocation is silently ignored (rustc unused_attributes), so the enum_variant_names allow for tool_box! had to be module-scoped
 - [Phase ?]: 02-11: CI builds --locked so an ordinary push never re-resolves; re-resolution is the scheduled lockfile-audit job's exclusive business
 - [Phase ?]: 02-11: TEST-03 stays In Progress — both workflows are config-only and have never executed, because this repository has no git remote
+- [Phase ?]: Bookmarks::upsert refuses to be the toggle (add-if-absent, never overwrite); the add-or-remove decision lives only in apply_ui_actions
+- [Phase ?]: Every bookmarks mutation is an atomic whole-array write (.tmp sibling + fs::rename) — the shape downloads.rs and settings.rs should copy, not vault.rs's plain fs::write
+- [Phase ?]: vault_ui_test.py's CREDENTIALS_BUTTON moved 283 -> 341, measured from the button's own rect under Xvfb rather than guessed
+- [Phase ?]: A data: URL in the human address bar stays a search, not a navigation — the human/agent trust-root asymmetry is deliberate and now tested (03-03)
+- [Phase ?]: SearchEngine carries no id: exactly one engine is configured at a time, so {name, url_template} is the whole identity (03-03)
+- [Phase ?]: config.json is the project's first config file, crossing CLAUDE.md's stated no-config-file-format boundary deliberately (03-03)
+- [Phase ?]: 03-04: AppEvent::DownloadCompleted carries no owning-session field — the store records every download regardless of owner (Pitfall 5), so RESEARCH.md's drafted field would have had no reader
+- [Phase ?]: 03-04: downloads.rs calls nothing that deletes a file — it drops even bookmarks.rs's stale-staging cleanup — so remove() has no lever to grow into delete()
+- [Phase ?]: 03-04: Shared::event_proxy is the first EventLoopProxy on Shared and the sanctioned route from any background thread back onto the main loop; Rc-not-Send makes the discipline compiler-enforced
+- [Phase ?]: 03-04: UiAction::OpenDownload (xdg-open) has exactly one construction site and one consumer, both in chrome — the browser's only process spawn is unreachable from the MCP/control-socket surface
+- [Phase ?]: 03-04: vault_ui_test.py's CREDENTIALS_BUTTON moved 370 -> 399, measured at [[388.3 2.0] - [409.3 20.0]]; 03-03's ~29pt/button prediction confirmed exactly on the fourth move
 
 ### Pending Todos
 
@@ -127,15 +158,19 @@ None yet.
   serving nothing. CI works around it with `dbus-run-session`. **This is a real user-facing hang on
   any headless box, container, or SSH session**, and the real fix changes `vault.rs`. See
   `.planning/phases/02-harden-the-agent-surface/deferred-items.md`. Candidate v1 blocker.
+
 - **REL-02 has no chosen approach** — Tauri's updater plugin no longer applies to the egui shell.
   Phase 7, which is now v2. Does not block v1.
+
 - **Verification weight sits almost entirely in the Python e2e suite** — 14 Xvfb suites against 9
   Rust unit tests. TEST-04 (meaningful Rust unit coverage) remains deferred to v2.
+
 - ~~**`.overnight-lock` is advisory**~~ — RESOLVED by plan 02-01.
 - ~~**MCP-09 / MCP-10 half closed**~~ — RECLASSIFIED 2026-08-17. Neither is blocked on effort:
   MCP-09 needs navigation provenance designed (it conflicts with D-02's human-trust-root rule) and
   MCP-10 needs a SpiderMonkey interrupt libservo does not expose. Both are now published in
   `SECURITY.md` as known limitations rather than carried as open work.
+
 - ~~**Neither workflow has ever run — no git remote**~~ — RESOLVED 2026-08-17. Remote added, `main`
   pushed, `ci.yml` green (run `32019859735`), `e2e.yml` green 14/14 (run `32019859744`). The
   predicted hosted-runner risks were real: a 42 GB `target/` cannot enter a 10 GB `actions/cache`,
@@ -158,6 +193,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-17T10:30:00.000Z
-Stopped at: Phase 02 closed; Phase 03 ready to plan
+Last session: 2026-08-20T09:21:53.268Z
+Stopped at: Completed 03-04-PLAN.md — Phase 3 complete
 Resume file: None

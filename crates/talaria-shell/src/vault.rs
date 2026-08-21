@@ -425,7 +425,15 @@ impl Vault {
         }
         if let Err(error) = fs::write(&self.path, data) {
             log::warn!("could not write vault: {error}");
+            return;
         }
+        // The vault is encrypted, so this is defence in depth rather than the
+        // only thing standing between the file and a reader — but the mode was
+        // never set on this path at all, so the file landed at whatever the
+        // umask allowed, which on a default Linux install is world-readable.
+        // A ciphertext nobody else can read is still better than one they can
+        // copy at leisure and attack offline.
+        restrict_to_owner(&self.path);
     }
 
     /// Store `entry`, replacing the existing entry with the same URL host and
@@ -577,6 +585,38 @@ mod tests {
             import_notice: None,
             key_downgraded: false,
         }
+    }
+
+    /// The encrypted vault is the one file here that actually holds
+    /// credentials, and its write path set no mode at all until this test
+    /// existed — it landed at whatever the umask allowed, world-readable on a
+    /// default Linux install. Ciphertext or not, that is a file worth not
+    /// handing to every other account on the machine.
+    #[cfg(unix)]
+    #[test]
+    fn a_saved_vault_lands_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("talaria-vault-perm-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("vault.enc");
+        // Pre-create it world-readable, so a pass cannot come from a strict
+        // umask having done the job before `save` ran.
+        let _ = fs::write(&path, b"stale");
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+
+        let key = ChaCha20Poly1305::generate_key(&mut OsRng);
+        let mut vault = Vault {
+            path: path.clone(),
+            cipher: Some(ChaCha20Poly1305::new(&key)),
+            entries: vec![login("https://example.com/in", "person", "secret")],
+            import_notice: None,
+            key_downgraded: false,
+        };
+        vault.save();
+
+        let mode = fs::metadata(&path).expect("vault written").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "vault.enc is {:o}, not owner-only", mode & 0o777);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

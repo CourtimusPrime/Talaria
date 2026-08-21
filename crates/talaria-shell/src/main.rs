@@ -1,9 +1,14 @@
 //! Talaria — a lightweight, lightning-fast web browser for humans and agents.
 
 mod app;
+mod bookmarks;
 mod control;
+mod downloads;
 mod gui;
+mod history;
 mod keyutils;
+mod permissions;
+mod settings;
 mod tabs;
 mod vault;
 
@@ -25,9 +30,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .expect("install crypto provider");
 
     let input = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_URL.to_owned());
+    // The default engine, deliberately, not the configured one: this runs
+    // before the event loop and before any `Shared` exists, so there is no
+    // settings store to read, and loading `config.json` early just for this
+    // path would duplicate that logic for a best-effort fallback that only
+    // fires when the first argument is neither a URL nor a host. A launch
+    // that lands here searches DuckDuckGo; every subsequent navigation in the
+    // window uses whatever the human configured.
     let url = Url::parse(&input)
         .or_else(|_| Url::parse(&format!("https://{input}")))
-        .unwrap_or_else(|_| app::resolve_location(&input));
+        .unwrap_or_else(|_| app::resolve_location(&input, &settings::SearchEngine::default()));
 
     // Single instance: a running Talaria owns the control socket (and the
     // engine profile). Hand it the URL and exit rather than stealing the

@@ -15,7 +15,10 @@ What this pins down:
   intact — including when two requests for the same name are in flight;
 - a stalling server ends inside the command-timeout window, not after it,
   and leaves nothing behind;
-- a filename carrying a path separator is still refused.
+- a filename carrying a path separator is still refused, and so is one
+  carrying a newline or a Unicode bidi override — neither is a path problem,
+  and both would otherwise reach the Downloads panel, where the requested
+  name is the row's entire visible label above a one-click handoff to the OS.
 
 Standalone (starts its own Xvfb + shell): the cap is read from the shell
 process's environment, which the shared run_all.py shell does not carry.
@@ -192,6 +195,26 @@ try:
     r = dl("sub/escape.bin", "/small")
     assert r["outcome"] == "error" and r["message"] == "bad filename", r
     print("PATH SEPARATOR still refused")
+
+    # --- a name that could lie about itself in the panel ------------------
+    # CR-04(c). The requested filename is the Downloads row's whole visible
+    # label, and the row carries a button that hands the file to the OS's
+    # default application. A newline splits the row in two; a bidi override
+    # reorders the extension the human reads. Neither contains `/` or `..`,
+    # so both walked past the check above.
+    for name, what in [
+            ("invoice.pdf\n\nSafe \u2014 from your bank", "a newline"),
+            ("report\u202Efdp.exe", "a bidi override"),
+            ("tabbed\tname.bin", "a tab"),
+    ]:
+        r = dl(name, "/small")
+        assert r["outcome"] == "error", (what + " was accepted as a filename", r)
+        assert r["message"].startswith("bad filename"), r
+        print(f"LABEL-SAFE refused {what}:", r["message"])
+    # Nothing landed under any prefix of those names.
+    written = sorted(os.listdir(downloads))
+    assert not any(n.startswith(("invoice", "report", "tabbed")) for n in written), written
+    print("LABEL-SAFE left nothing behind —", len(written), "files in the directory")
 
     print("DOWNLOAD BOUNDS CHECKS PASSED")
 finally:
