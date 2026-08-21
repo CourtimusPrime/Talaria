@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 current_phase: 5
-current_phase_name: v2
-status: planning
-stopped_at: Completed 04-08-PLAN.md
+current_phase_name: distributed-mode
+status: ready-to-execute
+stopped_at: Phase 04 closed and verified; Phase 05 planned (11 plans, checker APPROVED)
 last_updated: "2026-08-21T04:56:15.056Z"
 last_activity: 2026-08-21
-last_activity_desc: Phase 04 complete, transitioned to Phase 5
+last_activity_desc: Phase 05 planned - 11 plans in 8 waves, plan-checker APPROVED at revision 3
 progress:
-  total_phases: 3
-  completed_phases: 3
+  total_phases: 8
+  completed_phases: 4
   total_plans: 23
   completed_plans: 23
 ---
@@ -23,56 +23,45 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-15)
 
 **Core value:** An agent can drive a real, already-logged-in browsing session, and a human can take over instantly the moment it hits something only a human can clear.
-**Current focus:** Phase 04 — authenticated-remote-transport-v2
+**Current focus:** Phase 05 — distributed-mode
 
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: Not started
-Status: Ready to plan
-Next: /gsd-verify-work 4 — all eight plans are executed, AUTH-01, AUTH-02 and AUTH-03 are met,
-and `run_all.py` is 22/22. **v1 (Phases 1-3) is feature-complete and Phase 3 is closed** —
-verification passed 42/42 with 0 behaviours unverified.
+Plan: 0 of 11 executed
+Status: Planned and verified — ready to execute
+Next: `/gsd-execute-phase 5`
 
-04-01 is done: the nine-tool MCP surface now lives in a `talaria_mcp` library crate and
-`dispatch` takes `&dyn CommandSink` instead of `&ShellConnection`, so Success Criterion 1 ("an
-HTTP client drives the same tool surface") is a type-system property rather than a review item.
-A pure refactor — `tests/e2e/mcp_client_test.py` passes unmodified, e2e is 19/19 `failed: none`,
-`cargo test` went 117 -> 119 on the two new tool-surface tests, and `Cargo.lock` is byte-identical
-so 04-02 owns every dependency change in this phase without a collision.
+Phase 4 is closed. AUTH-01, AUTH-02 and AUTH-03 are Complete; verification passed after four
+code-review blockers were fixed. 296 unit tests, e2e 22/22. Phases 1–3 (v1) remain
+feature-complete.
 
-Phase 4 is planned: 8 plans across 6 waves, plan-checker APPROVED on revision 1. Four design
-decisions were locked up front in `04-CONTEXT.md` rather than left to the planner — target MCP
-spec revision 2025-11-25 (what rust-mcp-sdk 1.0.1 implements), ship DCR but not CIMD (which would
-make the browser fetch an attacker-supplied URL), the 8-plan split, and a listener that is off by
-default and loopback-only. ROADMAP's Success Criterion 2 was reworded during planning: the original
-permitted a plan that minted a token and implemented neither discovery nor audience binding.
+**Phase 5 is planned:** 11 plans across 8 waves, plan-checker APPROVED at revision 3. Scope was cut
+from four requirements to two — DIST-03 and DIST-04 moved to a new **Phase 5.1** — because an
+architectural client/server split plus a frame pipeline plus reconnect plus persistence was more
+than one reviewable phase. ROADMAP and REQUIREMENTS reflect the split.
 
-All four plans landed sequentially, each depending on the previous, because every one of
-them touches app.rs and gui.rs. BROWSE-01 through BROWSE-04 are all delivered; the e2e
-suite is at 19/19 and `cargo test` at 117.
+Six decisions locked up front in `05-CONTEXT.md`: a thin `talaria-client` binary with the server
+unchanged; the remote client sees **agent tabs only**; Tailscale Serve terminates TLS so
+`BIND_HOST` stays a constant; the 5/5.1 split; frame encoding reuses `png` at `Compression::Fast`
+over tile diffs with **no new codec**; and on a relayed link the client degrades and reports rather
+than refusing takeover.
 
-Phase 3 also absorbed a code-review pass: four criticals fixed (a page `<title>` could
-crash the browser, the four new stores were world-readable, an agent could forge rows
-into the human's history, and a download's row could lie about its own name), plus the
-encrypted vault's own file mode and a download path that fell back to the CWD. A
-`chrome_rects` hook behind `TALARIA_TEST_HOOKS=1` closed the recurring toolbar-coordinate
-churn and made six previously human-only checks automatic; the last three were closed by
-reviewing the rendered chrome directly.
+**Two spikes must land before the plans that depend on them.** GL readback cost is unmeasured and is
+the phase's largest unknown — and the e2e harness is Xvfb/llvmpipe, so the spike must report the
+software-rendered figure separately. The second is whether Tailscale Serve proxies a WebSocket
+upgrade cleanly.
 
-Planned without a CONTEXT.md — /gsd-discuss-phase was not run, so the design decisions it
-would have locked were resolved by 03-RESEARCH.md and 03-UI-SPEC.md instead, each recording
-its discretionary calls explicitly.
+**Two open product questions, recorded together in `05-CONTEXT.md`** because they are one question —
+what can a remote human do that requires being at the server machine? First pairing needs someone at
+the server (OAuth consent is a server-chrome panel), and a remote human at a login wall has no
+address bar, since the view channel deliberately carries no `Command` and remote input cannot reach
+the chrome. The second sits against the project's stated core value and should be revisited the
+first time a real takeover dead-ends.
 
-Three documentation debts are queued for the phase close, listed at the end of
-03-04-SUMMARY.md: CLAUDE.md's "no config file format" claim (false since 03-03), CLAUDE.md's
-component table missing the four Phase 3 stores and Shared::event_proxy, and CHANGELOG.md
-missing BROWSE-01/02/03 entries (BROWSE-04's is written).
-
-Last activity: 2026-08-21 — Phase 04 complete, transitioned to Phase 5
-
-v1 (Phases 1-3): [██████████] 3 of 3 phases complete
-All phases (1-7): [████░░░░░░] 3 of 7 complete
+**Note on history:** the 111 unpushed commits from Phases 3 and 4 were squashed to one commit per
+phase at the user's request; the pre-squash history is preserved on `backup/pre-squash-phases-3-4`.
+Phase 5 keeps per-task commits.
 
 ## Performance Metrics
 
