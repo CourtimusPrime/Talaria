@@ -987,7 +987,10 @@ impl ApplicationHandler<AppEvent> for App {
         // access is on starts the listener here, before the first tab, and a
         // fresh install (no file) starts nothing at all — D-04-04's
         // default-off is this `if` and no other check.
-        let configured = state.settings.borrow().remote_access;
+        // Cloned rather than copied: `RemoteAccessConfig` now carries the
+        // advertised origin, which is a `String`, so the type is no longer
+        // `Copy`. See `settings::RemoteAccessConfig::advertised_url`.
+        let configured = state.settings.borrow().remote_access.clone();
         if configured.enabled {
             start_remote_listener(&state, configured.port);
         }
@@ -1669,13 +1672,13 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
             // `UiAction::SetRemoteAccess` for why that is a security property
             // rather than a layout decision.
             UiAction::SetRemoteAccess(enabled) => {
-                let mut configured = state.settings.borrow().remote_access;
+                let mut configured = state.settings.borrow().remote_access.clone();
                 configured.enabled = enabled;
                 // Persisted first, in both directions, so the choice survives
                 // a restart. The write applies to this session whether or not
                 // it reaches disk, which is what makes the off direction below
                 // reliable even on a read-only config directory.
-                state.settings.borrow_mut().save_remote_access(configured);
+                state.settings.borrow_mut().save_remote_access(configured.clone());
                 match enabled {
                     // `start_remote_listener` is a no-op while one is already
                     // bound or starting, so a second click during a bind in

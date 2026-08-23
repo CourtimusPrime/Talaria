@@ -115,13 +115,33 @@ impl SearchEngine {
     }
 }
 
-/// The only bind address remote access may ever use in this phase.
+/// The only bind address remote access may ever use.
 ///
 /// Kept here as well as in [`crate::http`] because the two ends answer
 /// different questions: `http.rs` owns what is *bound*, and this owns what a
 /// file on disk is *allowed to ask for*. A stray `bind` key naming anything
 /// else is refused at load time — see [`RemoteAccessConfig::from_json`].
+///
+/// **Permanent, not provisional.** D-05-03 considered widening this and
+/// declined: a reverse proxy in front of a loopback listener satisfies the
+/// secure-transport obligation while leaving D-04-04's structural guarantee
+/// exactly as it is. What a browser reached through such a proxy publishes
+/// about itself is [`RemoteAccessConfig::advertised_url`]'s business, and
+/// that is a different fact from this one.
 pub const LOOPBACK_BIND: &str = "127.0.0.1";
+
+/// The scheme an advertised origin must carry, outside the one exception
+/// below.
+///
+/// Named once rather than spelled at each comparison, for the same reason
+/// [`crate::oauth::canonical_resource`] is the only place the resource
+/// identifier is built: a string that is compared rather than merely printed
+/// wants one definition.
+const SECURE_SCHEME: &str = "https";
+
+/// The scheme OAuth 2.1 §1.5's loopback exception covers, and the one a
+/// developer testing against `127.0.0.1` needs.
+const LOOPBACK_EXCEPTION_SCHEME: &str = "http";
 
 /// The port remote access uses unless `config.json` names another.
 ///
@@ -149,11 +169,18 @@ pub const DEFAULT_REMOTE_PORT: u16 = 8779;
 /// *reads* a `bind` key when a hand-edited file has one, purely so that it
 /// can refuse it out loud rather than ignore it in silence.
 ///
-/// Phase 5 is where a non-loopback bind gets considered, and it must bring
-/// TLS with it: OAuth 2.1 requires HTTPS for authorization-server endpoints
-/// with a loopback exception, and staying on loopback is what makes shipping
-/// without TLS conformant rather than merely unfinished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// OAuth 2.1 requires the secure scheme for authorization-server endpoints
+/// *with a loopback exception*, and staying on loopback is what made shipping
+/// Phase 4 without transport security conformant rather than merely
+/// unfinished. **Phase 5 considered a non-loopback bind and declined it.**
+/// D-05-03 puts a reverse proxy in front of this listener instead: it
+/// terminates transport security and forwards to loopback, which is the one
+/// proxy target it supports and exactly what this browser already binds. The
+/// loopback-only property is therefore permanent rather than provisional, and
+/// nothing about renewal ever becomes this program's problem. What changes
+/// instead is that the address a client reaches this browser at stops being
+/// the address the listener bound — see [`RemoteAccessConfig::advertised_url`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteAccessConfig {
     /// Whether the listener should be running. `false` means no thread is
     /// spawned and no port is bound at all — the default-off state is an
@@ -163,11 +190,50 @@ pub struct RemoteAccessConfig {
     /// is free" is refused at load, because the whole point of a fixed port
     /// is that a human wrote it into a client's configuration.
     pub port: u16,
+    /// The origin clients actually reach this browser at, when a reverse
+    /// proxy fronts the loopback listener. Absent means "nothing fronts it",
+    /// and then every string this browser publishes is built from the bound
+    /// address exactly as it was before this field existed.
+    ///
+    /// Three things about it, in the order a later reader needs them.
+    ///
+    /// **What it is.** A full origin — scheme, host, optional port, and
+    /// nothing else. It is what goes into the RFC 8707 canonical resource
+    /// identifier, the RFC 8414 issuer, the four endpoint URLs and the
+    /// host allowlist, all threaded from this one value the way the bound
+    /// address already is. D-05-03 is why it exists: a proxy that terminates
+    /// transport security in front of a loopback listener means the URL a
+    /// client used and the address this process bound are legitimately
+    /// different strings, and a browser that published the second would send
+    /// every client to a door it cannot reach.
+    ///
+    /// **What it is not: a bind address.** Nothing reads it when binding. The
+    /// bind host is still a module constant in [`crate::http`] used at exactly
+    /// one place, this type still has no bind-address field, and a hand-edited
+    /// `bind` key is still refused out loud in [`RemoteAccessConfig::from_json`]
+    /// with all of its existing rules intact. **D-04-04's structural guarantee
+    /// — that "bind somewhere else" is not a value this program can carry — is
+    /// preserved exactly, and this field does not weaken it.** The adjacency is
+    /// the thing a later reader will misread, which is why it is written down
+    /// here rather than left to be inferred.
+    ///
+    /// **Why it comes from here and never from a request header.** The
+    /// obvious shortcut is to read the advertised host off the request's
+    /// `Host` header, which is free and always correct-looking. It is also
+    /// threat T-05-09: a local page that could set the advertised issuer could
+    /// make this browser point a client at an authorization server the page
+    /// chose. The advertised identity has exactly one producer — this loader —
+    /// and that is the whole reason it is a configuration key at all.
+    ///
+    /// Validated at load by [`is_valid_advertised_url`], and refused rather
+    /// than normalised: a normalisation is a second spelling, and byte-for-byte
+    /// audience comparison cannot survive two.
+    pub advertised_url: Option<String>,
 }
 
 impl Default for RemoteAccessConfig {
     fn default() -> Self {
-        Self { enabled: false, port: DEFAULT_REMOTE_PORT }
+        Self { enabled: false, port: DEFAULT_REMOTE_PORT, advertised_url: None }
     }
 }
 
@@ -183,14 +249,20 @@ impl RemoteAccessConfig {
     /// `from_json` look like a round trip rather than what it is: a gate on
     /// something this program never produces.
     ///
-    /// Takes `self` by value where [`SearchEngine::to_json`] borrows, because
-    /// this type is two scalars and `Copy`; the shapes differ only because
-    /// the types do.
-    fn to_json(self) -> serde_json::Value {
-        serde_json::json!({
+    /// The advertised URL is written **only when there is one**, so a
+    /// configuration that never named one stays byte-identical to what every
+    /// install before this field wrote.
+    fn to_json(&self) -> serde_json::Value {
+        let mut document = serde_json::json!({
             "enabled": self.enabled,
             "port": self.port,
-        })
+        });
+        if let (Some(advertised), Some(object)) =
+            (self.advertised_url.as_deref(), document.as_object_mut())
+        {
+            object.insert("advertised_url".to_owned(), serde_json::json!(advertised));
+        }
+        document
     }
 
     /// One stored object back into a configuration, or `None` for anything
@@ -212,6 +284,13 @@ impl RemoteAccessConfig {
     /// Every refusal here returns `None`, which the caller turns into
     /// [`RemoteAccessConfig::default`] — remote access **off**. Failing
     /// closed is the only direction this key may degrade in.
+    ///
+    /// That is why a malformed `advertised_url` costs the *whole* block rather
+    /// than just itself: a browser running with an advertised identity nobody
+    /// wrote is worse than a browser with remote access off. It would publish
+    /// an issuer and a resource identifier a client would then be entitled to
+    /// believe, and the `bind` refusal above already established that this is
+    /// the direction this key degrades in.
     fn from_json(value: &serde_json::Value) -> Option<Self> {
         let enabled = value.get("enabled")?.as_bool()?;
         if let Some(bind) = value.get("bind") {
@@ -238,7 +317,86 @@ impl RemoteAccessConfig {
                 },
             },
         };
-        Some(Self { enabled, port })
+        // Question mark on every field, the same discipline `enabled` and
+        // `port` are held to — and refusing rather than normalising, because
+        // a normalised value is a second spelling of this server and the
+        // audience check that eventually reads it compares byte for byte.
+        let advertised_url = match value.get("advertised_url") {
+            None => None,
+            Some(advertised) => {
+                let named = advertised.as_str().unwrap_or("(not a string)");
+                if !is_valid_advertised_url(named) {
+                    log::warn!(
+                        "settings: {named:?} is not an origin this browser may advertise \
+                         — it must be {SECURE_SCHEME}, a host, an optional port and \
+                         nothing else; remote access stays off"
+                    );
+                    return None;
+                }
+                Some(named.to_owned())
+            },
+        };
+        Some(Self { enabled, port, advertised_url })
+    }
+}
+
+/// Whether `advertised` is an origin this browser may publish as its own
+/// identity.
+///
+/// A free function beside [`is_valid_template`] and for the same reason: one
+/// definition of "valid", reachable by anything that needs to ask, and reached
+/// by a hand-edited `config.json` exactly as it would be by a panel.
+///
+/// **Refuses rather than normalises**, which is the rule that matters most
+/// here. The value ends up in the RFC 8707 canonical resource identifier, and
+/// that identifier is compared byte for byte — so `https://host:8449` and
+/// `https://host:8449/` must not both be accepted as ways of saying the same
+/// thing. Accepting the second by quietly deleting its slash would be a
+/// browser that minted tokens against one spelling and validated them against
+/// another. The rules, each of which is one way to write a second spelling or
+/// one way to be something other than an origin:
+///
+/// - **The scheme is [`SECURE_SCHEME`]**, with exactly one exception: the
+///   loopback literal *with* a port may use [`LOOPBACK_EXCEPTION_SCHEME`].
+///   That is OAuth 2.1 §1.5's loopback exception, and the case a developer
+///   testing locally needs; every other host must be reached securely, because
+///   a tailnet name is not loopback under any reading.
+/// - **The authority is non-empty and carries no user information.** A `@`
+///   in an origin is credentials in a URL, which is not a thing this browser
+///   publishes about itself.
+/// - **There is no path, no query, no fragment — not even a bare trailing
+///   slash.** All four are checked on the string as written rather than on the
+///   parse, precisely because the parser would normalise the last one away.
+/// - **No uppercase in the authority.** A host that would be lower-cased to be
+///   understood is, again, a second spelling of the same server.
+pub fn is_valid_advertised_url(advertised: &str) -> bool {
+    let Some((scheme, authority)) = advertised.split_once("://") else {
+        return false;
+    };
+    // Read off the string as written. A trailing slash survives `split_once`
+    // and would not survive `Url::parse`, which is the whole reason this test
+    // comes first.
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.chars().any(|character| character.is_ascii_uppercase())
+    {
+        return false;
+    }
+    // And parsed, so that "is this a host at all" is answered by the same
+    // library the address bar uses rather than by a hand-rolled guess.
+    let Ok(parsed) = url::Url::parse(advertised) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host.is_empty() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    match scheme {
+        SECURE_SCHEME => true,
+        LOOPBACK_EXCEPTION_SCHEME => host == LOOPBACK_BIND && parsed.port().is_some(),
+        _ => false,
     }
 }
 
@@ -1044,7 +1202,7 @@ mod tests {
         let temp = TempPath::new();
         let mut settings = Settings::load_from(temp.path());
 
-        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41005 });
+        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41005, advertised_url: None });
 
         let reloaded = Settings::load_from(temp.path());
         assert!(reloaded.remote_access.enabled);
@@ -1062,7 +1220,7 @@ mod tests {
             url_template: "https://kagi.com/search?q={query}".to_owned(),
         });
 
-        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41006 });
+        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41006, advertised_url: None });
 
         let reloaded = Settings::load_from(temp.path());
         assert_eq!(reloaded.search_engine.name, "Kagi");
@@ -1074,7 +1232,7 @@ mod tests {
     fn saving_the_search_engine_preserves_saved_remote_access() {
         let temp = TempPath::new();
         let mut settings = Settings::load_from(temp.path());
-        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41007 });
+        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41007, advertised_url: None });
 
         settings.save(SearchEngine {
             name: "Kagi".to_owned(),
@@ -1093,7 +1251,7 @@ mod tests {
     fn a_saved_document_never_writes_a_bind_key() {
         let temp = TempPath::new();
         let mut settings = Settings::load_from(temp.path());
-        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41008 });
+        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41008, advertised_url: None });
 
         let written = temp.read();
         assert!(!written.contains("bind"), "the saved document named a bind address: {written}");
@@ -1107,7 +1265,7 @@ mod tests {
         let temp = TempPath::new();
         let mut settings = Settings::load_from(temp.path());
 
-        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41009 });
+        settings.save_remote_access(RemoteAccessConfig { enabled: true, port: 41009, advertised_url: None });
 
         assert_eq!(permissions::mode_of(&temp.path()), 0o600);
         assert!(!temp.temp_sibling().exists(), "the staging file outlived the save");
@@ -1123,9 +1281,238 @@ mod tests {
         let blocked = temp.path().join("nested").join("config.json");
 
         let mut settings = Settings::load_from(blocked);
-        settings.remote_access = RemoteAccessConfig { enabled: true, port: 41010 };
-        settings.save_remote_access(RemoteAccessConfig { enabled: false, port: 41010 });
+        settings.remote_access =
+            RemoteAccessConfig { enabled: true, port: 41010, advertised_url: None };
+        settings.save_remote_access(RemoteAccessConfig {
+            enabled: false,
+            port: 41010,
+            advertised_url: None,
+        });
 
         assert!(!settings.remote_access.enabled);
+    }
+
+    /// The zero-regression guard for D-05-03's key: a file that never names an
+    /// advertised URL loads exactly as it did before the key existed, and the
+    /// browser therefore publishes exactly what Phase 4 published.
+    #[test]
+    fn a_configuration_with_no_advertised_url_loads_exactly_as_it_did_before() {
+        let temp = TempPath::new();
+        temp.write(r#"{"remote_access":{"enabled":true,"port":41011}}"#);
+
+        let settings = Settings::load_from(temp.path());
+
+        assert!(settings.remote_access.enabled);
+        assert_eq!(settings.remote_access.port, 41011);
+        assert_eq!(settings.remote_access.advertised_url, None);
+    }
+
+    /// Preserved verbatim, not re-serialised through a parser: the value that
+    /// comes back out is the value that went in, character for character.
+    #[test]
+    fn a_secure_origin_with_a_host_and_a_port_is_preserved_verbatim() {
+        let temp = TempPath::new();
+        temp.write(
+            r#"{"remote_access":{"enabled":true,"port":41012,
+                "advertised_url":"https://thinkpad.tailcd3cc6.ts.net:8449"}}"#,
+        );
+
+        let settings = Settings::load_from(temp.path());
+
+        assert!(settings.remote_access.enabled);
+        assert_eq!(
+            settings.remote_access.advertised_url.as_deref(),
+            Some("https://thinkpad.tailcd3cc6.ts.net:8449")
+        );
+    }
+
+    /// A proxy on the default secure port names no port, and that is an
+    /// ordinary origin rather than a half-written one.
+    #[test]
+    fn a_secure_origin_with_no_port_is_accepted() {
+        let temp = TempPath::new();
+        temp.write(
+            r#"{"remote_access":{"enabled":true,
+                "advertised_url":"https://thinkpad.tailcd3cc6.ts.net"}}"#,
+        );
+
+        let settings = Settings::load_from(temp.path());
+
+        assert!(settings.remote_access.enabled);
+        assert_eq!(
+            settings.remote_access.advertised_url.as_deref(),
+            Some("https://thinkpad.tailcd3cc6.ts.net")
+        );
+    }
+
+    /// OAuth 2.1 §1.5's loopback exception, and its edges: the insecure scheme
+    /// is the loopback literal's alone, and only with a port. Every other host
+    /// must be reached securely, because a tailnet name is not loopback under
+    /// any reading.
+    #[test]
+    fn the_insecure_scheme_belongs_to_the_loopback_literal_with_a_port_and_to_nothing_else() {
+        assert!(is_valid_advertised_url("http://127.0.0.1:8779"));
+
+        assert!(!is_valid_advertised_url("http://127.0.0.1"));
+        assert!(!is_valid_advertised_url("http://localhost:8779"));
+        assert!(!is_valid_advertised_url("http://127.0.0.2:8779"));
+        assert!(!is_valid_advertised_url("http://thinkpad.tailcd3cc6.ts.net:8449"));
+        assert!(!is_valid_advertised_url("http://[::1]:8779"));
+    }
+
+    /// An origin is a scheme and an authority. Anything after the authority is
+    /// a second thing, and a second thing is a second spelling.
+    #[test]
+    fn an_advertised_url_carrying_a_path_query_or_fragment_is_refused() {
+        for named in [
+            "https://host.example:8449/mcp",
+            "https://host.example:8449/.well-known/oauth-authorization-server",
+            "https://host.example:8449?resource=1",
+            "https://host.example:8449#fragment",
+        ] {
+            assert!(!is_valid_advertised_url(named), "{named} was accepted as an origin");
+        }
+    }
+
+    /// **Refused, not normalised.** `https://host:8449/` and
+    /// `https://host:8449` name the same server and are different strings, and
+    /// RFC 8707 audience validation compares byte for byte — so quietly
+    /// deleting the slash would be a browser that minted tokens against one
+    /// spelling and validated them against the other.
+    #[test]
+    fn a_bare_trailing_slash_is_refused_rather_than_normalised_away() {
+        assert!(!is_valid_advertised_url("https://host.example:8449/"));
+        assert!(!is_valid_advertised_url("https://host.example/"));
+        assert!(is_valid_advertised_url("https://host.example:8449"));
+    }
+
+    /// Credentials in a URL are not a thing this browser publishes about
+    /// itself, and an `@` in an origin is exactly that.
+    #[test]
+    fn an_advertised_url_carrying_user_information_is_refused() {
+        assert!(!is_valid_advertised_url("https://someone@host.example:8449"));
+        assert!(!is_valid_advertised_url("https://someone:secret@host.example:8449"));
+    }
+
+    /// The other shapes that are not origins: no host at all, no scheme, an
+    /// unrelated scheme, or an authority that only looks like one.
+    #[test]
+    fn an_advertised_url_with_no_usable_host_is_refused() {
+        for named in [
+            "https://",
+            "https://:8449",
+            "host.example:8449",
+            "",
+            "file:///etc/passwd",
+            "javascript://host.example",
+            "HTTPS://host.example:8449",
+            "https://HOST.example:8449",
+            "https://host example:8449",
+        ] {
+            assert!(!is_valid_advertised_url(named), "{named:?} was accepted as an origin");
+        }
+    }
+
+    /// A value of the wrong JSON type is a refusal like any other, and lands
+    /// in the same place: remote access off.
+    #[test]
+    fn an_advertised_url_that_is_not_a_string_is_refused() {
+        for named in ["8449", "true", "null", "[\"https://host.example\"]", "{}"] {
+            let temp = TempPath::new();
+            temp.write(&format!(
+                r#"{{"remote_access":{{"enabled":true,"advertised_url":{named}}}}}"#
+            ));
+
+            let settings = Settings::load_from(temp.path());
+
+            assert!(!settings.remote_access.enabled, "{named} was accepted");
+            assert_eq!(settings.remote_access.advertised_url, None);
+        }
+    }
+
+    /// The refusal's landing place, in the shape the `bind` key already
+    /// established: the whole remote-access block goes to its default — **off**
+    /// — and the search engine, which was not this key's to reset, survives.
+    #[test]
+    fn a_refused_advertised_url_disables_remote_access_and_keeps_the_search_engine() {
+        for named in [
+            "https://host.example:8449/",
+            "http://host.example:8449",
+            "https://someone@host.example",
+            "not a url at all",
+        ] {
+            let temp = TempPath::new();
+            temp.write(&format!(
+                r#"{{"search_engine":{{"name":"Kagi","url_template":"https://kagi.com/search?q={{query}}"}},
+                    "remote_access":{{"enabled":true,"port":41013,"advertised_url":{}}}}}"#,
+                serde_json::json!(named)
+            ));
+
+            let settings = Settings::load_from(temp.path());
+
+            assert!(!settings.remote_access.enabled, "{named:?} enabled remote access");
+            assert_eq!(settings.remote_access.port, DEFAULT_REMOTE_PORT);
+            assert_eq!(settings.remote_access.advertised_url, None);
+            assert_eq!(settings.search_engine.name, "Kagi", "{named:?} reset the engine");
+        }
+    }
+
+    #[test]
+    fn an_advertised_url_round_trips_through_save_and_load() {
+        let temp = TempPath::new();
+        let mut settings = Settings::load_from(temp.path());
+
+        settings.save_remote_access(RemoteAccessConfig {
+            enabled: true,
+            port: 41014,
+            advertised_url: Some("https://thinkpad.tailcd3cc6.ts.net:8449".to_owned()),
+        });
+
+        let reloaded = Settings::load_from(temp.path());
+        assert!(reloaded.remote_access.enabled);
+        assert_eq!(reloaded.remote_access.port, 41014);
+        assert_eq!(
+            reloaded.remote_access.advertised_url.as_deref(),
+            Some("https://thinkpad.tailcd3cc6.ts.net:8449")
+        );
+    }
+
+    /// The other half of the round trip: a configuration with no advertised
+    /// URL writes no key, so a file that never named one stays byte-identical
+    /// to what every install before this field wrote.
+    #[test]
+    fn a_saved_document_with_no_advertised_url_writes_no_key() {
+        let temp = TempPath::new();
+        let mut settings = Settings::load_from(temp.path());
+
+        settings.save_remote_access(RemoteAccessConfig {
+            enabled: true,
+            port: 41015,
+            advertised_url: None,
+        });
+
+        let written = temp.read();
+        assert!(!written.contains("advertised"), "an absent advertised URL was written: {written}");
+        assert!(!written.contains("bind"), "{written}");
+        assert!(written.contains("remote_access"), "{written}");
+    }
+
+    /// The guarantee this field must not weaken, asserted beside it rather
+    /// than only in the three tests above: the bind rules are unchanged in the
+    /// presence of an advertised URL, and an advertised URL is not a way to
+    /// smuggle one in.
+    #[test]
+    fn an_advertised_url_does_not_make_a_wider_bind_expressible() {
+        let temp = TempPath::new();
+        temp.write(
+            r#"{"remote_access":{"enabled":true,"bind":"0.0.0.0",
+                "advertised_url":"https://thinkpad.tailcd3cc6.ts.net:8449"}}"#,
+        );
+
+        let settings = Settings::load_from(temp.path());
+
+        assert!(!settings.remote_access.enabled, "a wildcard bind rode in on an advertised URL");
+        assert_eq!(settings.remote_access.advertised_url, None);
+        assert_eq!(LOOPBACK_BIND, "127.0.0.1", "the one bind address moved");
     }
 }
