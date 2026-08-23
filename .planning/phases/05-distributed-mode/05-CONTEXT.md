@@ -76,8 +76,27 @@ each phase reviewable.
 **Decided here, on `05-RESEARCH.md`'s measurements** rather than referred, because the numbers
 settle it.
 
-The current `encode_screenshot` path cannot be the frame path: `Compression::Default` measured
-**21 ms** on a page-like 1280×800 frame and **175 ms** on a photo-like one, against a 30 ms budget.
+**CORRECTED 2026-08-21 by the 05-02 spike — the decision stands, its stated reason did not.**
+
+This section originally said the current `encode_screenshot` path "cannot be the frame path" because
+`Compression::Default` measured 21 ms page-like and 175 ms photo-like. That is a real measurement of
+a configuration **this codebase never executes**. `png 0.17.16`'s `Info::default()` already sets
+`compression: Compression::Fast` (`common.rs:638`) and defaults the filter to `Sub`, and
+`encode_screenshot` (`app.rs`) never calls `set_compression` — it sets only colour and depth. The
+spike proved it by encoding one real frame both ways and getting **byte-identical output**, while an
+explicitly-set `Compression::Default` produced 183 KB in 21.3 ms — within 1.4 % of the research's
+figure, confirming the benchmark was run correctly and simply measured the wrong configuration.
+
+So the real numbers are: `encode_screenshot` is **1.7 ms**, not 21 ms, and the MCP `screenshot` tool
+was never as slow as this document claimed. Two consequences the planner and 05-08 must carry:
+- The tile-diff choice is **cheaper than it looked**, not a rescue from a 21 ms path.
+- The "sibling encoder diverging on three lines" 05-08 was handed **diverges on one** — raw bytes
+  instead of base64. The compression and filter settings it was told to change are already the
+  defaults.
+
+The original reasoning is left below for the record, struck through in effect by the above.
+
+~~The current `encode_screenshot` path cannot be the frame path: `Compression::Default` measured **21 ms** on a page-like 1280×800 frame and **175 ms** on a photo-like one, against a 30 ms budget.~~
 The same crate at `Compression::Fast` + `FilterType::Sub` over 64×64 tile diffs measured **0.007 ms
 / 3.9 KB** for a caret, **0.034 ms / 15 KB** for typing, and **2.16 ms / 522 KB** for a keyframe,
 with a **0.14 ms** whole-frame dirty-tile scan.
