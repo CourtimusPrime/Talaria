@@ -2,19 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-current_phase: 5
-current_phase_name: distributed-mode
 status: executing
-stopped_at: Completed 05-02-PLAN.md
-last_updated: "2026-08-23T11:50:28.455Z"
+last_updated: "2026-08-23T12:21:13.281Z"
 progress:
   total_phases: 8
   completed_phases: 3
   total_plans: 34
-  completed_plans: 25
+  completed_plans: 26
   percent: 38
-last_activity: 2026-08-23
-last_activity_desc: "Phase 05 wave 1 complete - spike A1 CONFIRMED, A8 REFUTED"
 ---
 
 # Project State
@@ -29,8 +24,8 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 2 of 11 executed (wave 1 complete)
-Status: Executing — wave 1 landed, wave 2 next
+Plan: 3 of 11 executed (wave 1 complete)
+Status: Ready to execute
 Next: `/gsd-execute-phase 5`
 
 Phase 4 is closed. AUTH-01, AUTH-02 and AUTH-03 are Complete; verification passed after four
@@ -121,6 +116,7 @@ Phase 5 keeps per-task commits.
 | Phase 04 P08 | 85 min | 3 tasks | 10 files |
 | Phase 05 P01 | 50min | 3 tasks | 6 files |
 | Phase 05 P02 | 45min | 2 tasks | 2 files |
+| Phase 05 P03 | 30min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -215,6 +211,10 @@ Recent decisions affecting current work:
 - [Phase 5]: A1 CONFIRMED: read_to_image at a 30 ms cadence costs 1.19-1.56 ms mean, p95 never above 1.86 ms, 0 failures over 900 ticks — the capture model stands and 05-08 may be executed as planned
 - [Phase 5]: A8 REFUTED: encode_screenshot never ran at png::Compression::Default — png 0.17's Info::default() is Fast+Sub — so the 21 ms/175 ms premise is void, the frame encoder diverges on one line not three, and the synthetic frames predicted encode time well but bytes badly (3.2x on the photo case)
 - [Phase 5]: One readback figure, not two: this machine has no non-llvmpipe GL path, and the Xvfb number is plausibly optimistic rather than conservative — the hardware re-measure becomes a VERIFICATION.md manual item
+- [Phase ?]: The view channel carries no agent tool vocabulary — D-05-02 expressed as an absence in the wire types, so a remote click is unreachable from the MCP tool surface by construction
+- [Phase ?]: The view wire's channel tags are 0x01 control, 0x02 tabs, 0x03 event, 0x04 input, 0x10 frame — a low JSON block and a high binary block, with the gap deliberate
+- [Phase ?]: The frame header is a fixed 51-byte little-endian layout carrying last_applied_input, which makes input-to-photon latency measurable with no clock shared between the two machines
+- [Phase ?]: talaria-protocol's Unix socket helpers were moved into a cfg(unix) local module and deliberately not re-exported: a re-export would leave the root surface being corrected exactly as it was
 
 ### Pending Todos
 
@@ -263,6 +263,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T11:50:17.522Z
-Stopped at: Completed 05-02-PLAN.md
+Last session: 2026-08-23T12:21:02.448Z
+Stopped at: Completed 05-03-PLAN.md
 Resume file: None

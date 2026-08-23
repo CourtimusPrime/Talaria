@@ -84,7 +84,7 @@ over from the originating brief — see `.planning/codebase/CONCERNS.md` for evi
 
 ### Distributed Mode (DIST)
 
-- [ ] **DIST-01**: Client and server can run on separate machines connected via Tailscale — *Must Have*
+- [x] **DIST-01**: Client and server can run on separate machines connected via Tailscale — *Must Have*
 - [ ] **DIST-02**: A human can watch and take over an agent's tab when the server is remote, with adaptive frame polling (~200–500ms passive, ~30–60ms during takeover) — *Must Have*
 - [ ] **DIST-03**: A dropped Tailscale connection does not kill in-progress agent work; the client resyncs on reconnect — *Must Have*
 - [ ] **DIST-04**: The server persists a session manifest and offers to restore tabs after a crash or restart in distributed mode — *Should Have*
@@ -168,7 +168,7 @@ Deferred. Tracked but not in the current roadmap.
 | AUTH-03 | Phase 4 | Complete |
 | AUTH-01 | Phase 4 | Complete |
 | AUTH-02 | Phase 4 | Complete |
-| DIST-01 | Phase 5 | Pending |
+| DIST-01 | Phase 5 | Complete |
 | DIST-02 | Phase 5 | Pending |
 | DIST-03 | Phase 5.1 | Pending |
 | DIST-04 | Phase 5.1 | Pending |
