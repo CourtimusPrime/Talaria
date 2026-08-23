@@ -38,6 +38,7 @@
 //! do not drift apart visually.
 
 mod chrome;
+mod input;
 mod net;
 mod present;
 
@@ -307,6 +308,9 @@ struct Running {
     outbound: net::Outbound,
     /// The picture, and the one transform that lays it out.
     present: present::Presenter,
+    /// The pointer and keyboard, on their way out. Lives for the process rather
+    /// than for a connection, so its sequence is never reused after a reconnect.
+    capture: input::Capture,
     /// Set by a redraw request and cleared once the frame is drawn, so one
     /// window event produces at most one frame.
     redraw: Cell<bool>,
@@ -326,7 +330,8 @@ impl Running {
         // `self.egui` is: edition 2021 closures capture disjoint fields, so
         // nothing here needs the move-out-and-back the server's chrome does for
         // its own view state.
-        let Running { egui, chrome, window, server, state, tabs, present, .. } = self;
+        let Running { egui, chrome, window, server, state, tabs, present, capture, .. } = self;
+        let sent = capture.last_seq();
         let credential_file = net::credential_file();
         let mut actions = Vec::new();
         egui.run(window, |ui| {
@@ -340,6 +345,7 @@ impl Running {
                     attached: present.attached(),
                 },
                 present,
+                sent,
             );
         });
         self.surface.prepare_for_rendering();
@@ -384,6 +390,58 @@ impl Running {
                     self.outbound.control(&ClientView::Detach { tab });
                 },
             }
+        }
+    }
+
+    /// Turn one window event into a wire message, or into nothing.
+    ///
+    /// Everything that decides *whether* lives in [`crate::input`]; this is the
+    /// wiring, and it is deliberately thin — a refusal implemented here would be
+    /// a refusal outside the module whose tests are about refusals.
+    fn capture_input(&mut self, event: &WindowEvent) {
+        let aim = self.aim();
+        let message = match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                // The one conversion between the two coordinate spaces this
+                // binary holds: winit reports physical pixels, and every
+                // rectangle the interface lays out — including the fitted
+                // picture's — is in logical points.
+                let logical: winit::dpi::LogicalPosition<f32> =
+                    position.to_logical(self.window.scale_factor());
+                self.capture.pointer_moved(&aim, egui::pos2(logical.x, logical.y))
+            },
+            WindowEvent::CursorLeft { .. } => {
+                self.capture.pointer_left();
+                None
+            },
+            WindowEvent::MouseInput { button, state, .. } => {
+                self.capture.pointer_button(&aim, *button, *state)
+            },
+            WindowEvent::MouseWheel { delta, .. } => self.capture.wheel(&aim, *delta),
+            // Only when the interface is not itself taking keys. It has no text
+            // field today, so this is a guard against a later one rather than a
+            // live condition — but a later one would otherwise send every
+            // keystroke to the page as well as to the field.
+            WindowEvent::KeyboardInput { event, .. }
+                if !self.egui.egui_ctx.egui_wants_keyboard_input() =>
+            {
+                self.capture.key(&aim, &event.logical_key, event.state)
+            },
+            _ => return,
+        };
+        let Some(message) = message else { return };
+        // Queued, not written: the write happens on the connection thread. A
+        // queue that has nowhere to go answers false, which is the same answer a
+        // closed connection gives, and neither is worth a line in the window.
+        let _ = self.outbound.input(&message);
+    }
+
+    /// What may be sent right now, read fresh from the loop's own state.
+    fn aim(&self) -> input::Aim {
+        input::Aim {
+            connected: matches!(self.state, net::ConnectionState::Connected),
+            tab: self.present.attached(),
+            fit: self.chrome.layout(),
         }
     }
 
@@ -509,6 +567,7 @@ impl ApplicationHandler<ClientEvent> for App {
             tabs,
             outbound,
             present: present::Presenter::default(),
+            capture: input::Capture::default(),
             redraw: Cell::new(true),
         }));
     }
@@ -559,6 +618,11 @@ impl ApplicationHandler<ClientEvent> for App {
             _ => {},
         }
         let response = running.egui.on_window_event(&running.window, &event);
+        // **After the interface, never instead of it.** The interface has to see
+        // every event to keep its own hover and press state, and this pass sends
+        // nothing for any position outside the fitted picture — so a press on
+        // the client's own controls reaches the interface and stops there.
+        running.capture_input(&event);
         if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             running.window.request_redraw();
         }

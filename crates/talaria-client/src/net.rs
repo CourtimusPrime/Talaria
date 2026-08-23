@@ -47,7 +47,8 @@ use std::path::PathBuf;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use talaria_protocol::wire::{
-    Channel, ClientView, FrameHeader, ServerView, TabList, FRAME_HEADER_LEN, PROTOCOL_VERSION,
+    Channel, ClientView, FrameHeader, InputMessage, ServerView, TabList, FRAME_HEADER_LEN,
+    PROTOCOL_VERSION,
 };
 use talaria_protocol::TabInfo;
 use tokio_tungstenite::tungstenite;
@@ -178,6 +179,18 @@ impl Outbound {
     pub fn control(&self, message: &ClientView) -> bool {
         let Ok(payload) = serde_json::to_vec(message) else { return false };
         self.channel(Channel::Control, &payload)
+    }
+
+    /// One input-channel message.
+    ///
+    /// **The wire's own well-formedness gate, reused rather than restated.**
+    /// [`InputMessage::to_json`] refuses a coordinate that is not a finite
+    /// number and a key naming both a character and a name or neither — which
+    /// are exactly the two shapes the far end refuses. A second spelling of that
+    /// rule here would be a second thing to keep in step.
+    pub fn input(&self, message: &InputMessage) -> bool {
+        let Some(payload) = message.to_json() else { return false };
+        self.channel(Channel::Input, payload.as_bytes())
     }
 
     /// The tag byte, then the payload — the whole of this wire's framing.

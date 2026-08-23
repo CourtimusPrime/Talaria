@@ -227,6 +227,16 @@ impl Chrome {
         self.chrome_rects.as_deref().unwrap_or_default()
     }
 
+    /// How the picture was laid out on the last drawn frame, if one was.
+    ///
+    /// **The value [`crate::input`] inverts.** It is read from here rather than
+    /// recomputed there, which is the whole of the one-transform rule: a change
+    /// to how the picture is laid out cannot leave the pointer mapping behind,
+    /// because there is no second mapping to leave behind.
+    pub fn layout(&self) -> Option<Fit> {
+        self.fit
+    }
+
     /// Draw one frame and return what the human asked for.
     ///
     /// Rebuilds the rect collection from scratch, so a control that stopped
@@ -237,6 +247,7 @@ impl Chrome {
         ui: &mut egui::Ui,
         view: &View<'_>,
         present: &Presenter,
+        sent: u64,
     ) -> Vec<UiAction> {
         let mut actions: Vec<UiAction> = Vec::new();
         let mut rects = self.chrome_rects.is_some().then(Vec::new);
@@ -285,7 +296,7 @@ impl Chrome {
             }
         });
 
-        record_readings(rects.as_mut(), present);
+        record_readings(rects.as_mut(), present, sent);
 
         if let Some(rects) = rects {
             self.chrome_rects = Some(rects);
@@ -306,7 +317,7 @@ impl Chrome {
 /// Why they are exposed at all: "the client is connected" is not "the client is
 /// showing the page", and an end-to-end suite that asserted only the former
 /// would pass against a client whose picture never arrived.
-fn record_readings(rects: Option<&mut Vec<ChromeRect>>, present: &Presenter) {
+fn record_readings(rects: Option<&mut Vec<ChromeRect>>, present: &Presenter, sent: u64) {
     let Some(rects) = rects else { return };
     let mut reading = |name: &str, width: f32, height: f32| {
         rects.push(ChromeRect { name: name.to_owned(), x: 0.0, y: 0.0, width, height });
@@ -322,6 +333,7 @@ fn record_readings(rects: Option<&mut Vec<ChromeRect>>, present: &Presenter) {
     }
     reading("reading.frame_seq", present.last_frame_seq() as f32, 0.0);
     reading("reading.last_applied_input", present.last_applied_input() as f32, 0.0);
+    reading("reading.input_seq", sent as f32, 0.0);
 }
 
 impl Default for Chrome {
