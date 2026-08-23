@@ -13,6 +13,8 @@
 //! sessions, and run arbitrary JavaScript in them, so reachability by another
 //! local user is itself the vulnerability.
 
+pub mod wire;
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
