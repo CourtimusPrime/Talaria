@@ -109,14 +109,30 @@ pub enum ViewMode {
 /// displayed and how many viewers hold it — needs no engine at all. The three
 /// engine calls are then two lines each, and their `and` cannot drift from the
 /// table this enum makes assertable.
+///
+/// **This table decides shown-or-hidden, and only that.** Focus is decided
+/// separately, by [`focus_action`], and the split is forced by the engine
+/// rather than chosen: `servo::WebView::blur()` sends
+/// `EmbedderToConstellationMessage::BlurWebView`, which **carries no webview
+/// id** (`servo-0.4.0/webview.rs:416-422`), and the façade answers it by
+/// clearing focus on *every* webview it holds (`servo-0.4.0/servo.rs:786-791`).
+/// There is therefore no such call as "blur this one", and a per-tab focus
+/// column in this table would be describing something the API cannot express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
-    /// The tab the local human is looking at: shown **and** focused.
+    /// The tab the local human is looking at: shown, and the one tab
+    /// [`focus_action`] gives focus to.
     DisplayedAndFocused,
-    /// Held shown for at least one remote viewer, and deliberately not
-    /// focused — see [`Tab::held_for_view`].
+    /// Held shown for at least one remote viewer — see [`Tab::held_for_view`]
+    /// — and **not given** focus.
+    ///
+    /// "Not given focus" rather than "blurred", and the difference is the
+    /// whole of what this arm can honestly promise: focus is granted to
+    /// exactly one tab, by name, after every show and hide, so a tab that is
+    /// not that tab does not hold it. Nothing blurs *this* tab in particular,
+    /// because nothing can.
     HeldForViewing,
-    /// Neither displayed nor held: hidden and blurred, as before.
+    /// Neither displayed nor held: hidden, and likewise not given focus.
     Hidden,
 }
 
@@ -131,6 +147,49 @@ pub fn visibility_of(displayed: bool, held_for_view: usize) -> Visibility {
         (true, _) => Visibility::DisplayedAndFocused,
         (false, 0) => Visibility::Hidden,
         (false, _) => Visibility::HeldForViewing,
+    }
+}
+
+/// The one focus call a visibility sync makes, and there is at most one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusAction {
+    /// Give this tab focus. `FocusWebView` carries the id, and the façade
+    /// answers it by setting `focused` true on that webview and **false on
+    /// every other** (`servo-0.4.0/servo.rs:776-784`) — so one focus call is
+    /// the complete statement of who holds focus, and no blur is needed to
+    /// take it off whoever had it.
+    Focus(u64),
+    /// Clear focus everywhere. The id is only somewhere to send the message
+    /// from: `BlurWebView` carries no webview id, so this is a global
+    /// operation whichever webview it is sent through.
+    BlurAll(u64),
+    /// There are no tabs, so there is nothing to say.
+    Nothing,
+}
+
+/// Who should hold focus after a visibility sync, given the displayed tab and
+/// the first tab in the table.
+///
+/// **The correction WR-04 made, and it is a correction to the engine call
+/// rather than to the policy.** `sync_visibility` used to fire `focus()` for
+/// the displayed tab and `blur()` for every held or hidden one, walking the
+/// table in insertion order — and since `blur()` is a *global*
+/// `BlurWebView` with no webview id, any tab following the displayed one in
+/// the vector immediately cleared the focus the displayed tab had just been
+/// given. Order-dependently, and observably: `document.hasFocus()`,
+/// `:focus-within`, focus and blur handlers and caret rendering all see it.
+/// The bug predates this phase, but Phase 5 made a **remote party** able to
+/// trigger the sync, because `hold_for_view` and `release_view_hold` both call
+/// it.
+///
+/// So: blur only when nothing at all should be focused, at most once, and
+/// never before the focus call. A displayed tab needs no blur first, because
+/// focusing one webview is already the whole statement.
+pub fn focus_action(displayed_id: Option<u64>, first_id: Option<u64>) -> FocusAction {
+    match (displayed_id, first_id) {
+        (Some(displayed), _) => FocusAction::Focus(displayed),
+        (None, Some(first)) => FocusAction::BlurAll(first),
+        (None, None) => FocusAction::Nothing,
     }
 }
 
@@ -271,23 +330,34 @@ impl TabManager {
     /// The interaction runs the other way too — holding a background tab shown
     /// disturbs nothing the human sees, because each tab renders into its own
     /// framebuffer (see [`Tab::rendering_context`]).
+    ///
+    /// **Shown-or-hidden first, focus once, focus last.** `blur()` is a global
+    /// `BlurWebView` carrying no webview id, so it may be sent only when no tab
+    /// should hold focus at all, and never after the focus call — see
+    /// [`focus_action`], which is where that argument lives and where it is
+    /// asserted.
     pub fn sync_visibility(&self) {
         let displayed_id = self.displayed_id();
         for tab in &self.tabs {
             match visibility_of(Some(tab.id) == displayed_id, tab.held_for_view) {
-                Visibility::DisplayedAndFocused => {
-                    tab.webview.show();
-                    tab.webview.focus();
+                Visibility::DisplayedAndFocused | Visibility::HeldForViewing => {
+                    tab.webview.show()
                 },
-                Visibility::HeldForViewing => {
-                    tab.webview.show();
-                    tab.webview.blur();
-                },
-                Visibility::Hidden => {
-                    tab.webview.hide();
-                    tab.webview.blur();
-                },
+                Visibility::Hidden => tab.webview.hide(),
             }
+        }
+        match focus_action(displayed_id, self.tabs.first().map(|tab| tab.id)) {
+            FocusAction::Focus(id) => {
+                if let Some(tab) = self.get(id) {
+                    tab.webview.focus();
+                }
+            },
+            FocusAction::BlurAll(id) => {
+                if let Some(tab) = self.get(id) {
+                    tab.webview.blur();
+                }
+            },
+            FocusAction::Nothing => {},
         }
     }
 
@@ -525,5 +595,40 @@ mod tests {
     fn a_held_tab_is_shown_without_being_focused() {
         assert_ne!(visibility_of(false, 1), Visibility::DisplayedAndFocused);
         assert_ne!(visibility_of(false, 1), Visibility::Hidden);
+    }
+
+    /// WR-04: `blur()` is a **global** `BlurWebView` with no webview id, so a
+    /// sync that fires one per non-displayed tab clears the focus it has just
+    /// given the displayed one — order-dependently, whenever the displayed tab
+    /// is not last in the table.
+    ///
+    /// The property: whenever anything is displayed, the sync's one focus call
+    /// is a `Focus` and there is no blur at all. A displayed tab needs no blur
+    /// first, because `FocusWebView` already unfocuses every other webview.
+    #[test]
+    fn a_sync_with_a_displayed_tab_sends_a_focus_and_never_a_blur() {
+        // Whatever the table's order and whichever tab is displayed.
+        for first in [1_u64, 2, 3] {
+            for displayed in [1_u64, 2, 3] {
+                assert_eq!(
+                    focus_action(Some(displayed), Some(first)),
+                    FocusAction::Focus(displayed),
+                    "a table led by {first} with {displayed} displayed did not simply \
+                     focus the displayed tab",
+                );
+            }
+        }
+    }
+
+    /// And the only time a blur is sent is the one time it means what it says:
+    /// nothing should hold focus.
+    #[test]
+    fn a_sync_with_nothing_displayed_blurs_once_and_only_then() {
+        assert_eq!(focus_action(None, Some(7)), FocusAction::BlurAll(7));
+        // No tabs at all: nothing to send it through, and nothing to say.
+        assert_eq!(focus_action(None, None), FocusAction::Nothing);
+        // The blur arm is unreachable while anything is displayed, which is
+        // the assertion the order-dependent bug would have failed.
+        assert!(!matches!(focus_action(Some(1), Some(2)), FocusAction::BlurAll(_)));
     }
 }
