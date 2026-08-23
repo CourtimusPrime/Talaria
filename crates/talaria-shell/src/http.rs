@@ -680,16 +680,48 @@ struct ViewSocketHandle {
 }
 
 impl ViewSockets {
-    /// Track an accepted socket. Called once per connection, at accept time,
-    /// before the client is told anything.
-    fn register(&self, connection: u64, client_id: &str, close: oneshot::Sender<()>) {
-        if let Ok(mut open) = self.open.lock() {
-            open.push(ViewSocketHandle {
-                connection,
-                client_id: client_id.to_owned(),
-                close,
-            });
+    /// Track an accepted socket, answering whether there was room for it.
+    /// Called once per connection, at accept time, before the client is told
+    /// anything.
+    ///
+    /// **This is the authoritative connection cap and the only atomic one**
+    /// (CR-02). [`view_upgrade`] asks [`ViewSockets::has_capacity`] first so a
+    /// legitimate client that is over the ceiling gets a legible HTTP answer
+    /// rather than a socket that opens and shuts, but that check and this push
+    /// are two operations: two upgrades racing could both pass it. The count
+    /// and the push happen here under one lock, so the table itself can never
+    /// exceed the cap however many upgrades arrive at once.
+    ///
+    /// A poisoned table answers `false` rather than pushing, which is the
+    /// degrade direction the rest of this type already takes: a socket that
+    /// could not be tracked is a socket a revoke could never close.
+    fn register(&self, connection: u64, client_id: &str, close: oneshot::Sender<()>) -> bool {
+        let Ok(mut open) = self.open.lock() else {
+            log::error!("the view socket table is poisoned; no view socket was accepted");
+            return false;
+        };
+        if open.len() >= crate::view::max_view_connections() {
+            return false;
         }
+        open.push(ViewSocketHandle {
+            connection,
+            client_id: client_id.to_owned(),
+            close,
+        });
+        true
+    }
+
+    /// Whether another view socket would fit, without taking the slot.
+    ///
+    /// Advisory only — see [`ViewSockets::register`], which is the gate. This
+    /// exists so the refusal an authenticated client hits is an HTTP status
+    /// with a body it can read, rather than a completed upgrade that closes a
+    /// moment later.
+    fn has_capacity(&self) -> bool {
+        self.open
+            .lock()
+            .map(|open| open.len() < crate::view::max_view_connections())
+            .unwrap_or(false)
     }
 
     /// Forget a socket that ended on its own. `true` if it was still tracked.
@@ -1602,8 +1634,20 @@ impl ViewRoute {
         let connection = next_view_connection();
         let (close_tx, mut close_rx) = oneshot::channel::<()>();
         // Registered before the client is told anything, so there is no window
-        // in which a socket is live and a revoke cannot reach it.
-        self.views.register(connection, &client_id, close_tx);
+        // in which a socket is live and a revoke cannot reach it — and the
+        // registration is also the connection cap, so a socket that does not
+        // fit is one this task never speaks the wire on. Reached only when two
+        // upgrades raced the advisory check in [`view_upgrade`]; the client
+        // has already had the readable answer in the ordinary case.
+        if !self.views.register(connection, &client_id, close_tx) {
+            log::warn!(
+                "view connection from client {client_id} refused: this browser already \
+                 serves its ceiling of {} view sockets",
+                crate::view::max_view_connections(),
+            );
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
         log::info!("view connection {connection} opened by client {client_id}");
 
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -1743,7 +1787,42 @@ async fn view_upgrade(
         log::debug!("remote access refused an unauthenticated view upgrade");
         return view_refusal();
     };
+    // **Third gate, and deliberately after the second** (CR-02). A capacity
+    // answer that differed from [`view_refusal`] would be an oracle if an
+    // unauthenticated party could reach it, so it is reached only by a client
+    // whose token this server has already accepted. To that client it is
+    // legible on purpose: it is not "your credential is not accepted", it is
+    // "this browser is already serving as many viewers as it will".
+    if !route.views.has_capacity() {
+        log::info!("remote access refused a view upgrade from client {client_id}: at capacity");
+        return view_at_capacity();
+    }
     upgrade.on_upgrade(move |socket| route.run(socket, client_id))
+}
+
+/// The body an **authenticated** client gets when this browser is already
+/// serving its ceiling of view sockets.
+///
+/// Distinct from [`view_refusal`], and that is the point: a client that hit
+/// the ceiling has done nothing wrong, and telling it that its credential was
+/// rejected would send its operator looking at the token. It says which
+/// ceiling and which variable moves it, which is information this reader has
+/// already proved it is entitled to.
+///
+/// `503` rather than `429`: the limit is on what this process can hold at
+/// once, not on how fast this client asked, and it clears when a viewer
+/// leaves rather than when a window passes.
+fn view_at_capacity() -> rust_mcp_axum::axum::response::Response {
+    use rust_mcp_axum::axum::response::IntoResponse as _;
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "this browser is already serving {} view connections, which is its ceiling; \
+             close one, or raise TALARIA_VIEW_MAX_CONNECTIONS on the machine running it",
+            crate::view::max_view_connections(),
+        ),
+    )
+        .into_response()
 }
 
 /// The one body a refused view upgrade ever returns.
@@ -2334,6 +2413,45 @@ mod tests {
         assert!(!views.remove(1), "a socket that already ended was removed twice");
         // Removing is not closing: the connection ended under its own power.
         assert!(was_closed(&mut fired), "the handle outlived the table entry");
+    }
+
+    /// CR-02: nothing capped view connections, so one token bought as many
+    /// pumps as the holder cared to open.
+    ///
+    /// The cap is counted and taken under one lock, which is what makes it
+    /// hold against upgrades arriving at once — the advisory check in
+    /// `view_upgrade` exists only so an authenticated client gets a readable
+    /// answer rather than a socket that opens and shuts.
+    #[test]
+    fn a_view_socket_beyond_the_connection_cap_is_not_accepted() {
+        let cap = crate::view::max_view_connections();
+        assert!(cap > 0, "a cap of zero would close the view channel entirely");
+        let views = ViewSockets::default();
+        let mut handles = Vec::new();
+        for connection in 0..cap as u64 {
+            let (close, fired) = a_view_socket();
+            assert!(
+                views.register(connection, "client-a", close),
+                "connection {connection} was refused inside the cap",
+            );
+            handles.push(fired);
+        }
+        assert_eq!(views.tracked(), cap);
+        assert!(!views.has_capacity(), "the table reports room it does not have");
+
+        let (over, _over_fired) = a_view_socket();
+        assert!(
+            !views.register(cap as u64, "client-a", over),
+            "a view socket beyond the cap was accepted",
+        );
+        assert_eq!(views.tracked(), cap, "a refused socket was tracked anyway");
+
+        // One leaving makes room, so the cap bounds what is live rather than
+        // what has ever connected — the same distinction `remove` exists for.
+        assert!(views.remove(0));
+        assert!(views.has_capacity());
+        let (again, _again_fired) = a_view_socket();
+        assert!(views.register(cap as u64, "client-a", again));
     }
 
     /// The property a revoke needs: one client's sockets close and no other

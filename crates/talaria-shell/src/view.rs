@@ -117,9 +117,54 @@ pub fn decode_control(payload: &[u8]) -> Option<ClientView> {
 /// this is the one place that can refuse before anything is leased.
 ///
 /// Eight is a viewer watching several agents at once and nothing like a load
-/// generator. It is a per-connection number, not a per-client one; the number
-/// of connections is bounded by the token holder, and by a revoke.
+/// generator.
+///
+/// **It is a per-connection number and it is not the one that bounds the
+/// cost**, which is the correction CR-02 made. This doc used to close with
+/// "the number of connections is bounded by the token holder, and by a
+/// revoke", and that clause was the whole hole: in this threat the token
+/// holder *is* the attacker, so a per-connection ceiling bounds a number the
+/// attacker chooses. The two caps that actually bound the readback cost are
+/// [`DEFAULT_MAX_VIEW_CONNECTIONS`] and [`DEFAULT_MAX_TOTAL_ATTACH`]; this one
+/// stays because refusing before anything is leased is still the right place
+/// to say no to one connection asking for too much.
 const DEFAULT_MAX_ATTACH: usize = 8;
+
+/// The default ceiling on how many `/view` sockets this process serves at
+/// once, whoever owns them.
+///
+/// **A total, because the per-connection cap bounds nothing an attacker has to
+/// respect (CR-02).** One accepted token, K WebSocket upgrades, eight
+/// attachments each: `take_due` walks every session and every attachment, so
+/// the pump performs `K × 8` paints and framebuffer readbacks per interval on
+/// the winit main thread. The browser stops answering the human, and the
+/// consent panel that would revoke the token is drawn by the loop that is now
+/// saturated — the operator's recovery path is the thing that stops
+/// responding.
+///
+/// Four is chosen from the shape this phase exists for rather than from a
+/// benchmark: one human at one other machine, watching. That is one live
+/// socket. Four leaves room for a second window, for a reconnect racing a
+/// socket the far end has already abandoned but this end has not yet noticed,
+/// and for one spare — while staying an order of magnitude below any number at
+/// which the socket bookkeeping itself matters. The expensive resource is
+/// attachments rather than connections, and that is capped in its own right by
+/// [`DEFAULT_MAX_TOTAL_ATTACH`].
+pub const DEFAULT_MAX_VIEW_CONNECTIONS: usize = 4;
+
+/// The default ceiling on live attachments across **every** connection.
+///
+/// The number that bounds what the winit loop pays: one attachment is one
+/// `paint()` and one framebuffer readback per tick, and 05-02 measured that
+/// pair at about a fifth of a 30 ms tick. Eight of them is already more than
+/// one tick can hold at the fastest rung, which is what the rung ladder exists
+/// to degrade — but past this point degrading is not enough and the honest
+/// answer is to refuse the lease.
+///
+/// Deliberately the same number as [`DEFAULT_MAX_ATTACH`], so a single viewer
+/// can still reach the full complement that cap always advertised, and so a
+/// second viewer cannot multiply it.
+const DEFAULT_MAX_TOTAL_ATTACH: usize = 8;
 
 /// The cap's environment override, `TALARIA_VIEW_MAX_ATTACH`.
 ///
@@ -143,6 +188,38 @@ fn parse_max_attachments(raw: Option<&str>) -> usize {
     raw.and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MAX_ATTACH)
+}
+
+/// The connection cap's environment override,
+/// `TALARIA_VIEW_MAX_CONNECTIONS`.
+///
+/// The same shape [`max_attachments`] uses, and for the same reason: an unset
+/// variable, a value that is not a number and a value of zero all fall back to
+/// the default — **never to zero and never to unbounded**.
+pub fn max_view_connections() -> usize {
+    parse_max_view_connections(std::env::var("TALARIA_VIEW_MAX_CONNECTIONS").ok().as_deref())
+}
+
+/// The connection cap the override spells, or the default. Split out with the
+/// raw value as a parameter so a bad value is assertable without one test's
+/// environment becoming another's answer.
+fn parse_max_view_connections(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_VIEW_CONNECTIONS)
+}
+
+/// The total-attachment cap's environment override,
+/// `TALARIA_VIEW_MAX_TOTAL_ATTACH`. Same shape, same refusals.
+pub fn max_total_attachments() -> usize {
+    parse_max_total_attachments(std::env::var("TALARIA_VIEW_MAX_TOTAL_ATTACH").ok().as_deref())
+}
+
+/// The total cap the override spells, or the default.
+fn parse_max_total_attachments(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_TOTAL_ATTACH)
 }
 
 /// The idle threshold, overridable through
@@ -1210,6 +1287,13 @@ impl ViewSessions {
             return;
         }
         let cap = max_attachments();
+        // **The total, counted before the per-connection one is consulted.**
+        // The per-connection cap bounds a number the attacker chooses, because
+        // nothing stops that attacker opening more connections; this is the
+        // one that bounds what the winit loop pays per tick (CR-02). It is the
+        // same refusal, as every refusal here is.
+        let total_cap = max_total_attachments();
+        let total: usize = self.sessions.iter().map(|session| session.attached.len()).sum();
         let now = Instant::now();
         let mut take_hold = false;
         {
@@ -1230,7 +1314,7 @@ impl ViewSessions {
                     attachment.pull_forward(rung, now);
                 },
                 None => {
-                    if session.attached.len() >= cap {
+                    if session.attached.len() >= cap || total >= total_cap {
                         session.send(refused_frame());
                         return;
                     }
@@ -1888,6 +1972,68 @@ mod tests {
                 parse_max_attachments(bad),
                 DEFAULT_MAX_ATTACH,
                 "{bad:?} did not fall back to the default"
+            );
+        }
+    }
+
+    /// CR-02: the attachment cap is per connection, so the cost the browser
+    /// pays is bounded only by a **total** the attacker cannot multiply by
+    /// opening more sockets.
+    #[test]
+    fn attaching_beyond_the_total_cap_is_refused_across_connections() {
+        let all: Vec<(u64, bool)> = (1..=(DEFAULT_MAX_TOTAL_ATTACH as u64 + 2))
+            .map(|id| (id, true))
+            .collect();
+        let mut tabs = FakeTabs::with(&all);
+        let mut sessions = ViewSessions::default();
+        // Spread over two connections, each staying inside its own per-
+        // connection cap, so the only thing that can refuse is the total.
+        let mut first = connect(&mut sessions, 1, "client-a");
+        let mut second = connect(&mut sessions, 2, "client-a");
+        let _ = first.drain();
+        let _ = second.drain();
+
+        let half = DEFAULT_MAX_TOTAL_ATTACH as u64 / 2;
+        assert!(
+            (half as usize) < DEFAULT_MAX_ATTACH,
+            "each connection must stay inside its own cap or this asserts the wrong one",
+        );
+        for id in 1..=half {
+            attach(&mut sessions, &first, id, &mut tabs);
+        }
+        for id in (half + 1)..=(half * 2) {
+            attach(&mut sessions, &second, id, &mut tabs);
+        }
+        assert_eq!(first.control().len(), half as usize, "an attach inside the total was refused");
+        assert_eq!(second.control().len(), half as usize);
+
+        // The next one, on either connection, is over the total.
+        attach(&mut sessions, &second, DEFAULT_MAX_TOTAL_ATTACH as u64 + 1, &mut tabs);
+        assert_eq!(second.control(), vec![ServerView::Refused]);
+        assert_eq!(
+            sessions.session_mut(2).expect("the session").attachment_count(),
+            half as usize,
+            "a refused attach was recorded anyway",
+        );
+        assert_eq!(tabs.held(DEFAULT_MAX_TOTAL_ATTACH as u64 + 1), 0, "a refused attach took a hold");
+    }
+
+    /// Both new caps' overrides land on their defaults for anything they
+    /// cannot read, and never on zero and never on unbounded.
+    #[test]
+    fn the_connection_and_total_caps_fall_back_to_their_defaults_and_never_to_zero() {
+        assert_eq!(parse_max_view_connections(Some("2")), 2);
+        assert_eq!(parse_max_total_attachments(Some("  16  ")), 16);
+        for bad in [None, Some(""), Some("0"), Some("-1"), Some("lots"), Some("2.5")] {
+            assert_eq!(
+                parse_max_view_connections(bad),
+                DEFAULT_MAX_VIEW_CONNECTIONS,
+                "{bad:?} did not fall back to the connection default"
+            );
+            assert_eq!(
+                parse_max_total_attachments(bad),
+                DEFAULT_MAX_TOTAL_ATTACH,
+                "{bad:?} did not fall back to the total default"
             );
         }
     }

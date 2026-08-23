@@ -197,6 +197,16 @@ PROTOCOL_VERSION = 1
 # there *is* a ceiling and that crossing it is refused, not what the number is.
 MAX_ATTACH = 2
 
+# The view-connection ceiling the shell is started with, and it is *exactly*
+# the number of sockets this suite holds open at its peak — the two viewers of
+# the snapshot section, the input section's, and the two of the frame section.
+# Pinned rather than raised out of the way, so the ceiling is reachable and the
+# refusal that guards it is asserted with a real upgrade rather than reasoned
+# about. Its default is lower; the property under test is that there *is* a
+# ceiling, that crossing it is refused, and that an authenticated client can
+# tell that refusal from a rejected credential.
+MAX_VIEW_CONNECTIONS = 5
+
 
 def wheel_line_pixels():
     """How far the shell says one wheel notch travels, read out of its source.
@@ -716,6 +726,7 @@ try:
     tal = harness.start_shell("about:blank", log=log, rust_log="info", wait=10,
                               HOME=tmp, XDG_CONFIG_HOME=config,
                               TALARIA_VIEW_MAX_ATTACH=str(MAX_ATTACH),
+                              TALARIA_VIEW_MAX_CONNECTIONS=str(MAX_VIEW_CONNECTIONS),
                               TALARIA_TEST_HOOKS="1")
     assert wait_until_accepting("127.0.0.1", port), f"the listener never bound {port}"
     print(f"BOUND: the listener accepts 127.0.0.1:{port}")
@@ -1284,7 +1295,48 @@ try:
     print("INDEPENDENT: one viewer detaching left the other receiving, and the "
           "tab is still held once")
 
-    # --- 33. the local display did not move, pixel for pixel -------------
+    # --- 33. the connection ceiling, at the suite's own peak -------------
+    # CR-02: the concurrent-attachment cap is counted per *connection*, and
+    # nothing capped connections — so one token bought as many frame pumps as
+    # its holder cared to open, each of them paying paints and framebuffer
+    # readbacks on the winit main thread, and the Access panel that would
+    # revoke that token is drawn by the loop being saturated.
+    #
+    # This is asserted here rather than earlier because here is where the
+    # suite's own open sockets reach the ceiling, so the refusal is produced by
+    # a real upgrade against a real ceiling rather than by a lowered one.
+    #
+    # The **status is the assertion**, not merely that it failed: a client that
+    # hit the ceiling has done nothing wrong, and answering it the way an
+    # unknown token is answered would send its operator looking at the token.
+    # The capacity answer is reachable only after the credential was accepted,
+    # so it is not an oracle for which tokens exist.
+    assert len([s for s in sockets if s.handshook()]) == MAX_VIEW_CONNECTIONS, (
+        "this suite is not holding the number of view sockets the ceiling was "
+        "set to, so the refusal below would be measuring the wrong thing",
+        MAX_VIEW_CONNECTIONS)
+    over = harness.WebSocket("127.0.0.1", port, token=TOKEN)
+    sockets.append(over)
+    assert over.status == 503, (
+        "a view upgrade past the connection ceiling was accepted, or refused "
+        "with the wrong answer", over.status, over.body[:200])
+    assert over.status != bare.status, (
+        "a client that hit the connection ceiling is told its credential was "
+        "rejected, which sends its operator looking at the wrong thing",
+        over.status, over.body[:200])
+    assert view_holds(watched) == 1, \
+        ("the refused upgrade disturbed a lease somebody else holds",
+         view_holds(watched))
+    settle_frames(seer)
+    evaluate(watched, "document.body.style.background = '#5a5'")
+    assert next_frame(seer) is not None, \
+        "a refused upgrade stopped an accepted viewer's frames"
+    print(f"CONNECTION CEILING: with {MAX_VIEW_CONNECTIONS} view sockets open, "
+          f"a further authenticated upgrade is refused {over.status} — a "
+          f"different answer from the {bare.status} an unknown token gets — and "
+          f"the viewers already connected carry on")
+
+    # --- 34. the local display did not move, pixel for pixel -------------
     # Read over the control socket rather than over the channel under test,
     # before and after a whole frame exchange — and the human's own tab is
     # captured both times and compared byte for byte, which is the per-tab
@@ -1321,7 +1373,7 @@ try:
           f"still {focused_before}, and the human's own tab is byte-identical "
           f"across a whole frame exchange on another tab")
 
-    # --- 34. closing the tab detaches, releases and stops the frames -----
+    # --- 35. closing the tab detaches, releases and stops the frames -----
     assert rpc("tabs_close", tab_id=watched)["outcome"] == "ok"
     notice = None
     deadline = time.monotonic() + 10
@@ -1347,7 +1399,7 @@ try:
     # Everything above composes wire messages by hand. Nothing below does.
     # ======================================================================
 
-    # --- 35. the client's empty state, before there is anything to list ---
+    # --- 36. the client's empty state, before there is anything to list ---
     # Every agent tab the sections above left behind is closed first, so "no
     # agent has opened a tab on this server" is the *true* state rather than a
     # pane that happens to be blank. The empty-state label is only drawn while
@@ -1367,7 +1419,7 @@ try:
     print("CLIENT EMPTY STATE: the real client connected and drew the "
           "no-agent-tabs copy rather than a blank pane")
 
-    # --- 36. an agent tab appears in the real client's list ---------------
+    # --- 37. an agent tab appears in the real client's list ---------------
     remote = rpc("tabs_open", client="agent-remote", url=f"{BASE}/index.html")
     assert remote["outcome"] == "ok", remote
     remote = remote["result"]["tab"]["tab_id"]
@@ -1378,7 +1430,7 @@ try:
     print(f"CLIENT LISTED: agent tab {remote} has a row and a Watch control in "
           f"the real client")
 
-    # --- 37. the client's window, deliberately the wrong size -------------
+    # --- 38. the client's window, deliberately the wrong size -------------
     # The transform must be exercised rather than accidentally be the identity.
     # The client's page area is already narrower than the server's tab — its own
     # controls take a fixed strip — and the window is resized on top of that so
@@ -1405,11 +1457,11 @@ try:
           f"{after_area['width']:.0f}x{after_area['height']:.0f} points against "
           f"a server tab this section reads below")
 
-    # --- 38. the server's tab viewport, before anybody attaches ----------
+    # --- 39. the server's tab viewport, before anybody attaches ----------
     viewport_before = tab_viewport(remote)
     assert view_holds(remote) == 0, "a tab was held before anyone attached"
 
-    # --- 39. attach through the client's OWN control, with a real pointer -
+    # --- 40. attach through the client's OWN control, with a real pointer -
     click_client(client_window, watch)
     held = None
     deadline = time.monotonic() + 15
@@ -1428,7 +1480,7 @@ try:
     print(f"CLIENT ATTACHED: a real click on the client's own control attached "
           f"it to tab {remote}, and the server holds it once")
 
-    # --- 40. and the server's tab viewport is unchanged by it ------------
+    # --- 41. and the server's tab viewport is unchanged by it ------------
     # The decision this whole design turns on: the viewer adapts to the page.
     # A client that asked the server to resize the tab to its own window would
     # make an agent's layout a function of who is looking at it.
@@ -1444,7 +1496,7 @@ try:
           f"{viewport_before[0]}x{viewport_before[1]} device pixels, and the "
           f"client adapted to it rather than the other way round")
 
-    # --- 41. a real click through the client lands on the LOWER link ------
+    # --- 42. a real click through the client lands on the LOWER link ------
     # The same decoy discipline the wire path uses, aimed across a process
     # boundary and through the client's own transform. Asserted over the control
     # socket, so the frame path is not also the thing reporting success.
@@ -1460,7 +1512,7 @@ try:
     print(f"CLIENT AIMED LOWER: a real pointer in the client's window reached "
           f"{landed.rsplit('/', 1)[-1]}, not the decoy above it")
 
-    # --- 42. the decoy is reachable through the client too ---------------
+    # --- 43. the decoy is reachable through the client too ---------------
     assert rpc("navigate", tab_id=remote, url=f"{BASE}/index.html")["outcome"] == "ok"
     wait_for_url(remote, "/index.html")
     click_page(client, client_window, marks["decoy-lower"])
@@ -1472,7 +1524,7 @@ try:
           "toolbar-height above the lower link is hit — so the offset "
           "regression would be named rather than merely missed")
 
-    # --- 43. and the other direction, at the UPPER link ------------------
+    # --- 44. and the other direction, at the UPPER link ------------------
     assert rpc("navigate", tab_id=remote, url=f"{BASE}/index.html")["outcome"] == "ok"
     wait_for_url(remote, "/index.html")
     click_page(client, client_window, marks["upper"])
@@ -1487,7 +1539,7 @@ try:
           f"{landed.rsplit('/', 1)[-1]}, so the transform is proven in both "
           f"directions rather than coincidentally right in one")
 
-    # --- 44. real keystrokes reach a BACKGROUND agent tab ----------------
+    # --- 45. real keystrokes reach a BACKGROUND agent tab ----------------
     # The local human has been looking at their own tab since section 23, so
     # this tab is shown-and-blurred rather than displayed. Servo's keyboard
     # focus is a different thing from visibility, and this is the assertion that
@@ -1511,7 +1563,7 @@ try:
     print(f"CLIENT TYPED: the field of a background agent tab reads {typed!r} "
           f"after real keystrokes at the client's own window")
 
-    # --- 45. a click in the letterboxed MARGIN sends nothing -------------
+    # --- 46. a click in the letterboxed MARGIN sends nothing -------------
     # Inside the client's page area and outside the fitted picture, which the
     # mismatched window size guarantees exists. Not clamped to the page's edge:
     # clamping would turn "the human aimed at the margin" into a click at the
@@ -1534,7 +1586,7 @@ try:
     print(f"MARGIN SILENT: a real click {margin:.0f} points above the picture, "
           f"inside the client's page area, reached the server not at all")
 
-    # --- 46. and a click on the client's OWN controls sends nothing ------
+    # --- 47. and a click on the client's OWN controls sends nothing ------
     row = client_rect(client, "tabs.row.0")
     click_client(client_window, row)
     time.sleep(2.5)
@@ -1548,7 +1600,7 @@ try:
     print("CLIENT CHROME: a real click on the client's own tab row reached the "
           "page not at all, and the attachment survived it")
 
-    # --- 47. the picture is arriving, and the echo reached the click -----
+    # --- 48. the picture is arriving, and the echo reached the click -----
     # Without reading a pixel. The client reports what it applied and what the
     # server echoed; a page change is forced first, because silence is the
     # correct answer to a static page and never a symptom.
@@ -1577,7 +1629,7 @@ try:
           f"{applied_after:.0f}, and the echoed input sequence {echoed:.0f} "
           f"reached the {sent:.0f} the client had sent")
 
-    # --- 48. a remote wheel notch travels as far as a local one -----------
+    # --- 49. a remote wheel notch travels as far as a local one -----------
     # The one input verb that shipped with no end-to-end assertion at all,
     # which is why a 76x error in it survived a phase. The quantity asserted
     # is a **distance**, not "something moved": the defect delivered the
@@ -1633,7 +1685,7 @@ try:
           f"agent tab {scrolled} px, against the {notches * notch:.0f} px the "
           f"local path's own constant says {notches} notches travel")
 
-    # --- 49. the local human's window never moved -------------------------
+    # --- 50. the local human's window never moved -------------------------
     assert window_title(wid, X) == displayed_before, (
         "the real client changed the displayed tab or the view mode",
         displayed_before, window_title(wid, X))
