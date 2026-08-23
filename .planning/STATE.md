@@ -5,13 +5,13 @@ milestone_name: milestone
 current_phase: 5
 current_phase_name: v2
 status: executing
-stopped_at: Completed 05-08-PLAN.md
-last_updated: "2026-08-23T17:17:03.112Z"
+stopped_at: Completed 05-09-PLAN.md
+last_updated: "2026-08-23T18:26:03.055Z"
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 34
-  completed_plans: 31
+  completed_plans: 32
 ---
 
 # Project State
@@ -26,13 +26,29 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 8 of 11 executed (waves 1-4 complete; wave 5 done — 05-08 landed, 05-09 next)
+Plan: 9 of 11 executed (waves 1-5 complete; wave 6 done — 05-09 landed, 05-10 next)
 Status: Ready to execute
 Next: `/gsd-execute-phase 5`
 
 Phase 4 is closed. AUTH-01, AUTH-02 and AUTH-03 are Complete; verification passed after four
-code-review blockers were fixed. Phases 1–3 (v1) remain feature-complete. At 05-08's tip the tree
-stands at **448 unit tests** and **e2e 23/23, `failed: none`**.
+code-review blockers were fixed. Phases 1–3 (v1) remain feature-complete. At 05-09's tip the tree
+stands at **486 unit tests** and **e2e 23/23, `failed: none`**.
+
+**05-09 closed Success Criterion 1's loopback half.** A human at a `talaria-client` can watch an
+agent's tab and take it over: the end-to-end suite starts the real client binary, attaches through
+its own control with a real pointer, clicks links in both directions through the client's window,
+types into a *background* agent tab with real keystrokes, and asserts every effect over the control
+socket. One fit transform lives in `present.rs` and is inverted in `input.rs` — `grep -c 'fn fit'`
+is 1 and 0 respectively — a position outside the fitted picture sends nothing rather than being
+moved to the page's edge (`grep -ci 'clamp'` is 0), and `Viewport` appears nowhere in the client, so
+no wire message ever asks the server to resize a tab. **The two-machine run over Tailscale stays a
+manual item**, because two machines are not something a suite on one machine can produce; 05-11 owns
+the script.
+
+Two things 05-09 recorded rather than fixed, both in `deferred-items.md`: 05-08's open question
+about remote keyboard to a held-but-not-focused background tab is now **answered yes**, and a shell
+bug was found — `screenshot` on a tab a viewer is watching re-hides the webview without consulting
+the view hold count, so the viewer's clicks stop landing while its frames carry on arriving.
 
 **05-07 added a second binary.** `talaria-client` is D-05-01's other half: 222 dependency crates
 against the shell's 690, a 19 MB binary against 183 MB, and no web engine at all. It connects over a
@@ -143,6 +159,7 @@ Phase 5 keeps per-task commits.
 | Phase 05 P06 | 76min | 3 tasks | 6 files |
 | Phase 05 P07 | 96min | 3 tasks | 8 files |
 | Phase 05 P08 | 95min | 3 tasks | 7 files |
+| Phase 05 P09 | 175 | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -308,6 +325,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T17:16:55.870Z
-Stopped at: Completed 05-08-PLAN.md
+Last session: 2026-08-23T18:26:03.049Z
+Stopped at: Completed 05-09-PLAN.md
 Resume file: None
