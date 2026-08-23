@@ -141,6 +141,44 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Added
 
+- **A remote viewer now receives pixels: a keyframe on attach, only what changed
+  afterwards, and nothing at all while the page is static.** Attaching to a tab
+  takes a *visibility hold* on it (`crates/talaria-shell/src/tabs.rs`) — a count
+  rather than a flag, because two viewers may hold one tab and the first to
+  leave must not release it — and that hold is what closes the gap the input
+  work left behind: Servo answers a hit test only for a shown webview, so before
+  this a remote click on a tab the local human was not looking at reached
+  nothing at all. A held tab is shown and deliberately **not** focused, the tab
+  the human is displaying always wins, and the view module names no active-tab
+  setter, no view mode and no focus call, so an attachment cannot move, refocus
+  or blank anything on the local screen. Each tab renders into its own
+  framebuffer, and the end-to-end suite now proves rather than cites it: the
+  human's own tab is captured before and after a whole frame exchange on another
+  tab and compared byte for byte.
+
+  The pump paints unconditionally on its own tick instead of waiting for a
+  repaint notification — the engine's documentation licenses it, a settled page
+  never produces one, and the one-shot screenshot path answers the wait with a
+  one-and-a-half-second timeout, which at thirty ticks a second would deliver
+  nothing until each one expired. Its cadence joins the event loop's existing
+  wait computation rather than installing a second control-flow source: 30 ms
+  while a viewer is driving the tab, requested unconditionally on every machine,
+  and 250 ms while nobody is, with the transition on
+  `TALARIA_VIEW_IDLE_MS`-since-the-last-accepted-input. With no viewer attached
+  there is no tick, no readback and no tab held shown.
+
+  Everything after the readback happens on a fourth off-thread actor,
+  `talaria-frames`: a 64×64 tile comparison with a short-circuit on the first
+  differing row, a keyframe whenever more than nine twenty-sixths of the grid
+  changed (a scroll is one keyframe, not hundreds of tile messages), and a PNG
+  encoder that is a **sibling** of the screenshot encoder rather than a
+  modification of it — the screenshot path is byte-identical and still has its
+  one call site. One previous-frame buffer per *attachment*, released on detach,
+  on disconnect and on the tab closing; that release is the memory bound. The
+  thread degrades rather than aborting: a browser whose frame encoder could not
+  start is still a browser, and a viewer is refused with the one refusal instead
+  of being left on a stream that would never produce a frame
+  (`crates/talaria-shell/src/view.rs`).
 - **A remote human can now click, scroll and type into an agent's tab — and into
   nothing else.** Input arriving on the `/view` channel enters the engine through
   one module, `crates/talaria-shell/src/remote_input.rs`, which reaches a

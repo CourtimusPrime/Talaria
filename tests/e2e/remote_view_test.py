@@ -60,15 +60,52 @@ And then the input half, DIST-02:
     window's title and the set of focused tabs are unchanged across the whole
     remote input sequence.
 
-**Its honest limits.** Everything here runs on loopback. That proves the
-protocol and the authorisation and proves **nothing** about the network: TLS
-termination, the tailnet `Host`, relay latency and the two-machine case are
-05-10's and the manual verification's, not this suite's.
+And then the frame half, also DIST-02:
 
-The input assertions drive a tab that is **on screen**, because until the frame
-plan lands an attachment does not show a webview and a hidden one has no hit
-test to answer a click. The suite switches the local view to Agents itself, the
-way a human would, and says so at the step that does it.
+  * **The first frame after an attach is a whole keyframe**, at the origin,
+    covering the whole surface, and declaring the same size the attach
+    acknowledgement did — so a client can allocate its texture before the first
+    frame rather than reflow on it.
+  * **A page nobody is touching sends nothing at all.** Read across many ticks
+    with the page untouched, not one frame arrives. This is the delta model's
+    whole payoff and it is the assertion a pump built on the one-shot
+    screenshot path would fail.
+  * **A small change is a delta over a region smaller than the surface**, with
+    a frame sequence greater than the keyframe's, and **a large change is a
+    keyframe** instead — the dirty-tile threshold, observed rather than
+    reasoned about.
+  * **A viewport change produces a keyframe**, so a client that just
+    reallocated its texture is given a whole surface to fill it with.
+  * **Every frame echoes the last input the server had applied when it
+    painted**, which is what lets a client discard a frame that predates its
+    own most recent click. Asserted as present and correct, with no claim about
+    timing.
+  * **Two viewers on one tab are independent**: each gets its own keyframe and
+    its own sequence space, detaching one leaves the other receiving, and the
+    tab is released only when the last of them leaves — read back over the
+    control socket, because a released lease is an absence and every other
+    symptom of it is indistinguishable from a viewer with nothing to send.
+  * **A viewer attached to a background tab moves nothing the human sees.** The
+    displayed tab, the view mode and the set of focused tabs are read over the
+    control socket before and after a whole frame exchange, and the human's own
+    tab is captured before and after and compared **pixel for pixel** — the
+    per-tab-framebuffer invariant asserted rather than cited.
+  * **Closing the attached tab detaches the viewer and stops the frames**
+    without dropping its connection.
+
+**Its honest limits.** Everything here runs on loopback under software
+rendering. That proves the protocol, the authorisation and the delta behaviour,
+and proves **nothing** about the network or about what this costs on real
+hardware: TLS termination, the tailnet `Host`, relay behaviour, the rate
+ladder and the two-machine case are 05-10's and the manual verification's, not
+this suite's. **Nothing here makes a timing claim of any kind**, deliberately:
+measuring on loopback and declaring a budget met is the pitfall the phase's
+research names by name.
+
+The input assertions drive a tab that is **on screen**. An attachment now shows
+its tab, so a click on a background agent tab would reach a page — but the
+input half was written before that and the on-screen setup is what makes its
+refusal assertions mean what they say, so it is left exactly as it was.
 
 The credentials panel draws no named rectangle while the vault is empty, so
 "no panel opened" is measured on the history panel's rows — a probe this suite
@@ -87,6 +124,7 @@ import os
 import shutil
 import socket
 import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
@@ -103,6 +141,17 @@ import harness
 CHANNEL_CONTROL = 0x01
 CHANNEL_TABS = 0x02
 CHANNEL_INPUT = 0x04
+CHANNEL_FRAME = 0x10
+
+# The frame header's fixed layout (`talaria_protocol::wire::FrameHeader`),
+# spelled out here for the same reason the tags are: this suite is a client on
+# the far side of the wire, and decoding the header by hand is what makes it
+# one. A layout drift shows up as a decode that does not agree with the tab's
+# real geometry rather than as an import that stopped compiling.
+FRAME_HEADER_LEN = 51
+FRAME_FORMAT_VERSION = 1
+KEYFRAME = 0
+TILE = 1
 
 # The wire version the server announces. A mismatch here means the shell and
 # this suite were built against different wires, which is worth failing on.
@@ -239,6 +288,79 @@ def read(ws, channel, timeout=6.0):
             return json.loads(message[1:])
         if time.monotonic() > deadline:
             return None
+
+
+def decode_frame(message):
+    """One frame-channel message, taken apart into a header dict and a payload.
+
+    Every refusal the shell's own decoder makes is re-made here, so a header
+    this suite accepts is one the wire would: a short slice, a format version
+    this build does not know, a kind naming no kind, a zero scale, a tile with
+    no area, and a tile that does not fit inside the frame it declares."""
+    body = message[1:]
+    assert len(body) > FRAME_HEADER_LEN, ("a frame carried no payload", len(body))
+    assert body[0] == FRAME_FORMAT_VERSION, ("unknown frame format", body[0])
+    assert body[1] in (KEYFRAME, TILE), ("unknown frame kind", body[1])
+    scale = body[2]
+    assert scale > 0, "a frame declared a zero scale"
+    fields = struct.unpack_from("<QQQIIIIII", body, 3)
+    header = dict(zip(("tab", "seq", "last_applied", "x", "y",
+                       "width", "height", "frame_width", "frame_height"),
+                      fields))
+    header["kind"] = body[1]
+    header["scale"] = scale
+    assert header["width"] > 0 and header["height"] > 0, ("a tile with no area", header)
+    assert header["x"] + header["width"] <= header["frame_width"], header
+    assert header["y"] + header["height"] <= header["frame_height"], header
+    payload = body[FRAME_HEADER_LEN:]
+    assert payload[:8] == b"\x89PNG\r\n\x1a\n", ("a frame payload is not a PNG", payload[:8])
+    return header, payload
+
+
+def next_frame(ws, timeout=8.0):
+    """The next frame message's header and payload, or ``None`` if none comes.
+
+    Skips the other channels the way :func:`read` does, and for the same
+    reason: several channels are in flight at once and a reader that took
+    whatever arrived first would be asserting about the wrong one."""
+    deadline = time.monotonic() + timeout
+    while True:
+        message = ws.next_message(max(0.0, deadline - time.monotonic()))
+        if message is None:
+            return None
+        if message[0] == CHANNEL_FRAME:
+            return decode_frame(message)
+        if time.monotonic() > deadline:
+            return None
+
+
+def settle_frames(ws, quiet=2.5, limit=25.0):
+    """Read until nothing has arrived for `quiet`, and answer the last header.
+
+    A page that has just been attached to is still doing deferred work — the
+    engine paints a leased tab lazily and the first frames after a lease is
+    taken are the ones that settle it. Draining to quiet first is what makes
+    the silence assertion afterwards a statement about a *static* page rather
+    than about a page that had not finished arriving."""
+    deadline = time.monotonic() + limit
+    last = None
+    while time.monotonic() < deadline:
+        frame = next_frame(ws, quiet)
+        if frame is None:
+            return last
+        last = frame
+    return last
+
+
+def view_holds(tab_id):
+    """How many viewers hold `tab_id` shown — `None` for a tab that is gone.
+
+    The test hook, over the control socket. A released lease is an absence, and
+    every other symptom of one (a tab going hidden, frames stopping) is
+    indistinguishable from a viewer that simply had nothing to send."""
+    reply = rpc("view_holds", tab_id=tab_id)
+    assert reply["outcome"] == "ok", reply
+    return reply["result"]["value"]
 
 
 def snapshot(ws, timeout=6.0):
@@ -805,6 +927,257 @@ try:
     print(f"HUMAN'S TAB: input aimed at the displayed Me tab {mine} did "
           f"nothing, indistinguishably from a tab id that never existed, and "
           f"the connection stayed open")
+
+    # ======================================================================
+    # DIST-02: the frame half. Everything below reads real pixels.
+    # ======================================================================
+
+    # --- 24. a fresh viewer on a fresh tab, out of the input half's way ---
+    # A tab of its own, never clicked into: the input half left a caret
+    # blinking in `driven`'s text field, and a caret is a tile changing twice a
+    # second forever — which would make the static-page assertion below a test
+    # of nothing. The local human is in the Me view throughout this section, so
+    # the watched tab is a *background* agent tab, which is the case that
+    # matters: an attachment has to show it without disturbing anything here.
+    watched = rpc("tabs_open", client="agent-frames", url=f"{BASE}/watched.html")
+    assert watched["outcome"] == "ok", watched
+    watched = watched["result"]["tab"]["tab_id"]
+    assert wait_for_url(watched, "/watched.html").endswith("/watched.html"), \
+        ("the watched tab never reached the fixture", tab_url(watched))
+    assert view_holds(watched) == 0, "a tab was held before anyone attached"
+
+    seer = connect(port)
+    sockets.append(seer)
+    seer.send(view({"view": "attach", "tab": watched}))
+    ack = read(seer, CHANNEL_CONTROL)
+    assert ack is not None and ack.get("view") == "attached", ack
+    assert view_holds(watched) == 1, \
+        ("an attachment did not hold the tab shown, so no hit test can be "
+         "answered and no frame can be painted", view_holds(watched))
+    print(f"HELD: attaching to background tab {watched} holds it shown, and the "
+          f"local human is still in the Me view")
+
+    # --- 25. the first frame is a keyframe covering the whole surface ----
+    first_frame = next_frame(seer)
+    assert first_frame is not None, "a viewer attached and was sent no frame at all"
+    header, payload = first_frame
+    assert header["kind"] == KEYFRAME, ("the first frame after an attach was a "
+                                        "delta against a surface the client "
+                                        "does not have", header)
+    assert (header["x"], header["y"]) == (0, 0), header
+    assert (header["width"], header["height"]) \
+        == (header["frame_width"], header["frame_height"]), \
+        ("the first keyframe did not cover the whole surface", header)
+    assert header["tab"] == watched, header
+    assert header["scale"] == 1, ("this plan sends full resolution", header)
+    print(f"KEYFRAME ON ATTACH: frame {header['seq']} is a whole "
+          f"{header['frame_width']}x{header['frame_height']} surface, "
+          f"{len(payload)} bytes of PNG")
+
+    # --- 26. the header's size is the size the attach already promised ---
+    # So a client can allocate its texture on the acknowledgement and does not
+    # have to reflow when the first frame turns out to be a different shape.
+    assert (header["frame_width"], header["frame_height"]) \
+        == (ack["width"], ack["height"]), \
+        ("the attach acknowledgement and the first frame disagree about the "
+         "tab's size, so a client that sized its surface on the "
+         "acknowledgement has to throw it away", ack, header)
+    print(f"SIZED AHEAD: the acknowledgement's {ack['width']}x{ack['height']} "
+          f"is what the first frame declares")
+
+    # --- 27. a static page sends NOTHING ---------------------------------
+    # The delta model's whole payoff, and the assertion a pump built on the
+    # one-shot screenshot path would fail: that path waits for a repaint
+    # notification a settled page never produces, and answers the wait with a
+    # timeout. This one reads across many ticks and expects silence.
+    settle_frames(seer)
+    quiet = next_frame(seer, 5.0)
+    assert quiet is None, \
+        ("a page nobody touched kept sending frames, so the tile comparison is "
+         "not deciding anything", quiet[0] if quiet else None)
+    print("STATIC IS SILENT: with the page untouched, not one frame arrived "
+          "across many ticks")
+
+    # --- 28. a small change is a delta over a small region ---------------
+    evaluate(watched, "document.getElementById('upper').style.background = '#f00'")
+    small = next_frame(seer)
+    assert small is not None, "a change to the page produced no frame"
+    delta, _ = small
+    assert delta["kind"] == TILE, \
+        ("a one-element change was sent as a whole keyframe", delta)
+    assert delta["width"] * delta["height"] \
+        < delta["frame_width"] * delta["frame_height"], \
+        ("the delta's region is the whole surface", delta)
+    assert delta["seq"] > header["seq"], \
+        ("frame sequences did not increase", header["seq"], delta["seq"])
+    print(f"DELTA: a one-element change arrived as a "
+          f"{delta['width']}x{delta['height']} region at "
+          f"({delta['x']}, {delta['y']}), sequence {delta['seq']}")
+
+    # --- 29. a large change is a keyframe instead ------------------------
+    # The dirty-tile threshold, observed. A scroll-sized change is one keyframe
+    # rather than hundreds of tile messages, which is a bandwidth argument
+    # before it is anything else.
+    settle_frames(seer)
+    evaluate(watched, "document.body.style.background = '#00f'")
+    large = settle_frames(seer)
+    assert large is not None, "repainting the whole page produced no frame"
+    whole, _ = large
+    assert whole["kind"] == KEYFRAME, \
+        ("a change covering the whole page was sent as deltas", whole)
+    assert (whole["width"], whole["height"]) \
+        == (whole["frame_width"], whole["frame_height"]), whole
+    print(f"THRESHOLD: a whole-page change arrived as one keyframe, sequence "
+          f"{whole['seq']}")
+
+    # --- 30. a viewport change produces a keyframe -----------------------
+    # The client is about to reallocate its texture, so every tile it holds is
+    # about to be meaningless and a delta composited onto the new one would be
+    # a stripe of stale pixels.
+    settle_frames(seer)
+    seer.send(view({"view": "viewport", "tab": watched,
+                    "width": 800, "height": 600}))
+    resized = next_frame(seer)
+    assert resized is not None, "a viewport change produced no frame"
+    after_resize, _ = resized
+    assert after_resize["kind"] == KEYFRAME, \
+        ("a viewport change did not produce a keyframe", after_resize)
+    assert (after_resize["width"], after_resize["height"]) \
+        == (after_resize["frame_width"], after_resize["frame_height"]), after_resize
+    assert seer.still_open(), "a viewport change closed the connection"
+    print(f"RESIZE: a viewport change produced a keyframe declaring "
+          f"{after_resize['frame_width']}x{after_resize['frame_height']}")
+
+    # --- 31. every frame echoes the last input the server had applied ----
+    # The whole of the instrumentation, and the reason a client can discard a
+    # frame that predates its own most recent click. Asserted as present and
+    # correct; what it is *worth* is a two-machine question and not this
+    # suite's.
+    settle_frames(seer)
+    pointer = Input(seer, watched)
+    _, scale = harness.chrome_rects()
+    marks = centres(watched, scale)
+    pointer.send("mouse_move", x=float(marks["field"][0]),
+                 y=float(marks["field"][1]))
+    sent = pointer.seq
+    # A pointer move over a link changes no pixels, so nothing would be sent
+    # at all: the page has to be *made* to repaint before there is a frame to
+    # read the echo off. The toggle is what does that, and it runs before each
+    # read rather than after, because a silent page is the expected state here
+    # and not a reason to stop looking.
+    echoed = None
+    carried = []
+    for attempt in range(12):
+        evaluate(watched,
+                 "const l = document.getElementById('lower');"
+                 f"l.style.background = '#0{attempt % 8}f';")
+        frame = next_frame(seer, 6.0)
+        if frame is None:
+            continue
+        carried.append(frame[0]["last_applied"])
+        if frame[0]["last_applied"] >= sent:
+            echoed = frame[0]
+            break
+    assert echoed is not None, (
+        "no frame echoed the input sequence the server had already applied, so "
+        "a client cannot tell which of its own inputs a frame postdates",
+        sent, carried)
+    print(f"ECHOED: a frame carries last-applied-input {echoed['last_applied']}, "
+          f"at or past the {sent} that was sent")
+
+    # --- 32. a second viewer on the same tab is independent --------------
+    other = connect(port)
+    sockets.append(other)
+    other.send(view({"view": "attach", "tab": watched}))
+    other_ack = read(other, CHANNEL_CONTROL)
+    assert other_ack is not None and other_ack.get("view") == "attached", other_ack
+    assert view_holds(watched) == 2, \
+        ("the second viewer did not take its own hold", view_holds(watched))
+
+    own_keyframe = next_frame(other)
+    assert own_keyframe is not None, "the second viewer was sent no frame"
+    assert own_keyframe[0]["kind"] == KEYFRAME, \
+        ("the second viewer was given a delta against a surface it never had",
+         own_keyframe[0])
+    assert own_keyframe[0]["seq"] == 1, \
+        ("the two viewers share one frame sequence space", own_keyframe[0])
+    print(f"SECOND VIEWER: its own keyframe at sequence "
+          f"{own_keyframe[0]['seq']}, while the first is past "
+          f"{after_resize['seq']}")
+
+    # Both keep receiving, and detaching one leaves the other receiving.
+    evaluate(watched, "document.body.style.background = '#333'")
+    assert next_frame(seer) is not None, "the first viewer stopped receiving"
+    assert next_frame(other) is not None, "the second viewer stopped receiving"
+
+    other.send(view({"view": "detach", "tab": watched}))
+    gone = read(other, CHANNEL_CONTROL)
+    assert gone == {"view": "detached", "tab": watched}, gone
+    assert view_holds(watched) == 1, \
+        ("the first detach released a tab the other viewer was watching",
+         view_holds(watched))
+    settle_frames(seer)
+    evaluate(watched, "document.body.style.background = '#666'")
+    assert next_frame(seer) is not None, \
+        "one viewer detaching stopped the other's frames"
+    print("INDEPENDENT: one viewer detaching left the other receiving, and the "
+          "tab is still held once")
+
+    # --- 33. the local display did not move, pixel for pixel -------------
+    # Read over the control socket rather than over the channel under test,
+    # before and after a whole frame exchange — and the human's own tab is
+    # captured both times and compared byte for byte, which is the per-tab
+    # framebuffer invariant asserted rather than cited.
+    displayed_before = window_title(wid, X)
+    focused_before = focused_tabs()
+    mine_before_pixels = rpc("screenshot", tab_id=mine)
+    assert mine_before_pixels["outcome"] == "ok", mine_before_pixels
+    mine_before_pixels = mine_before_pixels["result"]
+
+    settle_frames(seer)
+    evaluate(watched, "document.body.style.background = '#999'")
+    assert next_frame(seer) is not None, "the exchange under test produced no frame"
+    settle_frames(seer)
+
+    assert window_title(wid, X) == displayed_before, (
+        "a viewer attached to a background tab changed the displayed tab or "
+        "the view mode", displayed_before, window_title(wid, X))
+    assert focused_tabs() == focused_before, (
+        "a viewer attached to a background tab changed an active tab",
+        focused_before, focused_tabs())
+    mine_after_pixels = rpc("screenshot", tab_id=mine)
+    assert mine_after_pixels["outcome"] == "ok", mine_after_pixels
+    mine_after_pixels = mine_after_pixels["result"]
+    assert (mine_after_pixels["width"], mine_after_pixels["height"]) \
+        == (mine_before_pixels["width"], mine_before_pixels["height"]), \
+        ("the human's own tab changed size while a viewer was attached to "
+         "another", mine_before_pixels["width"], mine_after_pixels["width"])
+    assert mine_after_pixels["png_base64"] == mine_before_pixels["png_base64"], (
+        "the human's own tab's pixels changed while a viewer was watching a "
+        "different tab — the per-tab framebuffer invariant does not hold for "
+        "the frame pump's shape")
+    print(f"LOCAL DISPLAY UNMOVED: still {displayed_before!r}, focused tabs "
+          f"still {focused_before}, and the human's own tab is byte-identical "
+          f"across a whole frame exchange on another tab")
+
+    # --- 34. closing the tab detaches, releases and stops the frames -----
+    assert rpc("tabs_close", tab_id=watched)["outcome"] == "ok"
+    notice = None
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        answer = read(seer, CHANNEL_CONTROL, 4.0)
+        if answer == {"view": "detached", "tab": watched}:
+            notice = answer
+            break
+    assert notice is not None, "closing the watched tab told the viewer nothing"
+    assert view_holds(watched) is None, \
+        ("the closed tab is still in the tab table", view_holds(watched))
+    assert next_frame(seer, 4.0) is None, \
+        "frames kept arriving for a tab that no longer exists"
+    assert seer.still_open(), \
+        "the tab closing dropped the connection instead of detaching it"
+    print(f"CLOSED: tab {watched} closing detached the viewer, released the "
+          f"hold and stopped the frames, without dropping the connection")
 
     print("REMOTE VIEW CHECKS PASSED")
 finally:
