@@ -194,3 +194,70 @@ passing, which is the signature.
 The first is the smaller change and turns a confusing failure into an obvious
 one. Neither is Phase 5 business; both belong wherever the harness is next
 touched.
+
+## Correction: `encode_screenshot` was never running at `Compression::Default`
+
+**Found during plan 05-02, measured rather than reasoned.** `05-RESEARCH.md`
+§ "Encode, measured this session" and `05-CONTEXT.md` D-05-05 both rest on the
+sentence *"`encode_screenshot` sets colour and depth and nothing else, so it
+runs at `png::Compression::Default` by omission"*, and on the **20.98 ms** page
+/ **175.40 ms** photo figures that follow from it.
+
+**That premise is false for `png 0.17.16`**, which is what this tree resolves.
+`png::Info::default()` sets `compression: Compression::Fast` — the comment on
+the line says *"Default to `deflate::Compression::Fast` and
+`filter::FilterType::Sub` to maintain backward compatible output"*
+(`png-0.17.16/src/common.rs:636-638`) — and `Encoder::set_filter`'s doc says
+*"The default filter is `FilterType::Sub`"* (`encoder.rs:321`).
+`png::Compression::Default` is a value you have to ask for.
+
+So the shipped screenshot encoder has been running at **`Compression::Fast` +
+`FilterType::Sub`** all along, which is exactly the configuration D-05-05 chose
+for the *frame* path. `05-02-SPIKE.md` encoded the same real Servo frame both
+ways and got **byte-identical** output (465,662 B, 1.685 ms vs 1.847 ms), while
+an explicitly-set `Compression::Default` on the same buffer produced 183,030 B
+in **21.275 ms** — within 1.4 % of the research's 20.98 ms. The benchmark was
+run correctly; it measured a configuration this codebase never executes.
+
+**What it changes:**
+
+- **Nothing about D-05-05's choice**, which stands and is cheaper than it
+  looked. PNG at `Fast`+`Sub` over 64×64 tile diffs, no new codec crate.
+- **The MCP `screenshot` tool is not slow and never was** — 1.7 ms for a text
+  page, 5.5 ms for a photographic one. `05-RESEARCH.md`'s Pitfall 1 ("reusing
+  the screenshot encoder for frames … a real page blows the budget") is not a
+  live hazard in this tree. Its conclusion survives; its reason does not.
+- **The frame encoder's divergence is one line, not three.** Raw bytes instead
+  of base64, plus a tile rectangle instead of the whole surface. 05-08 should
+  write it as its own function anyway — two encoders for two jobs — but must not
+  repeat the 21 ms / 175 ms justification in a comment, because that would embed
+  a false claim in the tree.
+
+**What closing it takes:** nothing in this phase — this entry *is* the closure.
+What a later reader must not do is quote `05-RESEARCH.md`'s first encode row as
+a fact about Talaria. If `png` is ever upgraded past 0.17, re-check
+`Info::default()` before assuming this still holds.
+
+Cited: `05-02-SPIKE.md` § "The finding that changes 05-08"; `05-CONTEXT.md`
+D-05-05.
+
+## Manual item for `VERIFICATION.md`: no hardware GL number exists on this machine
+
+**Found during plan 05-02.** Every X display on the build machine is an Xvfb on
+llvmpipe: `:20` and `:21` (Sunshine), `:95` (this spike), `:98` (CI). Reaching
+either real GPU — the Intel iGPU or the NVIDIA T1200, both with readable
+`/dev/dri` nodes — would need a Wayland compositor (none installed) or an Xorg
+holding DRM master, and `/etc/X11/Xwrapper.config` restricts that to
+`allowed_users=console`.
+
+So the readback figure in `05-02-SPIKE.md` is software-rendered, stated as such,
+and **must not be presented as evidence about SC 2 on real hardware** — which is
+T-05-12-A's mitigation working as intended. The asymmetry is the point: under
+software rendering the framebuffer is already in system memory, so the readback
+is close to a `memcpy` and `paint()` carries the cost; on a GPU that inverts.
+The number that could still break the capture model is a hardware
+`read_to_image` *slower* than the 1.19–1.56 ms measured here.
+
+**What closing it takes:** the two-machine manual check `05-CONTEXT.md` already
+anticipates, run on a machine with a compositor, carried into `VERIFICATION.md`
+as SC 2's evidence.

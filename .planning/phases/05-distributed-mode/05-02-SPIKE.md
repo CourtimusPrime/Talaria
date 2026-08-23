@@ -214,3 +214,221 @@ claiming a hardware ratio.
 ---
 
 ## A8 — the codec against real Servo readback
+
+Every encode below ran against buffers this loop actually produced — four sampled frames per shape,
+straight out of `read_to_image`, never a synthetic frame. Times are per-encode; bytes are the PNG
+payload before any transport framing.
+
+### The finding that changes 05-08: `encode_screenshot` is not what the research thought it was
+
+`05-RESEARCH.md` and `05-CONTEXT.md` D-05-05 both rest on this sentence: *"`encode_screenshot` sets
+colour and depth and nothing else, so it runs at `png::Compression::Default` by omission"*, and on
+the 20.98 ms / 175.40 ms figures that follow from it.
+
+**The premise is false for `png 0.17.16`, which is what this tree resolves.**
+`png::Info::default()` sets `compression: Compression::Fast`, with the comment *"Default to
+`deflate::Compression::Fast` and `filter::FilterType::Sub` to maintain backward compatible output"*
+(`png-0.17.16/src/common.rs:636-638`), and `Encoder::set_filter`'s own doc says *"The default filter
+is `FilterType::Sub`"* (`png-0.17.16/src/encoder.rs:321`). `png::Compression::Default` is a value you
+must ask for; it is not what you get by omission.
+
+So `encode_screenshot` has been running at **`Compression::Fast` + `FilterType::Sub`** all along —
+which is precisely the configuration D-05-05 chose for the *frame* path.
+
+This is not an inference. The spike encoded the same real frame both ways and the outputs are
+**byte-identical**, while an explicitly-set `Compression::Default` on the same buffer is a different
+size and roughly 12× slower:
+
+| Frame (static text page) | time | bytes |
+|--------------------------|-----:|------:|
+| `encode_screenshot`'s exact configuration, as shipped | **1.685 ms** | **465,662** |
+| `Compression::Fast` + `FilterType::Sub`, set explicitly | 1.847 ms | **465,662** |
+| `Compression::Default` + `FilterType::Sub`, set explicitly | **21.275 ms** | 183,030 |
+| `Compression::Best` + `FilterType::Sub` | 77.402 ms | 183,261 |
+| `Compression::Fast` + `FilterType::NoFilter` | 4.140 ms | 1,969,933 |
+
+The explicit-`Default` row lands at **21.275 ms**, within 1.4 % of `05-RESEARCH.md`'s 20.98 ms. The
+benchmark was measured correctly; it was measuring a configuration this codebase does not use.
+
+**What this does and does not change:**
+
+- **D-05-05's choice stands, and is now cheaper than it looked.** `png` at `Compression::Fast` +
+  `FilterType::Sub` over 64×64 tile diffs remains right, and no new codec dependency is needed.
+- **The MCP `screenshot` tool is not slow, and never was.** A whole-frame screenshot of a text page
+  costs **1.7 ms**, not 21 ms; of a photographic page, **5.5 ms**, not 175 ms. Pitfall 1 in
+  `05-RESEARCH.md` ("reusing the screenshot encoder for frames … a real page blows the budget") is
+  **not a real hazard in this tree**. Its *conclusion* — a separate encoder for frames — is still
+  right, but for a different and smaller reason.
+- **The "sibling that diverges on three lines" is a sibling that diverges on one.** Compression and
+  filter are already what the frame path wants. The only genuine divergences are that the frame
+  encoder emits raw bytes instead of base64, and encodes a tile rectangle instead of the whole
+  surface. See § What 05-08 must do.
+- **The screenshot path's base64 is now the visible cost, not its compression.** It adds
+  0.30 ms / +33 % on a text page and **0.71 ms / +360 KB** on a photographic one (1,079,996 →
+  1,439,996 bytes). That is the +33 % `05-RESEARCH.md` already called out, and it is the whole of
+  what the frame path saves by going binary.
+
+### Re-measured against the synthetic table
+
+`05-RESEARCH.md`'s two synthetic cases beside the real pages that should bracket them:
+
+| Encoder, 1280×800 whole frame | synthetic *page-like* | **real static text page** | synthetic *photo-like* | **real photographic page** |
+|-------------------------------|----------------------:|--------------------------:|-----------------------:|---------------------------:|
+| `Fast` + `Sub` — time | 1.80–2.16 ms | **1.52–1.85 ms** | 4.70 ms | **4.83–5.16 ms** |
+| `Fast` + `Sub` — bytes | 522 KB | **466 KB** | 3.45 MB | **1.08 MB** |
+| `Fast` + `NoFilter` — time | 5.26 ms | **4.14–4.38 ms** | 8.62 ms | **5.64–7.40 ms** |
+| `Fast` + `NoFilter` — bytes | 3.01 MB | **1.97 MB** | 4.10 MB | **3.22 MB** |
+| explicit `Default` — time | 20.98 ms | **21.21–21.65 ms** | 175.40 ms | **117.7–121.2 ms** |
+| explicit `Default` — bytes | 67 KB | **183 KB** | 2.06 MB | **858 KB** |
+
+| Tile-diff operation | synthetic | **real static text** | **real scrolling** | **real photographic** |
+|---------------------|----------:|---------------------:|-------------------:|----------------------:|
+| Whole-frame dirty-tile scan (260 tiles) | 0.14 ms | **0.330 ms mean / 0.479 p95** | **0.109 ms mean / 0.300 p95** | **0.333 ms mean / 0.476 p95** |
+| One 64×64 tile — time | 0.007 ms | **0.007–0.014 ms** | **0.009–0.021 ms** | **0.015–0.036 ms** |
+| One 64×64 tile — bytes | 3.9 KB | **413 B** | **1,095–4,175 B** | **1,685 B** |
+| Four-tile (128×128) cluster — time | 0.034 ms | **0.024–0.039 ms** | **0.023–0.084 ms** | **0.054–0.076 ms** |
+| Four-tile cluster — bytes | 15 KB | **5,054 B** | **4,827–15,456 B** | **7,108 B** |
+| Full keyframe — time | 2.164 ms | **1.52–1.85 ms** | **1.32–1.92 ms** | **4.83–5.16 ms** |
+| Full keyframe — bytes | 522 KB | **466 KB** | **259–548 KB** | **1.08 MB** |
+
+**Did real pages bracket between the synthetic page-like and photo-like cases, as predicted?**
+**On time, yes — almost exactly. On bytes, no.** Every real encode time falls inside or within a few
+percent of the synthetic range, so the CPU half of the budget was predicted correctly. The byte half
+was not: the synthetic photo-like frame was gradient-plus-noise, which is close to incompressible, so
+its 3.45 MB overstates a real photograph by **3.2×** (real: 1.08 MB). In the other direction, the
+synthetic page-like frame's explicit-`Default` output (67 KB) *understates* a real text page (183 KB)
+by 2.7×, because a real page has far more distinct colour than a hand-drawn one. The dirty-tile scan
+is **2.4× slower** than its synthetic figure on a static page — 0.330 ms against 0.14 ms — because a
+static page is the scan's worst case: no tile short-circuits, so every row of all 260 tiles is
+compared, about 4.3 MB at roughly 10 GB/s.
+
+That is why **A8 is REFUTED**: the frames were representative enough to get the encoder decision
+right, and not representative enough to plan wire budgets or a keyframe threshold from. Both of those
+now have measured numbers below instead.
+
+### What this means on the wire
+
+Payload at a 30 ms cadence, using the measured `Fast`+`Sub` bytes rather than the synthetic ones:
+
+| Case | measured payload | needs at 30 ms | direct WireGuard (≈350 Mbit/s) | DERP relay (13 Mbit/s) |
+|------|-----------------:|---------------:|:-------------------------------|:-----------------------|
+| One tile, static page | 413 B | 0.11 Mbit/s | ✅ | ✅ |
+| Four-tile cluster, static page | 5.1 KB | 1.3 Mbit/s | ✅ | ✅ |
+| Four-tile cluster, scrolling | 15.5 KB | 4.1 Mbit/s | ✅ | ✅ |
+| Keyframe, text page | 466 KB | 124 Mbit/s | ✅ | ❌ (≈287 ms per frame) |
+| Keyframe, scrolling | 259–548 KB | 69–146 Mbit/s | ✅ | ❌ |
+| **Keyframe, photographic page** | **1.08 MB** | **288 Mbit/s** | ⚠️ close to the measured ceiling | ❌ (≈665 ms per frame) |
+
+The photographic keyframe is the one row that moved materially against the plan: at 288 Mbit/s it is
+inside the 342–447 Mbit/s a direct path measured on this tailnet, but not comfortably. D-05-06's
+degrade-and-report ladder is not a relay-only feature — a full-bleed image page on a direct link can
+reach for it too. **Half-res costs 4× fewer bytes and is the rung that answers this**, which is
+another reason the ladder's rungs must be reachable from the interactive path and not only from a
+relay detection.
+
+**The static cases are the reassuring ones and they are the common ones.** A settled page — text or
+photographic — produced **0 dirty tiles on 299 of 299 comparisons in both shapes**. The pump sends
+*nothing* on a page nobody is touching, for 0.33 ms of `memcmp` per tick. `05-RESEARCH.md`'s
+"static pages then cost one readback and 0.14 ms of `memcmp` per tick and send nothing" is confirmed,
+at 0.33 ms rather than 0.14 ms.
+
+### The keyframe threshold, with a measured basis
+
+The scrolling shape is the only one that produces dirty tiles, and it produces almost all of them:
+**median 231 of 260 tiles per tick, p95 258, and 282 of 299 ticks over a third of the grid.** Scroll
+is a keyframe every tick, exactly as predicted.
+
+Where the crossover actually sits is decided by **per-encode fixed cost, not by bytes**. Bytes are
+close to linear in tile count either way — 260 × 1,989 B of individual scroll tiles ≈ 517 KB against
+a 548 KB whole-frame keyframe — so the tile path saves nothing on the wire once most of the frame is
+dirty, and it pays one envelope header per tile. Time is what separates them: a 64×64 tile encode
+costs **~0.02 ms** including its fixed overhead, and a whole keyframe costs **1.5–1.9 ms** on a
+page-like frame. They meet at roughly **90 tiles**.
+
+> **Recommended threshold for 05-08: send a keyframe when the dirty-tile count exceeds 90 of 260
+> tiles at 1280×800 — about a third of the grid.** Below it, per-tile messages are cheaper in CPU and
+> far cheaper on the wire. Above it, the keyframe is no more expensive to produce, no larger to send,
+> and one message instead of ninety. Express it as a fraction of the grid, not as the literal 90, so
+> a viewport resize does not silently re-tune it.
+
+### The `Send` precondition
+
+`servo::RgbaImage` is `image::RgbaImage` = `ImageBuffer<Rgba<u8>, Vec<u8>>`. The spike asserted this
+statically in this tree — `fn assert_send<T: Send>() {}` instantiated at `servo::RgbaImage` — and it
+compiled and ran. **The off-thread diff-and-encode design is sound**: the readback buffer can be
+moved to an encoder thread, which is where the 0.33 ms scan and the 1.5–5.2 ms encode belong.
+
+---
+
+## What 05-08 must do — the instruction this spike exists to produce
+
+**The Xvfb figure carries the cadence, so the answer is the simple one:**
+
+> **05-08 builds the pump to request a 30 ms cadence unconditionally, on every machine, including
+> under the harness's Xvfb.** The harness sustained it with one overrun in 300 ticks in each of three
+> shapes, and that one overrun was the first-frame-after-attach outlier rather than a steady-state
+> failure. **Do not add an environment check, an Xvfb-specific cadence, or a `TALARIA_*` knob that
+> lowers it** — a suite that measures a different cadence from the product measures the wrong thing.
+
+**And the falsifiable conditional, which is still live because the hardware number does not exist:**
+
+> **If any future measurement shows the requested cadence cannot be sustained — under Xvfb or on real
+> hardware — 05-08 must not lower the requested cadence. It must let 05-10's degrade ladder lower the
+> *delivered* one, and 05-10's e2e latency suite must then assert the *requested* cadence plus the
+> ladder's *response* at a rung the measuring machine can actually sustain, with the real-hardware
+> figure carried into `VERIFICATION.md` as SC 2's evidence and the two-machine manual check as its
+> confirmation.** The product's claim is about a direct WireGuard path on real hardware; software
+> rendering is the harness, not the claim.
+
+Four further instructions, each with the measurement behind it:
+
+1. **Expect the first frame after attach to be an outlier and keep it out of the rate controller.**
+   Measured at 111.6 ms (static), 75.8 ms (scrolling) and 53.2 ms (photographic) on the tick where
+   the lease is taken, against a steady state of 0.19–5.1 ms. Seed the latency EWMA from the second
+   frame, or the controller will degrade a healthy link on its first sample.
+2. **Do the dirty-tile scan and the PNG encode on the encoder thread, not on the loop.** `Send` is
+   confirmed above; on the loop these would add 0.33 ms + 1.5–5.2 ms to a tick that currently spends
+   1.74–6.30 ms there.
+3. **Write the frame encoder as its own function — but do not describe it as a three-line divergence,
+   and do not "fix" `encode_screenshot`.** Its compression and filter already match. Its real
+   divergences are raw bytes instead of base64 and a tile rectangle instead of the whole surface.
+   D-05-05's two-encoders-for-two-jobs argument still holds; its 21 ms/175 ms justification does not,
+   and repeating that number in a code comment would embed a false claim in the tree.
+4. **Keyframe above a third of the grid** (≈90 of 260 tiles at 1280×800), per the measured crossover
+   above.
+
+## What 05-10 may claim — the ladder's top rung, as a number
+
+**05-10's fastest rung is 30 ms full-res, and nothing faster may be added.**
+
+The measured server-side production floor — the shortest interval at which this machine can actually
+produce a frame, main-thread work only, using p95 rather than mean — is:
+
+| Shape | `paint`+`read` p95 | chrome frame p95 | **floor per tick** |
+|-------|-------------------:|-----------------:|-------------------:|
+| static text | 2.08 ms | 3.24 ms | **≈5.3 ms** |
+| photographic | 2.14 ms | 2.93 ms | **≈5.1 ms** |
+| **scrolling (worst)** | **9.62 ms** | 3.44 ms | **≈13.1 ms** |
+
+So the 30 ms rung has about **2.3× headroom in the worst measured shape** and ~5.7× in the
+interactive ones — on a software rasteriser, with none of that headroom yet spent on the wire. That
+is comfortable, and it is also the entire margin: a rung at 15 ms would have essentially none in the
+scrolling case, and the scrolling case is the one that produces keyframes. **Keep `05-RESEARCH.md`'s
+ladder as written — full-res 30 ms → full-res 60 ms → half-res 60 ms → half-res 120 ms →
+passive-only 500 ms — and do not invent a faster top rung on the strength of the readback being
+cheap.** The readback is cheap; `paint()` is not, and the wire is not.
+
+## What goes into `VERIFICATION.md` as a manual item
+
+**Measure `read_to_image` at cadence on real GPU hardware.** This repository cannot: every X display
+on the build machine is an Xvfb on llvmpipe, and reaching a GPU would need a compositor that is not
+installed or an Xorg holding DRM master from the console session. That absence is T-05-12-A's
+mitigation working as designed — one honest number with its limitation stated, rather than a
+software figure presented as a hardware one — and it is the reason SC 2's evidence must come from the
+two-machine manual check rather than from the harness alone.
+
+The specific thing to re-measure, and why it is not a formality: under software rendering the
+framebuffer is already in system memory, so the readback is close to a `memcpy` and `paint()` carries
+the cost. On a GPU that inverts. The number that could still break this phase's capture model is a
+hardware `read_to_image` that is *slower* than the 1.19–1.56 ms measured here, not a `paint()` that is
+faster.
