@@ -360,3 +360,52 @@ latency. **Nothing is deferred to a later phase** — these belong to Phase 5 an
 
 _Verified: 2026-08-24T06:20:00Z_
 _Verifier: Claude (gsd-verifier)_
+
+---
+
+## Orchestrator addendum — 2026-08-24
+
+### The four code-review criticals are fixed
+
+`05-REVIEW.md` returned 4 criticals and 10 warnings after this verification was written. I confirmed
+all four in the code myself, then had them and three warnings fixed and re-verified. Commits
+`bbd9658` (CR-01), `a2ad9a6` (CR-02), `fa76fdc` (CR-03), `7b56711` (CR-04), `28fd769` (WR-01),
+`9eff564` (WR-04), `a3c4b39` (WR-10).
+
+Three of the four criticals shared one root cause — a limit written down but counted against the
+wrong thing. Accepted input reset the pump deadline, so the rung ladder bounded only a *silent*
+viewer; the attachment cap was per connection with nothing capping connections; the outbound frame
+channel was unbounded. The fourth was a plain correctness bug: remote scroll was 76× smaller than
+local, because `remote_input` passed the raw line count where the local path multiplies by
+`WHEEL_LINE_PIXELS` — a constant whose own doc comment claimed `remote_input` read it.
+
+Three things from the fix pass worth keeping:
+
+- **The first CR-01 fix was wrong and the latency suite caught it.** Flooring the pull-forward at the
+  connection's *current rung* reads plausibly but ties a CPU bound to a bandwidth decision, and it
+  made the ladder's recovery half unreachable — the shimmed link walked to the slowest rung in four
+  steps and never took one back. The floor is now one `Rung::FASTEST` interval.
+- **CR-03 was fixed in the opposite direction to the brief, correctly.** I suggested dropping frames;
+  the fix gates *production* on queue depth instead, because this stream is deltas — dropping an
+  intermediate frame desynchronises the tile state, and the repair is a ~522 KB keyframe sent to the
+  one viewer that has just proved it cannot drain 522 KB.
+- **WR-04 turned out fixable without a Servo change.** `blur()` is a global `BlurWebView` carrying no
+  id, but `FocusWebView` *does* carry one and the façade clears `focused` on every other webview — so
+  one focus call is already the complete statement of who holds focus. The doc comments now say "not
+  **given** focus" rather than claiming a per-webview blur the API cannot provide.
+
+**One residual, recorded rather than hidden:** the encoder thread's job channel is still unbounded.
+It cannot stall on a slow peer, so it is not reachable by the CR-03 attack, but a backlog would have
+no ceiling if encoding ever ran slower than the tick rate.
+
+Post-fix: `cargo test --locked` **548 passed**, e2e **24/24 `failed: none`**, clippy silent,
+`primeorder 0.14.0-rc.14` intact, all four `remote_input.rs` absences still zero, both TLS gates hold.
+
+### What remains open is one missing run, not a defect
+
+SC 1's Tailscale clause and SC 2's ~30–60 ms direct-path figure are the same gap: nobody has run
+`scripts/two-machine-check.sh` on a real link. That cannot be faked under Xvfb on one host, and the
+phase declines to claim it — which is the right call. `courts-macbook-air` and `minipc` are both on
+this tailnet when the run is wanted; the Mac showed a **direct** path when last checked.
+
+`status` stays `human_needed` for that reason alone.
