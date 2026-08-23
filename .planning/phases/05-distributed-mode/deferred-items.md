@@ -261,3 +261,65 @@ The number that could still break the capture model is a hardware
 **What closing it takes:** the two-machine manual check `05-CONTEXT.md` already
 anticipates, run on a machine with a compositor, carried into `VERIFICATION.md`
 as SC 2's evidence.
+
+## The advertised identity has no automatic discovery
+
+**Found during plan 05-04.** The browser is *told* its advertised origin, by a
+`remote_access.advertised_url` key in `config.json` that a human writes.
+`scripts/tailscale-serve.sh up` prints the exact key its mapping implies, which
+is the one moment both facts are on screen together — but nothing checks that
+what was printed is what was written, and nothing notices if the mapping later
+moves.
+
+Reading the origin out of the daemon's own status would close that gap, and it
+is **deliberately not done here**. It would make a security-critical string —
+the RFC 8707 canonical resource identifier, the RFC 8414 issuer, and the host
+allowlist, all of them — depend on a live subprocess whose output format is not
+this project's to keep stable. A daemon upgrade that renamed a JSON key would
+silently change what this browser publishes about itself, and the failure mode
+of a *wrong* advertised identity is tokens that validate against one spelling
+and mysteriously never work against the other.
+
+**Condition for revisiting:** an operator surface that made the two disagree
+often enough to matter — for instance a Serve mapping that moves port across
+daemon restarts, or a second fronting arrangement where the origin is not
+something a human chose once. Until then the configuration key is the seam, and
+its single producer is the whole of threat T-05-09's mitigation.
+
+Cited: `05-CONTEXT.md` D-05-03; `crates/talaria-shell/src/settings.rs`
+`RemoteAccessConfig::advertised_url`; `05-04-PLAN.md` T-05-09.
+
+## Transport-identity lifecycle is the daemon's, permanently — T-05-16
+
+**Found during plan 05-04.** D-05-03 puts the Tailscale daemon in front of an
+unchanged loopback listener, so the daemon provisions and renews the identity
+that fronts it and this browser holds none. `grep -rqi
+'certificate\|\.pem\|cert_path\|ssl_cert\|private key'` across
+`crates/talaria-shell/src/` returns nothing, and that is asserted rather than
+assumed.
+
+**What that buys.** No renewal timer, no expiry check, no resolver that
+re-reads files, and therefore no day-ninety-one failure. This is the specific
+hazard the alternative carries: a long-running process that built its TLS
+configuration once at startup would happily serve an expired identity forever,
+and a browser is exactly the kind of process that stays up for months. Threat
+T-05-16 is *transferred*, not mitigated — which is an honest description of
+owning none of the problem.
+
+**What it costs.** This browser cannot be exposed over a secure transport
+without a Tailscale node. Anyone wanting a different fronting proxy — nginx, a
+cloud load balancer, Caddy — can still put one in front of the same loopback
+listener and set `advertised_url` to whatever that proxy publishes; the
+advertised-identity seam is proxy-agnostic and nothing in it names Tailscale.
+What they cannot do is have Talaria terminate the transport itself. That is
+`05-RESEARCH.md`'s Option 2 — an exposure enum with an identity precondition
+plus in-process rustls — and it is a different plan with a different threat
+model, because it inherits the renewal problem this one declined.
+
+**Condition for revisiting:** a deployment that needs Talaria to bind a
+non-loopback address directly. Note that this would also reopen D-04-04: the
+bind host is a module constant precisely so a wider bind is not a value this
+program can carry, and Option 2 cannot be built without making it one.
+
+Cited: `05-RESEARCH.md` § "Exposure and the Certificate Story", Option 2;
+`05-CONTEXT.md` D-05-03; `04-.../deferred-items.md`'s inherited obligation.

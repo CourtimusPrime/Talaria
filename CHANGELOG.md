@@ -141,6 +141,41 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Added
 
+- **Talaria can now advertise an identity it did not bind, and be reached over a
+  secure transport without ever handling one.** A new optional
+  `remote_access.advertised_url` key in `config.json` names the origin clients
+  actually reach this browser at when a reverse proxy fronts the loopback
+  listener. One value feeds all of it — the RFC 8707 canonical resource
+  identifier, the RFC 8414 issuer, the four authorization-server endpoint URLs,
+  the RFC 9728 protected-resource document, the DNS-rebinding host allowlist and
+  the outermost layer's `Host` comparison — threaded exactly the way the bound
+  address already was, because those strings are compared byte for byte and four
+  independent constructions would be four places to disagree. It comes from
+  configuration and **never** from a request header: a local page that could set
+  the advertised issuer could make this browser point a client at an
+  authorization server the page chose. The value is refused rather than
+  normalised — the secure scheme (with OAuth 2.1 §1.5's
+  loopback-literal-with-a-port exception), no path, no query, no fragment, no
+  user information, not even a bare trailing slash — because a normalisation is
+  a second spelling, and any refusal leaves the whole remote-access block off.
+  **The bind host did not widen.** It is still a module constant used at exactly
+  one place, `config.json` still cannot express an address, and the hand-edited
+  `bind` key is still refused out loud: transport security is terminated by the
+  Tailscale daemon in front of an unchanged loopback listener, so nothing about
+  renewal is ever this process's problem. With the key absent every published
+  string is byte-identical to what shipped before it, proven by two unmodified
+  end-to-end suites (`crates/talaria-shell/src/settings.rs`,
+  `crates/talaria-shell/src/oauth.rs`, `crates/talaria-shell/src/http.rs`).
+- **`scripts/tailscale-serve.sh` stands the proxy up and takes it down.**
+  Executable, with an `up` and a `down` and no third mode. It confirms its
+  prerequisites rather than assuming them, refuses a port that already carries a
+  mapping it did not create, refuses to publish a mapping pointing at nothing,
+  prints a before/after diff on teardown, and prints the exact `config.json` key
+  the mapping implies — the one moment both halves of the identity are on screen
+  together. Funnel, the public-internet variant, is refused **by name** with its
+  reason rather than merely omitted: the process on the other end of the mapping
+  holds an encrypted credential vault and the human's logged-in browsing
+  sessions, and the two commands differ by a few characters.
 - **The remote view wire has a named, tested vocabulary.**
   `crates/talaria-protocol/src/wire.rs` defines the multiplexed envelope a
   remote viewer speaks: five one-byte channel tags — `0x01` control, `0x02`
