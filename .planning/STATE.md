@@ -4,16 +4,17 @@ milestone: v1.0
 milestone_name: milestone
 current_phase: 5
 current_phase_name: distributed-mode
-status: ready-to-execute
-stopped_at: Completed 05-01-PLAN.md
-last_updated: "2026-08-23T11:06:26.595Z"
+status: executing
+stopped_at: Completed 05-02-PLAN.md
+last_updated: "2026-08-23T11:50:28.455Z"
 progress:
-  total_phases: 4
+  total_phases: 8
   completed_phases: 3
   total_plans: 34
-  completed_plans: 24
-last_activity: 2026-08-21
-last_activity_desc: Phase 05 planned - 11 plans in 8 waves, plan-checker APPROVED at revision 3
+  completed_plans: 25
+  percent: 38
+last_activity: 2026-08-23
+last_activity_desc: "Phase 05 wave 1 complete - spike A1 CONFIRMED, A8 REFUTED"
 ---
 
 # Project State
@@ -28,8 +29,8 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 1 of 11 executed
-Status: Planned and verified — ready to execute
+Plan: 2 of 11 executed (wave 1 complete)
+Status: Executing — wave 1 landed, wave 2 next
 Next: `/gsd-execute-phase 5`
 
 Phase 4 is closed. AUTH-01, AUTH-02 and AUTH-03 are Complete; verification passed after four
@@ -47,10 +48,16 @@ unchanged; the remote client sees **agent tabs only**; Tailscale Serve terminate
 over tile diffs with **no new codec**; and on a relayed link the client degrades and reports rather
 than refusing takeover.
 
-**Two spikes must land before the plans that depend on them.** GL readback cost is unmeasured and is
-the phase's largest unknown — and the e2e harness is Xvfb/llvmpipe, so the spike must report the
-software-rendered figure separately. The second is whether Tailscale Serve proxies a WebSocket
-upgrade cleanly.
+**Both required spikes have landed (wave 1).** 05-01 settled A2 — Tailscale Serve proxies a
+WebSocket upgrade cleanly, and forwards the tailnet `Host` with the Serve port, which makes 05-04's
+advertised-base-URL work required rather than optional. 05-02 settled the phase's largest unknown:
+**A1 CONFIRMED** — `read_to_image` at a 30 ms cadence costs 1.19–1.56 ms mean with a p95 never above
+1.86 ms and zero failures over 900 ticks, so the capture model stands. **A8 REFUTED** — the synthetic
+codec frames predicted encode *time* well and *bytes* badly, and `encode_screenshot` was never
+running at `png::Compression::Default` at all (png 0.17's `Info::default()` is `Fast`+`Sub`), which
+voids the 21 ms / 175 ms premise while leaving D-05-05's choice standing. Only one readback figure
+exists and it is software-rendered: this machine has no non-llvmpipe GL path, so the hardware
+re-measure is a `VERIFICATION.md` manual item.
 
 **Two open product questions, recorded together in `05-CONTEXT.md`** because they are one question —
 what can a remote human do that requires being at the server machine? First pairing needs someone at
@@ -113,6 +120,7 @@ Phase 5 keeps per-task commits.
 | Phase 04 P07 | 55min | 2 tasks | 3 files |
 | Phase 04 P08 | 85 min | 3 tasks | 10 files |
 | Phase 05 P01 | 50min | 3 tasks | 6 files |
+| Phase 05 P02 | 45min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -204,6 +212,9 @@ Recent decisions affecting current work:
 - [Phase ?]: Serve forwards the tailnet Host with the Serve port, so 05-04's advertised base URL is required work and must come from configuration
 - [Phase ?]: 05-07's client TLS costs zero packages on either rustls spelling; rustls-tls-native-roots recommended
 - [Phase ?]: First pairing requiring local access to the server is recorded as an open developer decision, not answered by silence
+- [Phase 5]: A1 CONFIRMED: read_to_image at a 30 ms cadence costs 1.19-1.56 ms mean, p95 never above 1.86 ms, 0 failures over 900 ticks — the capture model stands and 05-08 may be executed as planned
+- [Phase 5]: A8 REFUTED: encode_screenshot never ran at png::Compression::Default — png 0.17's Info::default() is Fast+Sub — so the 21 ms/175 ms premise is void, the frame encoder diverges on one line not three, and the synthetic frames predicted encode time well but bytes badly (3.2x on the photo case)
+- [Phase 5]: One readback figure, not two: this machine has no non-llvmpipe GL path, and the Xvfb number is plausibly optimistic rather than conservative — the hardware re-measure becomes a VERIFICATION.md manual item
 
 ### Pending Todos
 
@@ -252,6 +263,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T11:06:13.673Z
-Stopped at: Completed 05-01-PLAN.md
+Last session: 2026-08-23T11:50:17.522Z
+Stopped at: Completed 05-02-PLAN.md
 Resume file: None

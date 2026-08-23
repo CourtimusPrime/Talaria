@@ -214,7 +214,7 @@ obligation went unaddressed until 04-08.*
 Plans:
 
 - [x] 05-01-PLAN.md — Dependency + lockfile landing (`axum` with WebSockets, one added package); spike A2, whether Tailscale Serve proxies an upgrade and what `Host` a proxied request carries; open `deferred-items.md` (wave 1) — DIST-01
-- [ ] 05-02-PLAN.md — Spike A1/A8: GL readback cost at cadence under Xvfb and on real hardware, and the tile-diff/PNG figures re-measured against real Servo output (wave 1) — DIST-02
+- [x] 05-02-PLAN.md — Spike A1/A8: GL readback cost at cadence under Xvfb and on real hardware, and the tile-diff/PNG figures re-measured against real Servo output (wave 1) — DIST-02
 - [ ] 05-03-PLAN.md — `talaria-protocol`: the `wire` module (envelope, frame header, input and view messages), the Unix-only helpers moved into `local`, and the two module headers that call this crate the distributed wire (wave 1) — DIST-01
 - [ ] 05-04-PLAN.md — Advertised base URL as one source feeding the issuer, the canonical resource, the four endpoint URLs and the Host allowlist; `https` on every published OAuth URL; `BIND_HOST` unchanged; `scripts/tailscale-serve.sh` (wave 2) — DIST-01
 - [ ] 05-05-PLAN.md — The `/view` WebSocket route with **its own** bearer check, registered for revocation; the view session, the agent-only tab lookup and the attachment cap; `remote_view_test.py` and a stdlib WebSocket client in the harness (wave 3) — DIST-01
@@ -292,6 +292,6 @@ Phases execute in numeric order: 1 → 2 → 3 (**ship v1**) → 4 → 5 → 6 �
 | 2. Harden the Agent Surface | 11/11 | ✅ Complete | 2026-08-17 |
 | 3. Table-Stakes Browsing | 4/4 | Complete    | 2026-08-20 |
 | 4. Authenticated Remote Transport | 8/8 | Complete    | 2026-08-21 |
-| 5. Distributed Mode | 1/11 | In Progress|  |
+| 5. Distributed Mode | 2/11 | In Progress|  |
 | 6. Platform Coverage | 0/2 | Not started | - |
 | 7. Release Readiness | 0/3 | Not started | - |
