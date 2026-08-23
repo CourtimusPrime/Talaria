@@ -1,76 +1,30 @@
-//! Wire types for Talaria's local control socket.
+//! Talaria's shared vocabulary: the types the shell, the `talaria-mcp` stdio
+//! proxy, the HTTP transport and the remote view client all speak.
 //!
-//! The shell listens on a Unix domain socket (see [`socket_path`]). Clients
-//! (the `talaria-mcp` stdio proxy today, the distributed-mode client later)
-//! speak newline-delimited JSON: one [`ClientMessage`] per line in, one
-//! [`ServerMessage`] per line out. Replies carry the request's `id`; they may
-//! arrive out of order because some commands (evaluate, screenshot) complete
-//! asynchronously inside the engine.
+//! This crate deliberately carries no transport. It names the things —
+//! [`ClientMessage`], [`Command`], [`Outcome`], [`TabInfo`], [`Event`] — and
+//! leaves the carrying to whichever wire is in use:
 //!
-//! The socket is owner-only: it lives in a directory only its owner can enter,
-//! and the shell refuses to serve if it cannot establish that. Anything that
-//! reaches the socket can read the user's credentials, drive their logged-in
-//! sessions, and run arbitrary JavaScript in them, so reachability by another
-//! local user is itself the vulnerability.
+//! - a Unix domain control socket speaking newline-delimited JSON, one
+//!   [`ClientMessage`] per line in and one [`ServerMessage`] per line out (the
+//!   [`local`] module here, and `talaria-shell`'s `control` module);
+//! - Streamable HTTP for authenticated remote MCP clients (`talaria-shell`'s
+//!   `http` module);
+//! - a multiplexed binary WebSocket for the remote viewer (the [`wire`] module
+//!   here, and the shell's view route).
+//!
+//! What holds across all three is the correlation discipline: replies carry
+//! their request's `id`, and they may arrive out of order because some
+//! commands (evaluate, screenshot) complete asynchronously inside the engine.
+//! Unsolicited events share the same stream and carry no `id` at all.
 
+// `local` is gated because a Unix path and a Unix user id are not vocabulary:
+// they mean nothing to a peer on another machine. See its own header.
+#[cfg(unix)]
+pub mod local;
 pub mod wire;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-
-/// Socket filename inside [`socket_dir`].
-const SOCKET_FILE: &str = "talaria.sock";
-
-/// Directory holding the control socket: `$XDG_RUNTIME_DIR` when it is set,
-/// otherwise a per-UID `talaria-$UID` directory under the shared temp
-/// directory. The fallback is a *directory* rather than a bare socket file so
-/// that it can be made owner-only; see [`ensure_socket_dir`].
-pub fn socket_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir);
-    }
-    std::env::temp_dir().join(format!("talaria-{}", current_uid()))
-}
-
-/// Default socket location: `$XDG_RUNTIME_DIR/talaria.sock`, falling back to
-/// `/tmp/talaria-$UID/talaria.sock`. Always [`socket_dir`] joined with the
-/// socket filename, so the two can never drift.
-pub fn socket_path() -> PathBuf {
-    socket_dir().join(SOCKET_FILE)
-}
-
-/// Make sure [`socket_dir`] exists and is owner-only, returning it.
-///
-/// `$XDG_RUNTIME_DIR` is created and protected at mode 0700 by the OS already,
-/// so only the temp fallback is created and chmodded here. The chmod result is
-/// checked rather than discarded: a directory we cannot make private is a
-/// directory the socket should not live in.
-pub fn ensure_socket_dir() -> std::io::Result<PathBuf> {
-    let dir = socket_dir();
-    if std::env::var_os("XDG_RUNTIME_DIR").is_some() {
-        return Ok(dir);
-    }
-    std::fs::create_dir_all(&dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(dir)
-}
-
-/// The current process's real user id. Exposed so the shell can compare a
-/// connecting peer's credential against it without re-declaring the shim below
-/// or pulling the libc crate into this deliberately serde-only crate.
-pub fn current_uid() -> u32 {
-    unsafe { libc_getuid() }
-}
-
-// Tiny libc shim so we don't pull the libc crate for one call.
-extern "C" {
-    #[link_name = "getuid"]
-    fn libc_getuid() -> u32;
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

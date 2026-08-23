@@ -22,7 +22,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use talaria_protocol::{socket_path, ClientMessage, Command, Event, Outcome, ServerMessage};
+use talaria_protocol::local::socket_path;
+use talaria_protocol::{ClientMessage, Command, Event, Outcome, ServerMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;

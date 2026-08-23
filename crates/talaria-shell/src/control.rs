@@ -1,15 +1,21 @@
-//! Local control socket: the in-process precursor to the distributed
-//! protocol. The `talaria-mcp` stdio proxy (and later, remote clients over
-//! Tailscale) connect here; commands are ferried into the winit event loop
-//! and executed against real webviews on the main thread.
+//! The **local** control plane: a Unix domain socket the `talaria-mcp` stdio
+//! proxy connects to. Commands are ferried into the winit event loop and
+//! executed against real webviews on the main thread.
+//!
+//! This is not, and did not become, the distributed protocol. A remote client
+//! connects to the HTTP listener's routes instead (per `D-05-01` and
+//! `D-05-03`), and the reason is `peer_uid_ok` below rather than taste: the
+//! `Hello` line's `client` string is self-asserted, and it is safe here only
+//! because the kernel has already vouched that the peer runs as the same OS
+//! user. `SO_PEERCRED` has no TCP equivalent, so the same handshake cannot
+//! admit a peer on another machine — that party needs the bearer token and the
+//! origin, host and TLS checks the HTTP transport carries, not this one.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use talaria_protocol::{
-    current_uid, ensure_socket_dir, socket_dir, socket_path, ClientMessage, Command, Outcome,
-    ServerMessage,
-};
+use talaria_protocol::local::{current_uid, ensure_socket_dir, socket_dir, socket_path};
+use talaria_protocol::{ClientMessage, Command, Outcome, ServerMessage};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
