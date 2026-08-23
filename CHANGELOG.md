@@ -141,6 +141,56 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Added
 
+- **The frame rate is a named ladder, and a link that cannot carry the target is
+  answered rather than silently missed** (DIST-02). `talaria-protocol`'s wire gains
+  `RUNG_LADDER`: five rungs, fastest first, each carrying an interval in whole
+  milliseconds and a scale denominator, and **the one place a rung's numbers
+  live**. Its ordering is a test rather than a convention — intervals
+  non-decreasing, denominators non-decreasing, walked pairwise — which is the
+  property the shell's own timeout ordering has, applied here. The cadence
+  request changed shape to match: it names a rung instead of carrying a raw
+  interval, because an interval a client invents is an interval the server has
+  to decide whether to honour, and every such decision is a clamp somebody can
+  get wrong or a way for one viewer to pin the engine's loop (T-05-12-D). The
+  decision is removed rather than bounded. The fastest rung is bounded below by
+  what 05-02 measured this engine producing, not by the requirement's number.
+- **The client measures what the human actually waits for, and walks the ladder
+  on it.** Each input is timed against the frame that echoes its sequence, which
+  is an input-to-photon estimate across two machines with no clock agreed
+  between them — it contains the transmission, the hit test, the paint, the
+  readback, the encode and the client's own presentation. A sample strictly
+  greater than the current rung's interval is an overrun and one exactly equal
+  is not; three consecutive overruns step down and twelve consecutive samples
+  under two fifths of the interval step up. Both asymmetries are the
+  anti-oscillation mechanism, and the margin is derived rather than tuned: a
+  sample good enough to step up must never be an overrun on the rung it steps up
+  to, walked over the whole ladder by a unit test (T-05-12-E).
+- **And it says which rung it is on, and why.** The client's interface names the
+  rung in plain words and, where the overlay network can be asked, whether this
+  peer's path is direct or relayed — the difference between a browser that seems
+  slow and a connection that is being relayed, which is a fix rather than a
+  complaint. The lookup is a subprocess on its own thread, never waited for, and
+  a report that cannot get an answer keeps every part of the line it does know.
+  Per `D-05-06` there is no path anywhere in the controller that stops the human
+  driving: a degraded takeover of a login wall still clears the login wall.
+- **Server-side reduced-resolution frames.** A rung with a denominator above one
+  is produced on the encoder thread by a nearest-neighbour reduction whose
+  destination dimensions **round up**, so a viewport the denominator does not
+  divide loses no column and no row — a floor would drop the rightmost and
+  bottom strips, which reads as a rendering fault rather than as an arithmetic
+  choice. A rung change that resizes the surface forces a keyframe.
+- **`tests/e2e/link_shim.py`** — an unprivileged standard-library forwarder with
+  an added one-way delay, a token-bucket rate cap and a kill, defaulting to this
+  tailnet's own measured relayed profile (~13 Mbit/s, ~40 ms). The kill knob is
+  unused today and is here because Phase 5.1's reconnect work needs exactly it.
+- **`tests/e2e/remote_latency_test.py`** (DIST-02, driving the DIST-01 client) —
+  the passive-to-takeover cadence transition proved from frame timestamps in
+  both directions and at the idle
+  boundary, and, through the shim, a real client stepping down the ladder,
+  reporting it, and **still landing a click**. It deliberately makes no claim
+  that Success Criterion 2's target is met: that is a direct-path claim and
+  loopback hides transmission, which is the only variable that matters.
+
 - **The remote view client shows the page and drives it.** `talaria-client` now
   presents the frames of the agent tab it is attached to and sends the human's
   pointer and keyboard back into it, which is Success Criterion 1 demonstrable

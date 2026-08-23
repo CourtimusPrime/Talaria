@@ -6,16 +6,19 @@ serves the socket-driven suites: control_socket, scheme_refusal,
 crash_recovery, crash_event, timeout_session, wedge_fastfail, mcp_client,
 single_instance, popup.  Phase 2: the standalone suites (keyboard_nav, takeover,
 download_bounds, vault, vault_ui, history, bookmarks, downloads_list,
-panel_click, http_transport, oauth_flow, revocation, remote_view, vault_nobus)
-each start their own shell.
+panel_click, http_transport, oauth_flow, revocation, remote_view,
+remote_latency, vault_nobus) each start their own shell.
 
-oauth_flow_test and revocation_test are the two slow ones: each authorizes
-clients through a real consent click, and revocation_test additionally waits
+oauth_flow_test, revocation_test and remote_latency_test are the slow ones.
+The first two each authorize clients through a real consent click, and
+revocation_test additionally waits
 out a keep-alive interval to prove a stream is delivering before it asserts
 that revoking closes it — on the Streamable-HTTP stream, the legacy /sse
 stream, and the remote view WebSocket. remote_view_test restarts its shell
 once, to prove that with remote access off there is no /view route at all
-before switching it on.
+before switching it on.  remote_latency_test is slow for a different reason:
+it deliberately waits out cadence windows in both directions, and then drives
+a real client through a constrained link until the rate ladder answers.
 
 Honours TALARIA_E2E_DISPLAY / XDG_RUNTIME_DIR (see harness.py) so it can run
 next to a soak on the default display.  Exit code = number of failed suites.
@@ -76,7 +79,8 @@ finally:
 for name in ("keyboard_nav_test", "takeover_test", "download_bounds_test", "vault_test",
              "vault_ui_test", "history_test", "bookmarks_test", "downloads_list_test",
              "panel_click_test", "http_transport_test", "oauth_flow_test",
-             "revocation_test", "remote_view_test", "vault_nobus_test"):
+             "revocation_test", "remote_view_test", "remote_latency_test",
+             "vault_nobus_test"):
     run(name, [])
 
 failed = [n for n, ok in results.items() if not ok]

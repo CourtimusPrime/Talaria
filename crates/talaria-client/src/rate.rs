@@ -103,15 +103,23 @@ const COMFORTABLE_BEFORE_FASTER: u32 = 12;
 /// Stepping up on any sample merely *under* the interval would let a link
 /// sitting exactly on a rung's edge climb, overrun, fall, and climb again
 /// forever — and since a rung change forces a keyframe, that flapping is
-/// expensive rather than merely untidy (T-05-12-E). Requiring seven tenths of
-/// the interval means the faster rung, whose interval is at least half this
-/// one's, has evidence behind it rather than a coin toss.
-const RECOVERY_MARGIN_NUMERATOR: u64 = 7;
+/// expensive rather than merely untidy (T-05-12-E).
+///
+/// **Two fifths, and the number is derived rather than tuned.** The property
+/// that has to hold is: a sample good enough to step *up* from one rung must
+/// not be an overrun on the rung it steps up to, or the ladder climbs and
+/// falls forever on a link that never changed. Most steps of the ladder halve
+/// the interval, so the margin has to be at most one half; the slowest step is
+/// 120 ms to 250 ms, which allows at most 0.48. Two fifths clears both with
+/// room, and a unit test walks the ladder asserting the property directly, so
+/// a rung inserted later that broke it fails rather than oscillating in the
+/// field.
+const RECOVERY_MARGIN_NUMERATOR: u64 = 2;
 
 /// The denominator of [`RECOVERY_MARGIN_NUMERATOR`]. An integer fraction, the
 /// same shape the server's keyframe threshold uses, so the comparison stays
 /// whole-millisecond arithmetic end to end.
-const RECOVERY_MARGIN_DENOMINATOR: u64 = 10;
+const RECOVERY_MARGIN_DENOMINATOR: u64 = 5;
 
 /// How many outstanding send times are kept.
 ///
@@ -811,12 +819,40 @@ mod tests {
         let mut controller = settled();
         feed(&mut controller, u64::from(Rung::FASTEST.interval_ms()) + 1, OVERRUNS_BEFORE_SLOWER);
         let stepped = controller.rung();
-        // Under the interval, over seven tenths of it.
+        // Under the interval, over the recovery margin.
         let lukewarm = u64::from(stepped.interval_ms()) - 1;
         assert!(!is_overrun(lukewarm, stepped.interval_ms()));
         assert!(!is_comfortable(lukewarm, stepped.interval_ms()));
         feed(&mut controller, lukewarm, COMFORTABLE_BEFORE_FASTER * 4);
         assert_eq!(controller.rung(), stepped, "a link just under the edge climbed anyway");
+    }
+
+    /// **The invariant the recovery margin exists for, walked over the whole
+    /// ladder.** A sample good enough to step *up* from one rung must not be an
+    /// overrun on the rung it steps up to. Without that, a link that never
+    /// changed climbs, overruns, falls and climbs again forever — and every one
+    /// of those moves costs a keyframe. A rung inserted later that broke the
+    /// property fails here rather than oscillating in the field.
+    #[test]
+    fn a_sample_good_enough_to_step_up_is_never_an_overrun_on_the_rung_it_reaches() {
+        for entry in talaria_protocol::wire::RUNG_LADDER {
+            let faster = entry.rung.faster();
+            if faster == entry.rung {
+                continue;
+            }
+            // The slowest sample that still counts as comfortable on this rung,
+            // which is the worst link that can trigger a step up from it.
+            let worst = u64::from(entry.interval_ms) * RECOVERY_MARGIN_NUMERATOR
+                / RECOVERY_MARGIN_DENOMINATOR;
+            assert!(is_comfortable(worst, entry.interval_ms), "{}", entry.name);
+            assert!(
+                !is_overrun(worst, faster.interval_ms()),
+                "a link at {worst} ms steps up from {} into an immediate overrun on {}, \
+                 which is an oscillation the recovery margin was supposed to prevent",
+                entry.name,
+                faster.name(),
+            );
+        }
     }
 
     /// **The oscillation case.** A long run of samples sitting exactly on a
