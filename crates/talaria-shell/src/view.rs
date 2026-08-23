@@ -166,6 +166,38 @@ pub const DEFAULT_MAX_VIEW_CONNECTIONS: usize = 4;
 /// second viewer cannot multiply it.
 const DEFAULT_MAX_TOTAL_ATTACH: usize = 8;
 
+/// How many frames may be waiting for one viewer's socket before the pump
+/// stops producing for it.
+///
+/// **The bound on the outbound queue, and it is applied by declining to
+/// produce rather than by discarding what was produced** (CR-03). The channel
+/// itself has to stay unbounded, because a bounded *send* would mean the winit
+/// event loop waiting on a socket — the one thing it must never do. What was
+/// missing was the other half: a policy for a reader that falls behind. A
+/// viewer that stops reading (hostile, or ordinary on the 13 Mbit/s relayed
+/// path 05-RESEARCH measured, where one 522 KB keyframe takes ~300 ms) closes
+/// its receive window, `socket.send` stops returning, and the queue grew
+/// without bound in the process holding the encrypted credential vault.
+///
+/// **Why not drop the oldest and keep the newest**, which is the usual answer
+/// for a frame stream and is the wrong one here: this stream is *deltas*. A
+/// client composites each tile frame onto the surface the previous one left,
+/// so discarding an intermediate frame desynchronises the tile state and the
+/// only repair is a whole keyframe — half a megabyte, sent to the one viewer
+/// that has just proved it cannot drain half a megabyte. Declining to produce
+/// leaves the queue holding a short run of small, in-order deltas that are all
+/// still valid, so the viewer catches up to live by reading them rather than
+/// by being resynchronised. Nothing is discarded, so nothing can desynchronise
+/// and no keyframe is forced.
+///
+/// The cost is staleness, bounded by this number times the rung's interval —
+/// at four frames and the fastest rung, about an eighth of a second, and the
+/// client's own latency estimate will have walked the ladder down long before
+/// it matters. The tick that is skipped also skips its `paint()` and its
+/// framebuffer readback, so a stalled viewer stops costing the winit loop
+/// anything rather than costing it the same and throwing the result away.
+const MAX_QUEUED_FRAMES: usize = 4;
+
 /// The cap's environment override, `TALARIA_VIEW_MAX_ATTACH`.
 ///
 /// The same shape `TALARIA_COMMAND_TIMEOUT_SECS` uses: an unset variable, a
@@ -577,6 +609,100 @@ fn frame_message(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
     encode(Channel::Frame, &body)
 }
 
+/// One viewer's outbound wire, and how much is waiting on it.
+///
+/// **The channel is unbounded and the *production* is bounded** — see
+/// [`MAX_QUEUED_FRAMES`] for why round that way. This type exists because
+/// `tokio`'s `UnboundedSender` cannot be asked its own depth (only the
+/// receiver can, and the receiver lives on the listener thread), so the count
+/// is kept alongside it: raised by every write and lowered when the socket
+/// task takes the item off. It is therefore "queued, and not yet in the socket
+/// task's hand" — an undercount of one against "not yet on the wire", which is
+/// immaterial at a ceiling of four and is the direction that errs toward
+/// producing rather than stalling.
+///
+/// Cloned onto the encoder thread with the tick, so the thread that writes the
+/// bytes is the thread that raises the count.
+///
+/// `Debug` because [`crate::app::AppEvent`] derives it and winit's user event
+/// requires it; it prints the depth and nothing about what is on the wire.
+#[derive(Clone)]
+pub struct ViewChannel {
+    frames: UnboundedSender<Vec<u8>>,
+    depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Debug for ViewChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ViewChannel").field("depth", &self.depth()).finish()
+    }
+}
+
+/// The read end of a [`ViewChannel`], held by the socket task.
+///
+/// Taking an item is the *only* way to get one, and taking is what lowers the
+/// depth — so the count cannot drift by a caller forgetting to report a write.
+pub struct ViewReader {
+    frames: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One viewer's outbound wire, both ends.
+pub fn view_channel() -> (ViewChannel, ViewReader) {
+    let (frames, inbox) = tokio::sync::mpsc::unbounded_channel();
+    let depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (
+        ViewChannel { frames, depth: std::sync::Arc::clone(&depth) },
+        ViewReader { frames: inbox, depth },
+    )
+}
+
+impl ViewChannel {
+    /// Write one message toward the viewer.
+    ///
+    /// A closed channel is not an error: the socket task has ended and the
+    /// session is about to be removed. The count is put back in that case, so
+    /// a dead connection does not leave a permanently raised depth behind on
+    /// the clones the encoder thread still holds.
+    fn send(&self, message: Vec<u8>) {
+        self.depth.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.frames.send(message).is_err() {
+            self.depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// How many messages are queued and not yet taken by the socket task.
+    fn depth(&self) -> usize {
+        self.depth.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl ViewReader {
+    /// The next message for this viewer, or `None` once the main thread has
+    /// dropped the connection.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        let message = self.frames.recv().await;
+        if message.is_some() {
+            self.depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        message
+    }
+
+    /// The next message if one is already queued, without waiting.
+    ///
+    /// Test-only: the socket task awaits, and a poll that gave up would be a
+    /// busy loop on the one path that must not have one. It exists so a suite
+    /// can model a viewer that reads, and a viewer that does not.
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Option<Vec<u8>> {
+        let message = self.frames.try_recv().ok();
+        if message.is_some() {
+            self.depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        message
+    }
+}
+
 /// One tick's pixels and everything the encoder needs to describe them.
 struct Frame {
     connection: u64,
@@ -588,7 +714,7 @@ struct Frame {
     /// **here**, on the encoder thread, and never on the winit loop.
     scale_denominator: u8,
     surface: Surface,
-    out: UnboundedSender<Vec<u8>>,
+    out: ViewChannel,
 }
 
 /// What the main thread asks of the encoder thread.
@@ -687,7 +813,7 @@ fn encode_frames(inbox: std::sync::mpsc::Receiver<Job>) {
                     None => true,
                     Some((kind, region)) => match compose(&frame, kind, region) {
                         Some(message) => {
-                            let _ = frame.out.send(message);
+                            frame.out.send(message);
                             true
                         },
                         None => {
@@ -984,7 +1110,7 @@ pub struct DueTick {
     pub scale_denominator: u8,
     /// This connection's outbound frames, cloned so the encoder thread can
     /// write onto it without reaching back into the main thread's tables.
-    pub out: UnboundedSender<Vec<u8>>,
+    pub out: ViewChannel,
 }
 
 /// One remote viewer's connection, as the main thread sees it.
@@ -998,10 +1124,12 @@ pub struct ViewSession {
     /// it, because a socket that reached this table was already authenticated
     /// by the route that accepted it.
     pub client_id: String,
-    /// This connection's outbound frames. Unbounded because every producer is
-    /// the main thread itself: a bounded send would mean the event loop
-    /// waiting on a socket, which is the one thing it must never do.
-    out: UnboundedSender<Vec<u8>>,
+    /// This connection's outbound frames. The channel is unbounded because a
+    /// bounded *send* would mean the event loop waiting on a socket, which is
+    /// the one thing it must never do; what bounds it instead is
+    /// [`MAX_QUEUED_FRAMES`], consulted in [`ViewSessions::take_due`] before
+    /// anything is produced.
+    out: ViewChannel,
     /// The tabs this connection holds a view lease on, in the order it
     /// attached to them. Bounded by [`max_attachments`].
     attached: Vec<Attachment>,
@@ -1054,7 +1182,7 @@ impl ViewSession {
     /// the socket task has ended and the session is about to be removed.
     fn send(&self, frame: Option<Vec<u8>>) {
         if let Some(frame) = frame {
-            let _ = self.out.send(frame);
+            self.out.send(frame);
         }
     }
 
@@ -1094,7 +1222,7 @@ pub struct ViewSessions {
 
 impl ViewSessions {
     /// Record a newly accepted connection.
-    pub fn opened(&mut self, connection: u64, client_id: String, out: UnboundedSender<Vec<u8>>) {
+    pub fn opened(&mut self, connection: u64, client_id: String, out: ViewChannel) {
         self.sessions.push(ViewSession {
             connection,
             client_id,
@@ -1445,11 +1573,31 @@ impl ViewSessions {
         for session in &mut self.sessions {
             let last_applied_input = session.last_applied_input;
             let rung = session.rung;
+            // **The one question asked before any pixels are paid for**: is
+            // this viewer reading what it already has? See
+            // [`MAX_QUEUED_FRAMES`]. A backed-up viewer is one whose socket is
+            // not draining, so producing for it grows a queue in the process
+            // that holds the vault and costs the winit loop a paint plus a
+            // readback for a frame nobody will see any sooner.
+            let backed_up = session.out.depth() >= MAX_QUEUED_FRAMES;
             for attachment in &mut session.attached {
                 if attachment.due > now {
                     continue;
                 }
                 let interval = attachment.interval(rung, now, idle);
+                if backed_up {
+                    // The deadline still advances, so the loop does not spin
+                    // on an instant already past — and the sequence number is
+                    // **not** consumed and the forced keyframe is **not**
+                    // cleared, because nothing was produced and therefore
+                    // nothing was lost. The frames already queued are valid,
+                    // in order, and still the ones this client needs; it
+                    // catches up by reading them rather than by being
+                    // resynchronised.
+                    attachment.due = now + interval;
+                    attachment.last_tick = Some(now);
+                    continue;
+                }
                 // From `now` rather than from the old deadline: a loop that
                 // ran late must not then try to catch up by ticking twice in
                 // a row, which is how a slow machine turns a missed frame
@@ -1611,8 +1759,6 @@ impl ViewSessions {
 pub(crate) mod testing {
     use super::*;
 
-    use tokio::sync::mpsc::UnboundedReceiver;
-
     /// A tab table with no engine behind it.
     ///
     /// The point of [`ViewTabs`]: every `Tab` owns a live `WebView`, so a real
@@ -1693,14 +1839,14 @@ pub(crate) mod testing {
     /// One connected viewer, plus the read end of its outbound channel.
     pub(crate) struct Viewer {
         pub(crate) connection: u64,
-        frames: UnboundedReceiver<Vec<u8>>,
+        frames: ViewReader,
     }
 
     impl Viewer {
         /// Every frame written to this viewer since the last drain.
         pub(crate) fn drain(&mut self) -> Vec<Vec<u8>> {
             let mut frames = Vec::new();
-            while let Ok(frame) = self.frames.try_recv() {
+            while let Some(frame) = self.frames.try_recv() {
                 frames.push(frame);
             }
             frames
@@ -1737,7 +1883,7 @@ pub(crate) mod testing {
         connection: u64,
         client_id: &str,
     ) -> Viewer {
-        let (out, frames) = tokio::sync::mpsc::unbounded_channel();
+        let (out, frames) = view_channel();
         sessions.opened(connection, client_id.to_owned(), out);
         Viewer { connection, frames }
     }
@@ -2704,7 +2850,7 @@ mod tests {
     /// own size rather than inferring a scale from a ratio.
     #[test]
     fn a_reduced_frame_declares_its_denominator_and_its_reduced_dimensions() {
-        let (out, _frames) = tokio::sync::mpsc::unbounded_channel();
+        let (out, _frames) = view_channel();
         let surface = reduce(&flat(201, 137, 0x30), 2);
         let whole = surface.whole();
         let frame = Frame {
@@ -2764,6 +2910,58 @@ mod tests {
         let painted = Instant::now().max(due);
         assert_eq!(sessions.take_due(painted, view_idle()).len(), 1);
         assert_eq!(sessions.next_tick(), Some(painted + driven));
+    }
+
+    /// CR-03: a viewer that is not reading its socket stops the pump producing
+    /// for it, rather than growing a queue in the process that holds the
+    /// vault.
+    ///
+    /// The bug this pins: `out` was an unbounded channel with no depth check
+    /// anywhere and a cadence driven entirely by the server's own clock, so a
+    /// peer that closed its receive window — hostile, or ordinary on a stalled
+    /// relayed path — grew it without bound while the pump kept producing.
+    #[test]
+    fn a_viewer_that_is_not_reading_stops_the_pump_producing_for_it() {
+        let mut tabs = FakeTabs::with(&[(1, true)]);
+        let mut sessions = ViewSessions::default();
+        let mut viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &mut tabs);
+        let _ = viewer.drain();
+
+        let now = Instant::now();
+        assert_eq!(sessions.take_due(now, view_idle()).len(), 1, "the first frame was not due");
+        let _ = viewer.drain();
+
+        // Fill the queue and read none of it. A refusal is a message on the
+        // same wire the pictures ride, which is what makes it usable here —
+        // the pixels themselves need a live engine and these do not.
+        for _ in 0..MAX_QUEUED_FRAMES {
+            attach(&mut sessions, &viewer, 4242, &mut tabs);
+        }
+
+        let passive = Duration::from_millis(passive_tick_ms());
+        let mut at = now + passive;
+        assert!(
+            sessions.take_due(at, view_idle()).is_empty(),
+            "the pump produced a frame for a viewer that is not reading the last four",
+        );
+        assert!(
+            sessions.next_tick().is_some_and(|due| due > at),
+            "a skipped tick left the deadline in the past, so the loop spins",
+        );
+
+        // And it resumes on its own the moment the viewer reads — with the
+        // frame sequence the skipped ticks did **not** consume, so the client's
+        // stream has no hole in it and needs no keyframe to recover.
+        let _ = viewer.drain();
+        at += passive;
+        let resumed = sessions.take_due(at, view_idle());
+        assert_eq!(resumed.len(), 1, "the pump did not resume once the viewer read");
+        assert_eq!(
+            resumed[0].frame_seq, 2,
+            "a skipped tick consumed a frame sequence number, so a frame was dropped rather \
+             than never produced",
+        );
     }
 
     /// CR-01: a viewer sending input as fast as it can does not get to set the
@@ -3028,7 +3226,7 @@ mod tests {
     /// assembly rather than describing it.
     #[test]
     fn a_composed_frame_carries_a_header_the_wire_accepts() {
-        let (out, _frames) = tokio::sync::mpsc::unbounded_channel();
+        let (out, _frames) = view_channel();
         let surface = flat(200, 200, 0x30);
         let frame = Frame {
             connection: 7,
@@ -3064,7 +3262,7 @@ mod tests {
     /// its own frame is refused on decode.
     #[test]
     fn a_keyframe_covers_its_whole_surface_and_still_decodes() {
-        let (out, _frames) = tokio::sync::mpsc::unbounded_channel();
+        let (out, _frames) = view_channel();
         let surface = flat(200, 136, 0x30);
         let whole = surface.whole();
         let frame = Frame {

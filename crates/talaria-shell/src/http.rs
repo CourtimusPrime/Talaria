@@ -1650,7 +1650,7 @@ impl ViewRoute {
         }
         log::info!("view connection {connection} opened by client {client_id}");
 
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, mut out_rx) = crate::view::view_channel();
         let opened = match crate::view::hello_frame() {
             Some(hello) => socket.send(Message::Binary(Bytes::from(hello))).await.is_ok(),
             None => false,
@@ -1691,7 +1691,7 @@ impl ViewRoute {
     async fn pump(
         &self,
         socket: &mut WebSocket,
-        out_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        out_rx: &mut crate::view::ViewReader,
         close_rx: &mut oneshot::Receiver<()>,
         connection: u64,
     ) {
@@ -1797,8 +1797,26 @@ async fn view_upgrade(
         log::info!("remote access refused a view upgrade from client {client_id}: at capacity");
         return view_at_capacity();
     }
-    upgrade.on_upgrade(move |socket| route.run(socket, client_id))
+    upgrade
+        .max_message_size(MAX_VIEW_MESSAGE_BYTES)
+        .max_frame_size(MAX_VIEW_MESSAGE_BYTES)
+        .on_upgrade(move |socket| route.run(socket, client_id))
 }
+
+/// The largest inbound message this route will assemble, in bytes.
+///
+/// **The inbound half of CR-03.** `axum`'s default is 64 MiB, every inbound
+/// frame becomes an owned `Vec<u8>` shipped to the winit main thread on the
+/// event queue, and nothing bounded how many were in flight — so one peer
+/// could make this process allocate 64 MiB per message on the path the local
+/// human's own window is drawn from.
+///
+/// Everything a viewer legitimately sends is a control or input message of a
+/// few hundred bytes of JSON. Sixty-four kibibytes is three orders of
+/// magnitude of headroom against that and three orders of magnitude below the
+/// default, and it is set on the frame as well as the message so a peer cannot
+/// reach the limit by fragmenting.
+const MAX_VIEW_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// The body an **authenticated** client gets when this browser is already
 /// serving its ceiling of view sockets.

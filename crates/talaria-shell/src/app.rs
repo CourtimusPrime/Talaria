@@ -122,7 +122,7 @@ pub enum AppEvent {
     ViewOpened {
         connection: u64,
         client_id: String,
-        out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        out: crate::view::ViewChannel,
     },
     /// One frame arrived from a viewer, still exactly as it was on the wire.
     ///
@@ -812,7 +812,7 @@ impl Shared {
         &self,
         connection: u64,
         client_id: String,
-        out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        out: crate::view::ViewChannel,
     ) {
         self.views.borrow_mut().opened(connection, client_id, out);
         self.publish_views();
