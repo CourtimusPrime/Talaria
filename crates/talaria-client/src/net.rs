@@ -45,9 +45,9 @@
 
 use std::path::PathBuf;
 
-use futures_util::StreamExt as _;
+use futures_util::{SinkExt as _, StreamExt as _};
 use talaria_protocol::wire::{
-    Channel, FrameHeader, ServerView, TabList, FRAME_HEADER_LEN, PROTOCOL_VERSION,
+    Channel, ClientView, FrameHeader, ServerView, TabList, FRAME_HEADER_LEN, PROTOCOL_VERSION,
 };
 use talaria_protocol::TabInfo;
 use tokio_tungstenite::tungstenite;
@@ -118,10 +118,23 @@ pub enum ConnectionState {
     Dropped,
 }
 
-/// Everything the connection thread tells the event loop.
+/// A frame's encoded bytes.
 ///
-/// Two shapes and no more: where the connection is, and what the server last
-/// said the agent tabs were.
+/// A newtype over the bytes for one reason: its [`std::fmt::Debug`] prints the
+/// length rather than the contents. [`Update`] derives `Debug` and rides a winit
+/// user event, so without this a single stray trace line would print three
+/// megabytes of a page's pixels — which is both useless and a copy of somebody's
+/// screen in a log file.
+#[derive(Clone)]
+pub struct FramePayload(pub Vec<u8>);
+
+impl std::fmt::Debug for FramePayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "FramePayload({} bytes)", self.0.len())
+    }
+}
+
+/// Everything the connection thread tells the event loop.
 #[derive(Debug, Clone)]
 pub enum Update {
     /// The connection moved to a new state.
@@ -129,6 +142,51 @@ pub enum Update {
     /// A tab snapshot, **in the order the server sent it**. Nothing between the
     /// socket and the chrome reorders this.
     Tabs(Vec<TabInfo>),
+    /// The server accepted an attach and named the tab's viewport at that
+    /// moment. A *starting* size and never a contract — the frame header stays
+    /// the authority for what any particular frame actually is.
+    Attached { tab: u64, width: u32, height: u32 },
+    /// The attachment on `tab` is over, whether this client asked or the server
+    /// decided — a tab closing underneath a viewer takes this exit too.
+    Detached { tab: u64 },
+    /// The server refused, and **says nothing about why**. Nothing here guesses:
+    /// its refusal is byte-identical for a tab the human owns and a tab that
+    /// never existed, deliberately.
+    Refused,
+    /// One frame, header and payload, exactly as it arrived.
+    Frame(FrameHeader, FramePayload),
+}
+
+/// The messages this client may send, and the only way to send one.
+///
+/// Cloneable, because the loop hands one to the interface's intent handling and
+/// one to the input path, and both are on the same thread as the loop. A send
+/// is a push into an unbounded channel the connection thread drains — never a
+/// socket write from the loop, because a socket write can block and the loop
+/// draws the window.
+///
+/// Every method answers whether the message was **queued**, not whether it was
+/// delivered. There is no delivery answer to give: the wire has no
+/// acknowledgement for input, by design.
+#[derive(Clone)]
+pub struct Outbound {
+    sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Outbound {
+    /// One control-channel message: attach, detach, viewport or cadence.
+    pub fn control(&self, message: &ClientView) -> bool {
+        let Ok(payload) = serde_json::to_vec(message) else { return false };
+        self.channel(Channel::Control, &payload)
+    }
+
+    /// The tag byte, then the payload — the whole of this wire's framing.
+    fn channel(&self, channel: Channel, payload: &[u8]) -> bool {
+        let mut frame = Vec::with_capacity(payload.len() + 1);
+        frame.push(channel.tag());
+        frame.extend_from_slice(payload);
+        self.sender.send(frame).is_ok()
+    }
 }
 
 /// Which of the two places a credential was found in.
@@ -140,18 +198,19 @@ pub enum CredentialSource {
     File(PathBuf),
 }
 
-/// One decoded inbound message, in the two shapes this plan acts on.
+/// One decoded inbound message, in the three shapes this client acts on.
 ///
-/// The event channel and the frame channel are decoded far enough to know they
-/// are well formed and then discarded: presenting frames is `05-09` and
-/// surfacing events is `05-10`. Discarding is not the same as refusing — see
-/// [`decode`].
+/// The event channel is decoded far enough to know it is well formed and then
+/// discarded: surfacing events is `05-10`. Discarding is not the same as
+/// refusing — see [`decode`].
 #[derive(Debug, Clone)]
 enum Decoded {
     /// A control-channel message from the server.
     Control(ServerView),
     /// The server's agent tabs, in the server's order.
     Tabs(Vec<TabInfo>),
+    /// One frame: its fixed header, and the encoded bytes behind it.
+    Frame(FrameHeader, FramePayload),
 }
 
 /// The `ws`/`wss` endpoint a base URL names, or `None` for one this client
@@ -289,13 +348,16 @@ fn decode(frame: &[u8]) -> Option<Decoded> {
         Channel::Tabs => {
             serde_json::from_slice::<TabList>(payload).ok().map(|list| Decoded::Tabs(list.tabs))
         },
-        // Well formed or not, a tile goes nowhere yet: presenting frames is
-        // `05-09`. Parsing the header regardless is what makes "a short header
-        // is discarded" a property this plan already holds rather than one that
-        // arrives with the presenter.
+        // The header is decoded through the wire type, which makes six
+        // structural refusals of its own — a short slice, an unknown format
+        // version, a kind naming no kind, a zero scale denominator, a tile with
+        // no area, and a tile that does not fit inside the frame it declares.
+        // The last matters most here: a header claiming a tile beyond its own
+        // frame is a peer asking this client to composite outside its texture.
         Channel::Frame => {
-            let _ = frame_header(payload)?;
-            None
+            let header = frame_header(payload)?;
+            let bytes = payload.get(FRAME_HEADER_LEN..)?;
+            Some(Decoded::Frame(header, FramePayload(bytes.to_vec())))
         },
         // Events are `05-10`'s. Input only ever travels the other way.
         Channel::Event | Channel::Input => None,
@@ -354,11 +416,18 @@ fn view_request(
     Some(request)
 }
 
-/// Spawn the connection thread.
+/// Spawn the connection thread, and answer with the way to send on it.
 ///
 /// Called from the entry point with a cloned loop proxy, **before** the loop
 /// runs, so the first state the window can draw is already on its way.
-pub fn spawn(endpoint: String, report: impl Fn(Update) + Send + 'static) {
+///
+/// The returned [`Outbound`] is usable immediately, before the socket has
+/// opened: a message queued now is written when the connection is up. Nothing
+/// depends on that — the loop refuses to send anything at all while the
+/// connection is not established — but a queue that only existed after the fact
+/// would be a second state to reason about for no gain.
+pub fn spawn(endpoint: String, report: impl Fn(Update) + Send + 'static) -> Outbound {
+    let (sender, commands) = tokio::sync::mpsc::unbounded_channel();
     let thread = std::thread::Builder::new().name("talaria-view".into()).spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(runtime) => runtime,
@@ -371,11 +440,15 @@ pub fn spawn(endpoint: String, report: impl Fn(Update) + Send + 'static) {
                 return;
             },
         };
-        runtime.block_on(connect(endpoint, &report));
+        runtime.block_on(connect(endpoint, &report, commands));
     });
     if let Err(error) = thread {
         log::error!("the view connection thread could not be spawned: {error}");
     }
+    // Handed back whether or not the thread started. A send on a channel with
+    // no receiver answers `false`, which is the same answer a send on a closed
+    // connection gives — one failure shape rather than two.
+    Outbound { sender }
 }
 
 /// One connection, from credential to close.
@@ -384,7 +457,11 @@ pub fn spawn(endpoint: String, report: impl Fn(Update) + Send + 'static) {
 /// and stops there, because every one of those states has a next step a human
 /// takes — and a client that silently reconnected forever would hide all of
 /// them behind a spinner.
-async fn connect(endpoint: String, report: &(impl Fn(Update) + ?Sized)) {
+async fn connect(
+    endpoint: String,
+    report: &(impl Fn(Update) + ?Sized),
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
     let Some((credential, source)) = read_credential() else {
         report(Update::State(ConnectionState::MissingCredential));
         return;
@@ -410,7 +487,7 @@ async fn connect(endpoint: String, report: &(impl Fn(Update) + ?Sized)) {
     drop(credential);
 
     log::info!("connecting to {endpoint}");
-    let mut socket = match tokio_tungstenite::connect_async(request).await {
+    let socket = match tokio_tungstenite::connect_async(request).await {
         Ok((socket, _response)) => socket,
         Err(error) => {
             let state = classify(&error);
@@ -419,11 +496,17 @@ async fn connect(endpoint: String, report: &(impl Fn(Update) + ?Sized)) {
             return;
         },
     };
+    // Split so the reading half and the writing half can be awaited at once.
+    // Without this the loop below could not do both: reading borrows the socket
+    // for as long as it waits, and a viewer that could not send while waiting
+    // for a frame could not send at all — a page that is not changing sends
+    // nothing, which is exactly when a human is about to click on it.
+    let (mut writer, mut reader) = socket.split();
 
     // The server sends its hello first on every connection, before anything
     // else, so a client always learns the wire version before it is handed a
     // message it would need that version to interpret.
-    match next_binary(&mut socket).await.as_deref().and_then(decode) {
+    match next_binary(&mut reader).await.as_deref().and_then(decode) {
         Some(Decoded::Control(ServerView::Hello { protocol })) if protocol == PROTOCOL_VERSION => {
             report(Update::State(ConnectionState::Connected));
         },
@@ -443,13 +526,44 @@ async fn connect(endpoint: String, report: &(impl Fn(Update) + ?Sized)) {
         },
     }
 
-    while let Some(frame) = next_binary(&mut socket).await {
-        match decode(&frame) {
-            Some(Decoded::Tabs(tabs)) => report(Update::Tabs(tabs)),
-            // Control messages past the hello are attach answers, which this
-            // plan does not send and therefore cannot receive. Discarded, for
-            // [`decode`]'s reason.
-            Some(Decoded::Control(_)) | None => {},
+    // Both directions at once, on one thread, for the life of the connection.
+    //
+    // `quiet` guards the send arm rather than breaking the loop when the
+    // command channel closes: every [`Outbound`] being dropped means the window
+    // is gone, but the reading half may still have messages worth draining, and
+    // an unguarded `recv` that answers `None` forever would spin this thread at
+    // the speed of the scheduler.
+    let mut quiet = false;
+    loop {
+        tokio::select! {
+            inbound = next_binary(&mut reader) => {
+                let Some(frame) = inbound else { break };
+                match decode(&frame) {
+                    Some(Decoded::Tabs(tabs)) => report(Update::Tabs(tabs)),
+                    Some(Decoded::Frame(header, payload)) => {
+                        report(Update::Frame(header, payload))
+                    },
+                    Some(Decoded::Control(ServerView::Attached { tab, width, height })) => {
+                        report(Update::Attached { tab, width, height })
+                    },
+                    Some(Decoded::Control(ServerView::Detached { tab })) => {
+                        report(Update::Detached { tab })
+                    },
+                    Some(Decoded::Control(ServerView::Refused)) => report(Update::Refused),
+                    // A second hello, and anything this build does not know:
+                    // discarded, for [`decode`]'s reason.
+                    Some(Decoded::Control(ServerView::Hello { .. })) | None => {},
+                }
+            },
+            outgoing = commands.recv(), if !quiet => {
+                let Some(frame) = outgoing else {
+                    quiet = true;
+                    continue;
+                };
+                if writer.send(tungstenite::Message::Binary(frame.into())).await.is_err() {
+                    break;
+                }
+            },
         }
     }
     report(Update::State(ConnectionState::Dropped));
@@ -461,12 +575,12 @@ async fn connect(endpoint: String, report: &(impl Fn(Update) + ?Sized)) {
 /// message is a server saying something in a language this client does not
 /// speak, and that is the same situation as an unknown channel tag. Ping and
 /// pong are answered by the socket itself.
-async fn next_binary<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> Option<Vec<u8>>
+async fn next_binary<S>(reader: &mut S) -> Option<Vec<u8>>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: futures_util::Stream<Item = Result<tungstenite::Message, tungstenite::Error>> + Unpin,
 {
     loop {
-        match socket.next().await? {
+        match reader.next().await? {
             Ok(tungstenite::Message::Binary(frame)) => return Some(frame.to_vec()),
             Ok(tungstenite::Message::Close(_)) => return None,
             Ok(_) => {},
@@ -585,6 +699,37 @@ mod tests {
     }
 
     #[test]
+    fn a_well_formed_frame_decodes_into_its_header_and_the_bytes_behind_it() {
+        use talaria_protocol::wire::FrameKind;
+        let header = FrameHeader {
+            kind: FrameKind::Tile,
+            scale_denominator: 1,
+            tab_id: 12,
+            frame_seq: 44,
+            last_applied_input: 43,
+            tile_x: 64,
+            tile_y: 0,
+            tile_width: 64,
+            tile_height: 64,
+            frame_width: 256,
+            frame_height: 128,
+        };
+        let mut payload = header.to_bytes().to_vec();
+        payload.extend_from_slice(b"\x89PNG\r\n\x1a\n and then some");
+        let Some(Decoded::Frame(decoded, bytes)) = decode(&framed(Channel::Frame, &payload)) else {
+            panic!("a frame carrying a well-formed header must decode");
+        };
+        assert_eq!(decoded, header, "the header did not survive the round trip");
+        assert_eq!(bytes.0, b"\x89PNG\r\n\x1a\n and then some");
+    }
+
+    #[test]
+    fn a_frame_payload_prints_its_length_rather_than_a_page_of_pixels() {
+        assert_eq!(format!("{:?}", FramePayload(vec![0u8; 3_840_000])),
+                   "FramePayload(3840000 bytes)");
+    }
+
+    #[test]
     fn a_tab_snapshot_decodes_in_the_order_the_server_sent_it() {
         let tabs = vec![tab(9, "Nine"), tab(2, "Two"), tab(5, "Five")];
         let Ok(payload) = serde_json::to_vec(&TabList { tabs: tabs.clone() }) else {
@@ -672,11 +817,18 @@ mod tests {
         };
         let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = collected.clone();
-        connect(endpoint, &move |update: Update| {
-            if let Ok(mut collected) = sink.lock() {
-                collected.push(update);
-            }
-        })
+        // A receiver whose sender is dropped at once: this client sends nothing
+        // in these cases, and the send arm must sit quiet rather than spin.
+        let (_sender, commands) = tokio::sync::mpsc::unbounded_channel();
+        connect(
+            endpoint,
+            &move |update: Update| {
+                if let Ok(mut collected) = sink.lock() {
+                    collected.push(update);
+                }
+            },
+            commands,
+        )
         .await;
         handle.abort();
         let Ok(collected) = collected.lock() else {
@@ -695,7 +847,7 @@ mod tests {
             .iter()
             .filter_map(|update| match update {
                 Update::State(state) => Some(state.clone()),
-                Update::Tabs(_) => None,
+                _ => None,
             })
             .collect();
         assert_eq!(
@@ -733,6 +885,7 @@ mod tests {
                 Update::Tabs(tabs) => {
                     seen_tabs = tabs.iter().map(|tab| tab.tab_id).collect::<Vec<_>>()
                 },
+                _ => {},
             }
         }
         assert_eq!(

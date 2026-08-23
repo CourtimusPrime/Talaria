@@ -31,6 +31,17 @@ egui_glow = { workspace = true }
 egui-phosphor = { workspace = true }
 glow = { workspace = true }
 
+# The frame channel's payload codec, and the *only* dependency this plan adds.
+#
+# **Zero added packages, and no resolution.** `png 0.17` is already declared in
+# `[workspace.dependencies]` and already in `Cargo.lock` at 0.17.16 — the
+# server's frame encoder is the other end of this exact line — so this is an
+# edge onto a node the lock already carries rather than a package fetched from a
+# registry. `cargo build --locked` is what proves it: a resolution would fail
+# against the committed lock rather than quietly rewriting it. The lock's own
+# diff is one line, `"png 0.17.16"` in this crate's dependency list.
+png = { workspace = true }
+
 talaria-protocol = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros", "time"] }
 tokio-tungstenite = { workspace = true }

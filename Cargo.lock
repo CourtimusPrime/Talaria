@@ -8654,6 +8654,7 @@ dependencies = [
  "futures-util",
  "glow",
  "log",
+ "png 0.17.16",
  "rustls",
  "serde_json",
  "surfman",

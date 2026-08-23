@@ -2,8 +2,9 @@
 //!
 //! **What this binary is.** A viewer for a *Talaria server's* agent tabs. It
 //! opens a window, connects to one server over a WebSocket, authenticates with
-//! a bearer credential, and shows that server's agent tabs. From `05-09` it
-//! will also present their frames and send pointer and keyboard input back.
+//! a bearer credential, shows that server's agent tabs, presents the frames of
+//! whichever one it is attached to, and sends the human's pointer and keyboard
+//! back into it.
 //!
 //! **What it deliberately is not.** It links no web engine. There is no
 //! `servo` line in this crate's manifest and none in its dependency tree, and
@@ -38,6 +39,7 @@
 
 mod chrome;
 mod net;
+mod present;
 
 use std::cell::{Cell, RefCell};
 use std::error::Error;
@@ -46,6 +48,7 @@ use std::sync::Arc;
 use chrome::{Chrome, UiAction, View};
 use egui_glow::EguiGlow;
 use glow::HasContext as _;
+use talaria_protocol::wire::ClientView;
 use talaria_protocol::TabInfo;
 use surfman::{
     Connection, Context, ContextAttributeFlags, ContextAttributes, Device, GLApi, SurfaceAccess,
@@ -256,6 +259,7 @@ enum App {
         proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
         state: net::ConnectionState,
         tabs: Vec<TabInfo>,
+        outbound: net::Outbound,
     },
     /// After it. Owns the window, its surface and its interface.
     ///
@@ -297,6 +301,12 @@ struct Running {
     state: net::ConnectionState,
     /// The server's agent tabs, held **in the order the server sent them**.
     tabs: Vec<TabInfo>,
+    /// The way to send on the connection. Replaced wholesale by a reconnect, so
+    /// a message queued for a connection that ended cannot arrive on its
+    /// successor.
+    outbound: net::Outbound,
+    /// The picture, and the one transform that lays it out.
+    present: present::Presenter,
     /// Set by a redraw request and cleared once the frame is drawn, so one
     /// window event produces at most one frame.
     redraw: Cell<bool>,
@@ -316,16 +326,21 @@ impl Running {
         // `self.egui` is: edition 2021 closures capture disjoint fields, so
         // nothing here needs the move-out-and-back the server's chrome does for
         // its own view state.
-        let Running { egui, chrome, window, server, state, tabs, .. } = self;
+        let Running { egui, chrome, window, server, state, tabs, present, .. } = self;
         let credential_file = net::credential_file();
         let mut actions = Vec::new();
         egui.run(window, |ui| {
-            actions = chrome.update(ui, &View {
-                server,
-                state,
-                tabs,
-                credential_file: credential_file.as_deref(),
-            });
+            actions = chrome.update(
+                ui,
+                &View {
+                    server,
+                    state,
+                    tabs,
+                    credential_file: credential_file.as_deref(),
+                    attached: present.attached(),
+                },
+                present,
+            );
         });
         self.surface.prepare_for_rendering();
         self.egui.paint(&self.window);
@@ -341,10 +356,76 @@ impl Running {
                 UiAction::Reconnect => {
                     self.state = net::ConnectionState::NotStarted;
                     self.tabs.clear();
-                    net::spawn(self.endpoint.clone(), report_to(self.proxy.clone()));
+                    // The attachment belonged to the connection that ended, and
+                    // so did the picture. Clearing it here is the same
+                    // clear-on-detach rule the presenter states: a surface left
+                    // behind would be shown against whatever the next
+                    // attachment turns out to be.
+                    self.present.detach();
+                    self.outbound =
+                        net::spawn(self.endpoint.clone(), report_to(self.proxy.clone()));
                     self.window.request_redraw();
                 },
+                // The picture is **not** cleared here and the attachment is not
+                // marked until the server acknowledges. An optimistic switch
+                // would show the new tab's placeholder over the old tab's
+                // picture for a refusal that never becomes an attachment, and
+                // this server refuses without saying why.
+                UiAction::Attach(tab) => {
+                    if let Some(previous) = self.present.attached() {
+                        // One picture, one attachment: releasing the previous
+                        // lease is the client's job, because the server holds it
+                        // until somebody says otherwise.
+                        self.outbound.control(&ClientView::Detach { tab: previous });
+                    }
+                    self.outbound.control(&ClientView::Attach { tab });
+                },
+                UiAction::Detach(tab) => {
+                    self.outbound.control(&ClientView::Detach { tab });
+                },
             }
+        }
+    }
+
+    /// Take one report from the connection thread.
+    ///
+    /// The loop's half of the one-way discipline: the thread builds a value and
+    /// this is the only place one is interpreted.
+    fn receive(&mut self, update: net::Update) {
+        match update {
+            net::Update::State(next) => {
+                // A connection that ended takes its attachment with it. The
+                // picture goes too, for the presenter's stated reason.
+                if !matches!(next, net::ConnectionState::Connected) {
+                    self.present.detach();
+                }
+                self.state = next;
+            },
+            // Assigned wholesale, never merged and never sorted: the snapshot
+            // the server sent **is** the list, in the server's order.
+            net::Update::Tabs(next) => self.tabs = next,
+            net::Update::Attached { tab, width, height } => {
+                log::info!("attached to tab {tab}, whose viewport is {width}x{height}");
+                // The acknowledgement's size is deliberately **not** used to
+                // size the surface. It is a starting size and never a contract,
+                // and the first keyframe — which is already on its way —
+                // declares the size actually painted. Sizing from the weaker
+                // fact and then correcting it would put a wrongly-scaled frame
+                // on screen for exactly one frame, and a click during it would
+                // land somewhere else.
+                self.present.attach(tab);
+            },
+            net::Update::Detached { tab } => {
+                if self.present.attached() == Some(tab) {
+                    self.present.detach();
+                }
+            },
+            // The server says nothing about why, and neither does this: the
+            // human sees the page area go back to its placeholder.
+            net::Update::Refused => self.present.detach(),
+            net::Update::Frame(header, payload) => {
+                self.present.apply(&self.egui.egui_ctx, &header, &payload.0);
+            },
         }
     }
 
@@ -384,7 +465,7 @@ impl Drop for Running {
 
 impl ApplicationHandler<ClientEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let App::Initial { server, endpoint, proxy, state, tabs } = self else {
+        let App::Initial { server, endpoint, proxy, state, tabs, outbound } = self else {
             return;
         };
         let server = std::mem::take(server);
@@ -392,6 +473,7 @@ impl ApplicationHandler<ClientEvent> for App {
         let proxy = proxy.clone();
         let state = state.clone();
         let tabs = std::mem::take(tabs);
+        let outbound = outbound.clone();
         let display_handle = event_loop.display_handle().expect("display handle");
         let window = event_loop
             .create_window(
@@ -425,6 +507,8 @@ impl ApplicationHandler<ClientEvent> for App {
             proxy,
             state,
             tabs,
+            outbound,
+            present: present::Presenter::default(),
             redraw: Cell::new(true),
         }));
     }
@@ -440,21 +524,21 @@ impl ApplicationHandler<ClientEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ClientEvent) {
         let ClientEvent::Net(update) = event;
-        // Handled in both arms on purpose: an update that arrives before the
-        // first `resumed` is stashed rather than dropped. See
-        // [`App::Initial`].
-        let (state, tabs) = match self {
-            App::Initial { state, tabs, .. } => (state, tabs),
-            App::Running(running) => (&mut running.state, &mut running.tabs),
-        };
-        match update {
-            net::Update::State(next) => *state = next,
-            // Assigned wholesale, never merged and never sorted: the snapshot
-            // the server sent **is** the list, in the server's order.
-            net::Update::Tabs(next) => *tabs = next,
-        }
-        if let App::Running(running) = self {
-            running.window.request_redraw();
+        match self {
+            // Handled here on purpose: an update that arrives before the first
+            // `resumed` is stashed rather than dropped. See [`App::Initial`].
+            // A *frame* arriving this early is discarded instead — there is no
+            // graphics context to upload it into, and by the time there is, the
+            // server will have sent a fresh keyframe for the attachment.
+            App::Initial { state, tabs, .. } => match update {
+                net::Update::State(next) => *state = next,
+                net::Update::Tabs(next) => *tabs = next,
+                _ => {},
+            },
+            App::Running(running) => {
+                running.receive(update);
+                running.window.request_redraw();
+            },
         }
     }
 
@@ -556,13 +640,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Spawned with a cloned proxy **before** the loop runs, so the connection
     // is already in flight by the time the window draws its first frame.
     let proxy = event_loop.create_proxy();
-    net::spawn(endpoint.clone(), report_to(proxy.clone()));
+    let outbound = net::spawn(endpoint.clone(), report_to(proxy.clone()));
     let mut app = App::Initial {
         server,
         endpoint,
         proxy,
         state: net::ConnectionState::NotStarted,
         tabs: Vec::new(),
+        outbound,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

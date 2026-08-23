@@ -55,6 +55,16 @@
 use talaria_protocol::{ChromeRect, TabInfo};
 
 use crate::net::ConnectionState;
+use crate::present::{Fit, Presenter};
+
+/// How wide the client's own controls are, in logical points.
+///
+/// Fixed rather than proportional, and a **side** panel rather than a strip
+/// above the page: the page area is then a large rectangle whose aspect ratio
+/// has nothing to do with the server's, which is what keeps the letterboxed
+/// margin a real place a pointer can be rather than a hairline that only exists
+/// on some window sizes.
+const CONTROLS_WIDTH: f32 = 340.0;
 
 /// How many characters of a page-supplied string are rendered.
 ///
@@ -79,6 +89,15 @@ pub enum UiAction {
     /// [`crate::net`]'s no-retry-loop note. A client that reconnected on its own
     /// forever would hide all nine states behind a spinner.
     Reconnect,
+    /// Watch this tab: ask the server for its frames.
+    ///
+    /// One tab at a time, because one window shows one picture. Attaching to a
+    /// second detaches the first rather than opening a second stream nobody can
+    /// see — an invisible stream is bandwidth a human cannot account for, and on
+    /// the server side it is a render lease held on a tab nobody is watching.
+    Attach(u64),
+    /// Stop watching this tab, releasing the server's render lease.
+    Detach(u64),
 }
 
 /// The first `limit` characters of `text`, with an ellipsis when there was more.
@@ -173,6 +192,12 @@ pub struct View<'a> {
     pub tabs: &'a [TabInfo],
     /// Where a credential file would be read from, for the pairing copy.
     pub credential_file: Option<&'a std::path::Path>,
+    /// The tab whose frames are being shown, if any.
+    ///
+    /// The human needs to know what they are looking at and, once there is
+    /// input, what their clicks are going into: a viewer attached to nothing
+    /// must not look identical to one that is attached.
+    pub attached: Option<u64>,
 }
 
 /// The client's interface.
@@ -181,6 +206,9 @@ pub struct Chrome {
     /// per frame: the variable cannot change under a running process, and a
     /// lock and an allocation per frame to learn the same answer is not free.
     chrome_rects: Option<Vec<ChromeRect>>,
+    /// How the picture was laid out on the last drawn frame. Recorded here
+    /// because the pointer mapping needs it and must not compute its own.
+    fit: Option<Fit>,
 }
 
 impl Chrome {
@@ -190,6 +218,7 @@ impl Chrome {
                 true => Some(Vec::new()),
                 false => None,
             },
+            fit: None,
         }
     }
 
@@ -203,34 +232,96 @@ impl Chrome {
     /// Rebuilds the rect collection from scratch, so a control that stopped
     /// being drawn stops being reported — a stale rect for a control that is no
     /// longer there would be worse than no rect at all.
-    pub fn update(&mut self, ui: &mut egui::Ui, view: &View<'_>) -> Vec<UiAction> {
+    pub fn update(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &View<'_>,
+        present: &Presenter,
+    ) -> Vec<UiAction> {
         let mut actions: Vec<UiAction> = Vec::new();
         let mut rects = self.chrome_rects.is_some().then(Vec::new);
 
+        egui::Panel::left("talaria-client-controls")
+            .exact_size(CONTROLS_WIDTH)
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                connection_surface(ui, view, rects.as_mut(), &mut actions);
+                // **The tab surface exists only while connected**, and that
+                // includes its empty state. "No agent has opened a tab on this
+                // server" is a statement about the server, and a client that
+                // never reached one is in no position to make it — drawing it
+                // under a missing-credential line would tell a human two
+                // contradictory things at once and invite them to go looking
+                // for the agent rather than for the token.
+                if matches!(view.state, ConnectionState::Connected) {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    let watching = match view.attached {
+                        Some(tab) => format!("Watching tab {tab}."),
+                        None => "Not watching any tab.".to_owned(),
+                    };
+                    let indication = ui.label(watching);
+                    record_rect(rects.as_mut(), "attachment.state", None, indication.rect);
+                    ui.add_space(8.0);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        tab_surface(ui, view, rects.as_mut(), &mut actions);
+                    });
+                }
+            });
+
+        // Everything the controls did not take is the page.
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            connection_surface(ui, view, rects.as_mut(), &mut actions);
-            // **The tab surface exists only while connected**, and that
-            // includes its empty state. "No agent has opened a tab on this
-            // server" is a statement about the server, and a client that never
-            // reached one is in no position to make it — drawing it under a
-            // missing-credential line would tell a human two contradictory
-            // things at once and invite them to go looking for the agent
-            // rather than for the token.
-            if matches!(view.state, ConnectionState::Connected) {
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    tab_surface(ui, view, rects.as_mut());
-                });
+            let area = ui.max_rect();
+            record_rect(rects.as_mut(), "page.area", None, area);
+            self.fit = present.draw(ui, area);
+            if let Some(fit) = self.fit {
+                // The fitted picture, in the same logical points every other
+                // recorded control is in. An end-to-end suite aiming a real
+                // pointer at a page coordinate needs exactly this rectangle and
+                // the page's own size, and reads both here rather than
+                // recomputing the client's transform outside the client.
+                record_rect(rects.as_mut(), "page.surface", None, fit.surface_rect());
             }
         });
+
+        record_readings(rects.as_mut(), present);
 
         if let Some(rects) = rects {
             self.chrome_rects = Some(rects);
         }
         actions
     }
+}
+
+/// The attachment's numbers, put on the geometry channel under the test hook.
+///
+/// **These are readings, not rectangles**, and the convention is stated here
+/// rather than left to be inferred: a `reading.` entry carries its value in
+/// `width` (and, for a size, in `height`), with `x` and `y` zero. They ride the
+/// geometry line because that line already exists, is already drained by the
+/// harness, and is already gated on the same variable — a second channel for
+/// four numbers would be a second thing to keep working.
+///
+/// Why they are exposed at all: "the client is connected" is not "the client is
+/// showing the page", and an end-to-end suite that asserted only the former
+/// would pass against a client whose picture never arrived.
+fn record_readings(rects: Option<&mut Vec<ChromeRect>>, present: &Presenter) {
+    let Some(rects) = rects else { return };
+    let mut reading = |name: &str, width: f32, height: f32| {
+        rects.push(ChromeRect { name: name.to_owned(), x: 0.0, y: 0.0, width, height });
+    };
+    if let Some(tab) = present.attached() {
+        reading("reading.attached_tab", tab as f32, 0.0);
+    }
+    if let Some(size) = present.size() {
+        // The **page's** size in its own device pixels — what an input
+        // coordinate is expressed in — not the texture's.
+        reading("reading.page_size", size.page_width() as f32, size.page_height() as f32);
+        reading("reading.denominator", f32::from(size.denominator), 0.0);
+    }
+    reading("reading.frame_seq", present.last_frame_seq() as f32, 0.0);
+    reading("reading.last_applied_input", present.last_applied_input() as f32, 0.0);
 }
 
 impl Default for Chrome {
@@ -355,7 +446,12 @@ fn pairing_surface(ui: &mut egui::Ui, view: &View<'_>, rects: Option<&mut Vec<Ch
 }
 
 /// Surface two: the agent tab list, and the empty state that is not an error.
-fn tab_surface(ui: &mut egui::Ui, view: &View<'_>, mut rects: Option<&mut Vec<ChromeRect>>) {
+fn tab_surface(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    mut rects: Option<&mut Vec<ChromeRect>>,
+    actions: &mut Vec<UiAction>,
+) {
     if view.tabs.is_empty() {
         // **The connected-and-empty case specifically**, and it is distinct
         // from every not-connected state above it: a human who cannot tell
@@ -378,9 +474,11 @@ fn tab_surface(ui: &mut egui::Ui, view: &View<'_>, mut rects: Option<&mut Vec<Ch
     // reintroduce exactly the instability that avoids — two tabs created in the
     // same millisecond would swap places between reads.
     for (row, tab) in view.tabs.iter().enumerate() {
-        let fill = match row % 2 {
-            1 => ui.visuals().faint_bg_color,
-            _ => egui::Color32::TRANSPARENT,
+        let watching = view.attached == Some(tab.tab_id);
+        let fill = match (watching, row % 2) {
+            (true, _) => ui.visuals().selection.bg_fill,
+            (false, 1) => ui.visuals().faint_bg_color,
+            (false, _) => egui::Color32::TRANSPARENT,
         };
         egui::Frame::new().fill(fill).show(ui, |ui| {
             ui.vertical(|ui| {
@@ -393,6 +491,28 @@ fn tab_surface(ui: &mut egui::Ui, view: &View<'_>, mut rects: Option<&mut Vec<Ch
                     ui.label(egui::RichText::new("(as claimed)").small());
                 });
                 ui.label(egui::RichText::new(claimed(&tab.url)).small());
+                // The one control per row, and its label says which of the two
+                // states this row is in — a viewer attached to nothing must not
+                // look identical to one that is watching.
+                let control = match watching {
+                    true => ui.button("Stop watching"),
+                    false => ui.button("Watch"),
+                };
+                record_rect(
+                    rects.as_deref_mut(),
+                    match watching {
+                        true => "tabs.detach",
+                        false => "tabs.attach",
+                    },
+                    Some(row),
+                    control.rect,
+                );
+                if control.clicked() {
+                    actions.push(match watching {
+                        true => UiAction::Detach(tab.tab_id),
+                        false => UiAction::Attach(tab.tab_id),
+                    });
+                }
             });
         });
     }
