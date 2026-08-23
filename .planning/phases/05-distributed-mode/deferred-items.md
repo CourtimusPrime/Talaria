@@ -357,3 +357,49 @@ this is due at `05-10` rather than at some vague later date.
 open product question recorded above under *"Open: does first pairing require
 someone at the server machine?"*. A reader who found the copy and wants the
 alternatives should read that entry.
+
+---
+
+## Manual item for `VERIFICATION.md`: remote keyboard input to a tab the local human is not looking at
+
+**Raised by:** 05-08, Task 1.
+
+An attachment holds its tab **shown and deliberately not focused** — `visibility_of` returns
+`HeldForViewing`, and `sync_visibility` calls `show()` then `blur()`. That is the correct answer to
+`T-05-04-E`: focus belongs to the tab the local human is driving, and a remote party that could take
+it could redirect what somebody sitting at the machine is typing into.
+
+Servo's *hit test* needs a shown webview, which is what 05-08 supplies and what
+`tests/e2e/remote_view_test.py` now proves for a background tab. Servo's **keyboard focus** is a
+different thing, and the shipped end-to-end typing assertions all drive a tab that is displayed —
+therefore shown *and* focused — because they were written before the hold existed and were left
+unchanged as 05-06's own regression evidence.
+
+**So: whether a remote keystroke reaches a held-but-not-focused background tab is untested, not
+known-broken.** It cannot be resolved by weakening the hold; if it turns out that keyboard delivery
+needs per-webview focus, the answer is a Servo-side question about what `focus()` scopes to, not a
+licence for an attachment to steal the local window's focus.
+
+**What to measure:** attach to a background agent tab with the local human in the Me view, send a
+`key` message naming a character, and read the field's value back over the control socket. If it
+arrives, add the assertion to `remote_view_test.py`'s frame section. If it does not, this becomes a
+named limitation of remote takeover rather than a bug to be papered over.
+
+## Correction: two of 05-08's acceptance criteria were written against a false baseline
+
+**Raised by:** 05-08. Recorded here because a later reader running the criteria verbatim will see
+them fail and should know they were checked rather than skipped.
+
+- `grep -c 'expect("' crates/talaria-shell/src/view.rs` **is 0** — it was already **16** before the
+  plan ran, every occurrence inside `#[cfg(test)]`. The criterion's stated purpose is "the encoder
+  degrades rather than aborting", which is a statement about shipped paths. Verified as: zero
+  occurrences outside `#[cfg(test)]`. The total is now 28, all in tests.
+- `grep -ci 'latency\|cadence\|ms' tests/e2e/remote_view_test.py | head -1` **is 0** — it was
+  already **4**, because `ms` matches inside `**params` (three lines) and inside the word "claims"
+  (one line). `grep -c` never emits more than one line, so the trailing `head -1` had no effect
+  either. The count is now 3 and every match was inspected: none is a timing claim, and the frame
+  section makes none of any kind.
+
+**The general lesson for later plans:** a source criterion of the form "`grep -c X` is 0" should be
+established against the pre-task baseline when it is written, and scoped to shipped code when that
+is what it means. Both of these were sound in intent and unachievable as literals.

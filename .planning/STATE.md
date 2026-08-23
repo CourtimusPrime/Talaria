@@ -5,13 +5,13 @@ milestone_name: milestone
 current_phase: 5
 current_phase_name: v2
 status: executing
-stopped_at: Completed 05-07-PLAN.md
-last_updated: "2026-08-23T16:13:10.335Z"
+stopped_at: Completed 05-08-PLAN.md
+last_updated: "2026-08-23T17:17:03.112Z"
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 34
-  completed_plans: 30
+  completed_plans: 31
 ---
 
 # Project State
@@ -26,21 +26,32 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 7 of 11 executed (waves 1-3 complete; wave 4 half done — 05-07 landed, 05-08 next)
-Status: Executing
+Plan: 8 of 11 executed (waves 1-4 complete; wave 5 done — 05-08 landed, 05-09 next)
+Status: Ready to execute
 Next: `/gsd-execute-phase 5`
 
 Phase 4 is closed. AUTH-01, AUTH-02 and AUTH-03 are Complete; verification passed after four
-code-review blockers were fixed. Phases 1–3 (v1) remain feature-complete. At 05-07's tip the tree
-stands at **410 unit tests** and **e2e 23/23, `failed: none`**.
+code-review blockers were fixed. Phases 1–3 (v1) remain feature-complete. At 05-08's tip the tree
+stands at **448 unit tests** and **e2e 23/23, `failed: none`**.
 
 **05-07 added a second binary.** `talaria-client` is D-05-01's other half: 222 dependency crates
 against the shell's 690, a 19 MB binary against 183 MB, and no web engine at all. It connects over a
 `wss://` socket whose certificate verification is structural rather than configurable — there is no
 argument to `connect_async` that relaxes it, so turning it off would mean writing new code. It
-connects, authenticates and lists agent tabs; **frames are not delivered yet**, which is 05-08's and
-05-09's, and is the same gap 05-06 recorded: a hidden webview answers no hit test, and an attachment
-neither shows one nor ticks a pump until 05-08 fixes it.
+connects, authenticates and lists agent tabs; **the client does not yet render frames**, which is
+05-09's.
+
+**05-08 delivered the frames, and closed 05-06's blocker.** An attachment now takes a *visibility
+hold* on its tab — a count, not a flag — so the tab is shown and Servo will answer a hit test for
+it, while remaining deliberately unfocused: the displayed tab wins over held for every hold count,
+and `view.rs` names no active-tab setter, no view mode and no focus call. The pump paints
+unconditionally on a tick joined into the loop's own wait computation (30 ms driven, requested
+unconditionally on every machine per 05-02's instruction; 250 ms passive), and the tile comparison,
+the keyframe decision and the PNG encode all run on a fourth off-thread actor, `talaria-frames`. A
+viewer gets a keyframe on attach, only the changed region afterwards, and **nothing at all** while
+the page is static. The human's own displayed tab is captured before and after a whole frame
+exchange on another tab and is byte-identical, which is the per-tab framebuffer invariant proved
+rather than cited.
 
 **Phase 5 is planned:** 11 plans across 8 waves, plan-checker APPROVED at revision 3. Scope was cut
 from four requirements to two — DIST-03 and DIST-04 moved to a new **Phase 5.1** — because an
@@ -131,6 +142,7 @@ Phase 5 keeps per-task commits.
 | Phase 5 P5 | 54 | 3 tasks | 9 files |
 | Phase 05 P06 | 76min | 3 tasks | 6 files |
 | Phase 05 P07 | 96min | 3 tasks | 8 files |
+| Phase 05 P08 | 95min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -243,6 +255,8 @@ Recent decisions affecting current work:
 - [Phase ?]: 05-07: certificate verification is structural, not configurable — connect_async with no connector verifies against native roots, so disabling it would mean writing new code
 - [Phase ?]: 05-07: a non-loopback http:// base URL is refused rather than downgraded, because deriving ws:// from it would put the bearer token on the wire in the clear
 - [Phase ?]: 05-07: the client has no retry loop; every failed state names a human next step and UiAction::Reconnect is a press
+- [Phase 5]: 05-08: a viewport message forces a keyframe and does not resize the webview; server-side scaling stays 05-10's through scale_denominator
+- [Phase 5]: 05-08: the frame encoder is a sibling of encode_screenshot diverging on one line (raw bytes), not three — png 0.17's defaults already match, per the 05-02 correction
 
 ### Pending Todos
 
@@ -274,7 +288,8 @@ None yet.
   predicted hosted-runner risks were real: a 42 GB `target/` cannot enter a 10 GB `actions/cache`,
   so the gate moved to a self-hosted runner and the cold hosted build became a weekly canary.
 
-- 05-08 must show the attached webview: a hidden webview answers no hit test, so today a remote click only reaches the tab the local human is displaying
+- ~~05-08 must show the attached webview: a hidden webview answers no hit test~~ — RESOLVED by 05-08: `Tab::held_for_view` is consulted by `sync_visibility`, and `remote_view_test.py` attaches to a background agent tab and reads `view_holds` back as 1 while the local human stays in the Me view
+- 05-08: remote keyboard input to a held-but-not-focused background tab is untested — a held tab is shown and blurred, and Servo keyboard focus is separate from visibility. Manual VERIFICATION.md item, logged in deferred-items.md
 
 ## Deferred Items
 
@@ -293,6 +308,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T16:12:51.231Z
-Stopped at: Completed 05-07-PLAN.md
+Last session: 2026-08-23T17:16:55.870Z
+Stopped at: Completed 05-08-PLAN.md
 Resume file: None
