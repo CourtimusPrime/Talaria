@@ -32,7 +32,7 @@ use servo::{OffscreenRenderingContext, RenderingContext, WebView};
 use tokio::sync::mpsc::UnboundedSender;
 
 use talaria_protocol::wire::{
-    Channel, ClientView, FrameHeader, FrameKind, InputMessage, ServerView, TabList,
+    Channel, ClientView, FrameHeader, FrameKind, InputMessage, Rung, ServerView, TabList,
     FRAME_HEADER_LEN,
 };
 use talaria_protocol::TabInfo;
@@ -145,75 +145,44 @@ fn parse_max_attachments(raw: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_MAX_ATTACH)
 }
 
-/// The interval between frames for an attachment whose viewer is **driving**
-/// the tab, in whole milliseconds.
-///
-/// Serves DIST-02's ~30–60 ms takeover half, and it is the value the pump
-/// requests **unconditionally, on every machine** — there is deliberately no
-/// environment check here, no software-rendering special case and no knob that
-/// lowers it. 05-02 measured this tree's real engine sustaining a 30 ms cadence
-/// in three page shapes with one overrun per three hundred ticks, and that one
-/// overrun was the first tick after a lease was taken rather than a steady
-/// state. If a cadence ever cannot be sustained, the *requested* rate does not
-/// move: 05-10's degrade ladder lowers the *delivered* one, and the ladder's
-/// fastest rung is this number.
-const DRIVEN_TICK_MS: u64 = 30;
-
-/// The interval between frames for an attachment nobody is driving, in whole
-/// milliseconds.
-///
-/// Serves DIST-02's ~200–500 ms passive half and sits inside that band rather
-/// than at either end of it. A passive viewer is watching an agent work, so
-/// the frames still have to be timely enough to follow what it is doing; they
-/// do not have to be timely enough to aim a click with.
-const PASSIVE_TICK_MS: u64 = 250;
-
-/// How long after the last accepted input an attachment falls back from the
-/// driven cadence to the passive one, in whole milliseconds.
-///
-/// One second, which is longer than the gap between two keystrokes and shorter
-/// than a pause for thought — a viewer typing must not drop to a quarter-second
-/// cadence between characters, and a viewer who has stopped must not hold the
-/// fast rate indefinitely.
-const DEFAULT_VIEW_IDLE_MS: u64 = 1000;
-
-/// The idle threshold, overridable through `TALARIA_VIEW_IDLE_MS`.
+/// The idle threshold, overridable through
+/// [`talaria_protocol::wire::VIEW_IDLE_ENV`].
 ///
 /// The same shape [`max_attachments`] and `TALARIA_COMMAND_TIMEOUT_SECS` use:
 /// an unset variable, a value that is not a number and a value of zero all
-/// fall back to the default — **never to zero and never to unbounded**. Zero
-/// would mean every attachment was permanently driven, which is the whole
-/// browser paying takeover cost for a viewer nobody is touching.
+/// fall back to the default — **never to zero and never to unbounded**. The
+/// parsing itself lives in the shared vocabulary, because the client's own
+/// rate controller reads the same variable and the two must be one rule.
 pub fn view_idle() -> Duration {
-    parse_view_idle(std::env::var("TALARIA_VIEW_IDLE_MS").ok().as_deref())
+    parse_view_idle(std::env::var(talaria_protocol::wire::VIEW_IDLE_ENV).ok().as_deref())
 }
 
 /// The threshold the override spells, or the default. Split out with the raw
 /// value as a parameter so a bad value is assertable without one test's
 /// environment becoming another's answer.
 fn parse_view_idle(raw: Option<&str>) -> Duration {
-    let millis = raw
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_VIEW_IDLE_MS);
-    Duration::from_millis(millis)
+    Duration::from_millis(talaria_protocol::wire::parse_view_idle_ms(raw))
 }
 
-/// The interval one attachment should tick at, given how long ago its viewer's
-/// last input was accepted.
+/// The interval one attachment should tick at, given the rung its viewer asked
+/// for and how long ago that viewer's last input was accepted.
 ///
-/// **The transition, stated once so nobody has to infer it from two clocks.**
-/// An attachment enters the driven cadence on the first accepted input for
-/// that tab on that connection, and returns to the passive cadence once the
-/// elapsed time since the last accepted input *reaches* the threshold. An
-/// input arriving exactly at the threshold re-enters the driven cadence,
-/// because a new input always does — the comparison is on elapsed-since-last
-/// rather than on a countdown, so there is one rule and no race between a
-/// timer and a timestamp.
-fn tick_interval(since_last_input: Option<Duration>, idle: Duration) -> Duration {
-    match since_last_input {
-        Some(elapsed) if elapsed < idle => Duration::from_millis(DRIVEN_TICK_MS),
-        _ => Duration::from_millis(PASSIVE_TICK_MS),
+/// **The transition is one comparison, and it is not this function's.** It is
+/// [`talaria_protocol::wire::is_driving`], in the shared vocabulary, because
+/// the client's own rate controller makes the identical decision about the
+/// identical quantity — the two ends are running **one rule** rather than two
+/// that happen to agree today. Written out once there: an attachment enters the
+/// driven cadence on the first accepted input for that tab on that connection
+/// and returns to the passive cadence once the elapsed time since the last
+/// accepted input *reaches* the threshold, with a new input always re-entering.
+///
+/// What is decided here is only which interval that answer selects: the rung's
+/// own while driving, and the ladder's slowest rung's while not. The slowest
+/// rung is the ladder's floor, so this is never faster than the rung asked for.
+fn tick_interval(rung: Rung, since_last_input: Option<Duration>, idle: Duration) -> Duration {
+    match talaria_protocol::wire::is_driving(since_last_input, idle) {
+        true => rung.interval(),
+        false => Rung::SLOWEST.interval(),
     }
 }
 
@@ -308,13 +277,52 @@ const KEYFRAME_DIRTY_NUMERATOR: usize = 9;
 /// The denominator of [`KEYFRAME_DIRTY_NUMERATOR`].
 const KEYFRAME_DIRTY_DENOMINATOR: usize = 26;
 
-/// The divisor this plan applies to a tab's real size before painting it.
+/// One surface reduced by `denominator`, by nearest-neighbour sampling.
 ///
-/// One, always: every frame here is full resolution. It is carried in the
-/// header rather than left implicit because 05-10's degrade ladder sends
-/// halved frames, and a client that inferred the scale by dividing the tile
-/// size by the frame size would guess wrong on an odd-sized viewport.
-const FULL_SCALE_DENOMINATOR: u8 = 1;
+/// **The destination dimensions round up, and that is the whole of the
+/// arithmetic worth commenting.** A source width that is not divisible by the
+/// denominator has a partial column left over at its right-hand edge; a floor
+/// would drop that strip, and the bottom strip with it, leaving a page whose
+/// last few pixels are simply never sent. On screen that reads as a *rendering*
+/// fault — a sliver of the page missing — rather than as an arithmetic choice
+/// somebody made, which is exactly the kind of bug that gets looked for in the
+/// wrong module. Rounding up costs at most one duplicated column and one
+/// duplicated row, both of which are pixels the source actually has.
+///
+/// Nearest neighbour rather than an average: this runs on the encoder thread
+/// once per tick per attachment, the destination is then compared tile by tile
+/// against its predecessor, and an averaging filter would make a one-pixel
+/// change dirty its neighbours' tiles as well. 05-02 measured the reduction at
+/// a fraction of a millisecond against a 30 ms budget.
+fn reduce(surface: &Surface, denominator: u8) -> Surface {
+    let divisor = u32::from(denominator.max(1));
+    if divisor == 1 || surface.width == 0 || surface.height == 0 {
+        return Surface {
+            width: surface.width,
+            height: surface.height,
+            pixels: surface.pixels.clone(),
+        };
+    }
+    let width = surface.width.div_ceil(divisor);
+    let height = surface.height.div_ceil(divisor);
+    let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for y in 0..height {
+        // The round-up means the last row and column may name a source pixel
+        // one past the edge; they take the edge pixel rather than nothing.
+        let source_y = (y * divisor).min(surface.height - 1);
+        for x in 0..width {
+            let source_x = (x * divisor).min(surface.width - 1);
+            match surface.row(source_x, source_y, 1) {
+                Some(pixel) => pixels.extend_from_slice(pixel),
+                // Unreachable: both coordinates were bounded above. A frame
+                // with a hole in it is worse than a frame that is one pixel
+                // repeated, so the degrade is opaque black rather than a panic.
+                None => pixels.extend_from_slice(&[0, 0, 0, 255]),
+            }
+        }
+    }
+    Surface { width, height, pixels }
+}
 
 /// A rectangle of a surface, in that surface's own pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,6 +507,9 @@ struct Frame {
     frame_seq: u64,
     last_applied_input: u64,
     keyframe: bool,
+    /// The divisor the rung this attachment is on implies. The reduction runs
+    /// **here**, on the encoder thread, and never on the winit loop.
+    scale_denominator: u8,
     surface: Surface,
     out: UnboundedSender<Vec<u8>>,
 }
@@ -579,8 +590,18 @@ fn encode_frames(inbox: std::sync::mpsc::Receiver<Job>) {
             Job::Release { connection, tab } => {
                 previous.remove(&(connection, tab));
             },
-            Job::Frame(frame) => {
+            Job::Frame(mut frame) => {
                 let key = (frame.connection, frame.tab);
+                // **Reduced before anything else looks at it**, so the tile
+                // comparison, the keyframe decision, the crop and the header
+                // all speak one coordinate space — the one the client's texture
+                // is actually in. The previous-frame buffer therefore holds the
+                // reduced surface too, and a rung change, which changes the
+                // denominator, changes the buffer's size and is independently a
+                // keyframe trigger on top of the one the rung change forces.
+                if frame.scale_denominator > 1 {
+                    frame.surface = reduce(&frame.surface, frame.scale_denominator);
+                }
                 let selected =
                     select_frame(previous.get(&key), &frame.surface, frame.keyframe);
                 let delivered = match selected {
@@ -624,7 +645,7 @@ fn compose(frame: &Frame, kind: FrameKind, region: Region) -> Option<Vec<u8>> {
     };
     let header = FrameHeader {
         kind,
-        scale_denominator: FULL_SCALE_DENOMINATOR,
+        scale_denominator: frame.scale_denominator,
         tab_id: frame.tab,
         frame_seq: frame.frame_seq,
         // Stamped from the value the input path recorded on this connection,
@@ -637,6 +658,14 @@ fn compose(frame: &Frame, kind: FrameKind, region: Region) -> Option<Vec<u8>> {
         tile_y: region.y,
         tile_width: region.width,
         tile_height: region.height,
+        // The **reduced** dimensions, which is what the header means by "the
+        // whole frame's width at the declared scale". The client multiplies
+        // them by the denominator to recover the page's own size, so it
+        // reconstructs the placement from two declared facts rather than
+        // inferring a scale from the ratio of two sizes — which is what it
+        // would have to do if this carried the source dimensions instead, and
+        // what would guess wrong on a source size the denominator does not
+        // divide.
         frame_width: surface.width,
         frame_height: surface.height,
     };
@@ -816,9 +845,9 @@ impl Attachment {
         }
     }
 
-    /// The interval this attachment is currently ticking at.
-    fn interval(&self, now: Instant, idle: Duration) -> Duration {
-        tick_interval(self.last_input.map(|at| now.saturating_duration_since(at)), idle)
+    /// The interval this attachment is currently ticking at, on `rung`.
+    fn interval(&self, rung: Rung, now: Instant, idle: Duration) -> Duration {
+        tick_interval(rung, self.last_input.map(|at| now.saturating_duration_since(at)), idle)
     }
 }
 
@@ -835,6 +864,9 @@ pub struct DueTick {
     pub last_applied_input: u64,
     /// Whether this frame must be a keyframe whatever the comparison says.
     pub keyframe: bool,
+    /// The divisor this connection's rung implies, carried with the tick so the
+    /// encoder thread does not have to reach back into the session table.
+    pub scale_denominator: u8,
     /// This connection's outbound frames, cloned so the encoder thread can
     /// write onto it without reaching back into the main thread's tables.
     pub out: UnboundedSender<Vec<u8>>,
@@ -885,6 +917,21 @@ pub struct ViewSession {
     /// one, or either could replay or reorder the other's input by choosing
     /// numbers.
     pub last_applied_input: u64,
+    /// The rung of [`talaria_protocol::wire::RUNG_LADDER`] this connection last
+    /// asked for.
+    ///
+    /// **Per connection and not per attachment, because the request is.**
+    /// [`ClientView::Cadence`] names no tab: a viewer shows one picture at a
+    /// time and what it has learned about the link is a fact about the link,
+    /// not about a tab. A second attachment on the same connection inherits it
+    /// rather than rediscovering it.
+    ///
+    /// Starts at the fastest rung, so a viewer that never sends a cadence
+    /// request at all — every hand-composed client in the end-to-end suite —
+    /// gets exactly the behaviour the frame pump shipped with: full
+    /// resolution, the fast interval while driving, the slowest rung's interval
+    /// while idle.
+    rung: Rung,
 }
 
 impl ViewSession {
@@ -940,6 +987,7 @@ impl ViewSessions {
             attached: Vec::new(),
             snapshotted: false,
             last_applied_input: 0,
+            rung: Rung::FASTEST,
         });
         if let Some(session) = self.sessions.last() {
             log::debug!(
@@ -1081,10 +1129,16 @@ impl ViewSessions {
                 true => {},
                 false => self.refuse(connection),
             },
-            // A request, not a promise, and deliberately unanswered: the
-            // server delivers at whatever rate the link can carry, and a
-            // reply here would be a commitment this side cannot keep.
-            ClientView::Cadence { .. } => {},
+            // A named rung, looked up in the one table both ends read. A rung
+            // this build knows takes effect from the next tick and is not
+            // acknowledged — the server delivers at whatever rate the link can
+            // carry, and a reply here would be a commitment this side cannot
+            // keep. A name this build does not know gets the one reasonless
+            // refusal, exactly as every other refusal on this channel does.
+            ClientView::Cadence { rung } => match rung {
+                Some(rung) => self.set_rung(connection, rung),
+                None => self.refuse(connection),
+            },
         }
     }
 
@@ -1164,6 +1218,26 @@ impl ViewSessions {
         }
     }
 
+    /// Adopt `rung` for this connection, from the next tick.
+    ///
+    /// **A rung whose denominator differs forces a keyframe on every
+    /// attachment the connection holds**, because the client's surface geometry
+    /// has just changed: it is about to reallocate a texture of a different
+    /// size, and a delta whose tile coordinates were computed against the old
+    /// one names a region of the new one that corresponds to nothing. A rung
+    /// that changes only the interval needs no keyframe — the picture is the
+    /// same picture, arriving less often.
+    fn set_rung(&mut self, connection: u64, rung: Rung) {
+        let Some(session) = self.session_mut(connection) else { return };
+        let resized = session.rung.scale_denominator() != rung.scale_denominator();
+        session.rung = rung;
+        if resized {
+            for attachment in &mut session.attached {
+                attachment.keyframe = true;
+            }
+        }
+    }
+
     /// Forget one attachment without answering the viewer. The bookkeeping
     /// half of every release path, so the three of them cannot drift.
     fn drop_attachment(&mut self, connection: u64, tab: u64) -> bool {
@@ -1236,11 +1310,12 @@ impl ViewSessions {
         let mut due = Vec::new();
         for session in &mut self.sessions {
             let last_applied_input = session.last_applied_input;
+            let rung = session.rung;
             for attachment in &mut session.attached {
                 if attachment.due > now {
                     continue;
                 }
-                let interval = attachment.interval(now, idle);
+                let interval = attachment.interval(rung, now, idle);
                 // From `now` rather than from the old deadline: a loop that
                 // ran late must not then try to catch up by ticking twice in
                 // a row, which is how a slow machine turns a missed frame
@@ -1254,6 +1329,7 @@ impl ViewSessions {
                     frame_seq,
                     last_applied_input,
                     keyframe: std::mem::take(&mut attachment.keyframe),
+                    scale_denominator: rung.scale_denominator(),
                     out: session.out.clone(),
                 });
             }
@@ -1353,6 +1429,7 @@ impl ViewSessions {
             frame_seq: tick.frame_seq,
             last_applied_input: tick.last_applied_input,
             keyframe: tick.keyframe,
+            scale_denominator: tick.scale_denominator,
             surface,
             out: tick.out.clone(),
         }));
@@ -1565,6 +1642,19 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    /// The interval an attachment that never named a rung ticks at while its
+    /// viewer is driving. Read out of the ladder rather than restated here,
+    /// because the whole point of the table is that the number has one home.
+    fn driven_tick_ms() -> u64 {
+        u64::from(Rung::FASTEST.interval_ms())
+    }
+
+    /// And the interval it ticks at while nobody is — the ladder's slowest
+    /// rung, whichever rung the connection is on.
+    fn passive_tick_ms() -> u64 {
+        u64::from(Rung::SLOWEST.interval_ms())
+    }
 
     /// `D-05-02`: a tab the human owns never appears in a snapshot, in any
     /// state.
@@ -2092,7 +2182,7 @@ mod tests {
         assert!(sessions.take_due(now, view_idle()).is_empty(), "one tick painted twice");
 
         // The passive interval, since nothing has been driven.
-        let passive = Duration::from_millis(PASSIVE_TICK_MS);
+        let passive = Duration::from_millis(passive_tick_ms());
         assert!(sessions.take_due(now + passive - Duration::from_millis(1), view_idle()).is_empty());
         assert_eq!(sessions.take_due(now + passive, view_idle()).len(), 1);
     }
@@ -2109,7 +2199,7 @@ mod tests {
         let now = Instant::now();
         let first = sessions.take_due(now, view_idle());
         assert!(first[0].keyframe, "the first frame after an attach was not a keyframe");
-        let later = now + Duration::from_millis(PASSIVE_TICK_MS);
+        let later = now + Duration::from_millis(passive_tick_ms());
         let second = sessions.take_due(later, view_idle());
         assert!(!second[0].keyframe, "every frame is a keyframe, so nothing is a delta");
     }
@@ -2128,14 +2218,14 @@ mod tests {
 
         let resize = control_request(&ClientView::Viewport { tab: 1, width: 640, height: 480 });
         assert!(matches!(sessions.message(1, &resize, &mut tabs), Handled::Done));
-        let after_resize = now + Duration::from_millis(PASSIVE_TICK_MS);
+        let after_resize = now + Duration::from_millis(passive_tick_ms());
         assert!(
             sessions.take_due(after_resize, view_idle())[0].keyframe,
             "a viewport change did not produce a keyframe"
         );
 
         attach(&mut sessions, &viewer, 1, &mut tabs);
-        let after_reattach = after_resize + Duration::from_millis(PASSIVE_TICK_MS);
+        let after_reattach = after_resize + Duration::from_millis(passive_tick_ms());
         assert!(
             sessions.take_due(after_reattach, view_idle())[0].keyframe,
             "a re-attach did not produce a keyframe"
@@ -2156,7 +2246,7 @@ mod tests {
         let lost = sessions.take_due(now, view_idle()).remove(0);
         assert!(lost.keyframe);
         sessions.require_keyframe_again(&lost);
-        let next = sessions.take_due(now + Duration::from_millis(PASSIVE_TICK_MS), view_idle());
+        let next = sessions.take_due(now + Duration::from_millis(passive_tick_ms()), view_idle());
         assert!(next[0].keyframe, "a keyframe lost to a failed readback was never re-sent");
         assert!(
             next[0].frame_seq > lost.frame_seq,
@@ -2181,7 +2271,7 @@ mod tests {
             for tick in sessions.take_due(now, view_idle()) {
                 seen.push((tick.connection, tick.frame_seq));
             }
-            now += Duration::from_millis(PASSIVE_TICK_MS);
+            now += Duration::from_millis(passive_tick_ms());
         }
         let sequences = |connection: u64| -> Vec<u64> {
             seen.iter().filter(|(c, _)| *c == connection).map(|(_, s)| *s).collect()
@@ -2199,7 +2289,7 @@ mod tests {
         let viewer = connect(&mut sessions, 1, "client-a");
         attach(&mut sessions, &viewer, 1, &mut tabs);
 
-        let very_late = Instant::now() + Duration::from_millis(PASSIVE_TICK_MS * 10);
+        let very_late = Instant::now() + Duration::from_millis(passive_tick_ms() * 10);
         assert_eq!(sessions.take_due(very_late, view_idle()).len(), 1);
         assert!(
             sessions.take_due(very_late, view_idle()).is_empty(),
@@ -2214,30 +2304,217 @@ mod tests {
     #[test]
     fn the_cadence_falls_back_to_passive_exactly_at_the_idle_threshold() {
         let idle = Duration::from_millis(1000);
-        let driven = Duration::from_millis(DRIVEN_TICK_MS);
-        let passive = Duration::from_millis(PASSIVE_TICK_MS);
+        let driven = Duration::from_millis(driven_tick_ms());
+        let passive = Duration::from_millis(passive_tick_ms());
 
-        assert_eq!(tick_interval(None, idle), passive, "a viewer that never drove was driven");
-        assert_eq!(tick_interval(Some(Duration::ZERO), idle), driven);
-        assert_eq!(tick_interval(Some(idle - Duration::from_millis(1)), idle), driven);
+        let rung = Rung::FASTEST;
         assert_eq!(
-            tick_interval(Some(idle), idle),
+            tick_interval(rung, None, idle),
+            passive,
+            "a viewer that never drove was driven"
+        );
+        assert_eq!(tick_interval(rung, Some(Duration::ZERO), idle), driven);
+        assert_eq!(tick_interval(rung, Some(idle - Duration::from_millis(1)), idle), driven);
+        assert_eq!(
+            tick_interval(rung, Some(idle), idle),
             passive,
             "the threshold itself was still driven, so 'reaches' meant 'exceeds'"
         );
-        assert_eq!(tick_interval(Some(idle + Duration::from_millis(1)), idle), passive);
+        assert_eq!(tick_interval(rung, Some(idle + Duration::from_millis(1)), idle), passive);
     }
 
     /// The requested driven cadence is 30 ms and the passive one is inside the
     /// 200–500 ms band the requirement names — asserted rather than left to a
     /// comment, because these are the two numbers a later edit would move.
+    ///
+    /// Both are now read out of the ladder, so this is also the assertion that
+    /// the pump's default behaviour did not move when the rungs arrived.
     #[test]
     fn the_two_cadences_are_the_measured_ones() {
-        assert_eq!(DRIVEN_TICK_MS, 30);
+        let passive = passive_tick_ms();
+        assert_eq!(driven_tick_ms(), 30);
         assert!(
-            (200..=500).contains(&PASSIVE_TICK_MS),
-            "the passive cadence left the band DIST-02 names: {PASSIVE_TICK_MS}"
+            (200..=500).contains(&passive),
+            "the passive cadence left the band DIST-02 names: {passive}"
         );
+    }
+
+    // ---- the rung ---------------------------------------------------------
+
+    /// A named rung is adopted and takes effect on the next tick, both in the
+    /// interval it implies and in the denominator it implies.
+    #[test]
+    fn a_cadence_request_naming_a_known_rung_takes_effect_on_the_next_tick() {
+        let mut tabs = FakeTabs::with(&[(1, true)]);
+        let mut sessions = ViewSessions::default();
+        let mut viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &mut tabs);
+        let now = Instant::now();
+        let first = sessions.take_due(now, view_idle()).remove(0);
+        assert_eq!(
+            first.scale_denominator,
+            Rung::FASTEST.scale_denominator(),
+            "a connection that named no rung did not start at the fastest one",
+        );
+        let _ = viewer.control();
+
+        let slow = Rung::HalfResolutionSlow;
+        let request = control_request(&ClientView::Cadence { rung: Some(slow) });
+        assert!(matches!(sessions.message(1, &request, &mut tabs), Handled::Done));
+        assert!(
+            viewer.control().is_empty(),
+            "a rung this build knows was answered; it is a request, not a negotiation",
+        );
+
+        // Driving, so the rung's own interval is the one in force.
+        assert!(sessions.admit_input(1, 1, 1));
+        let driven = sessions.take_due(Instant::now(), view_idle()).remove(0);
+        assert_eq!(driven.scale_denominator, slow.scale_denominator());
+        let too_soon = Instant::now() + slow.interval() - Duration::from_millis(1);
+        assert!(
+            sessions.take_due(too_soon, view_idle()).is_empty(),
+            "the tick came earlier than the rung asked for",
+        );
+        assert_eq!(sessions.take_due(Instant::now() + slow.interval(), view_idle()).len(), 1);
+    }
+
+    /// A rung this build does not know gets the one reasonless refusal rather
+    /// than ending the connection, so a rung added later is not a breaking
+    /// change.
+    #[test]
+    fn a_cadence_request_naming_an_unrecognised_rung_is_refused_with_no_reason() {
+        let mut tabs = FakeTabs::with(&[(1, true)]);
+        let mut sessions = ViewSessions::default();
+        let mut viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &mut tabs);
+        let _ = viewer.control();
+
+        let unknown = encode(
+            Channel::Control,
+            b"{\"view\":\"cadence\",\"rung\":\"quarter_resolution_someday\"}",
+        );
+        assert!(
+            matches!(sessions.message(1, &unknown, &mut tabs), Handled::Done),
+            "an unknown rung ended the connection instead of being answered",
+        );
+        assert_eq!(viewer.control(), vec![ServerView::Refused]);
+
+        // And the connection is still on the rung it was on.
+        let tick = sessions.take_due(Instant::now(), view_idle()).remove(0);
+        assert_eq!(tick.scale_denominator, Rung::FASTEST.scale_denominator());
+    }
+
+    /// A rung whose denominator differs forces a whole keyframe, because the
+    /// client is about to reallocate a texture of a different size.
+    #[test]
+    fn a_rung_change_that_resizes_the_surface_forces_a_keyframe() {
+        let mut tabs = FakeTabs::with(&[(1, true)]);
+        let mut sessions = ViewSessions::default();
+        let viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &mut tabs);
+        let now = Instant::now();
+        assert!(sessions.take_due(now, view_idle())[0].keyframe);
+        let mut at = now + Duration::from_millis(passive_tick_ms());
+        assert!(!sessions.take_due(at, view_idle())[0].keyframe);
+
+        // Same denominator, slower interval: the picture is the same picture.
+        let steady = control_request(&ClientView::Cadence {
+            rung: Some(Rung::FullResolutionSteady),
+        });
+        assert!(matches!(sessions.message(1, &steady, &mut tabs), Handled::Done));
+        at += Duration::from_millis(passive_tick_ms());
+        assert!(
+            !sessions.take_due(at, view_idle())[0].keyframe,
+            "a rung change that did not resize anything still cost a whole keyframe",
+        );
+
+        // A different denominator: the surface geometry changed.
+        let half =
+            control_request(&ClientView::Cadence { rung: Some(Rung::HalfResolutionSteady) });
+        assert!(matches!(sessions.message(1, &half, &mut tabs), Handled::Done));
+        at += Duration::from_millis(passive_tick_ms());
+        let tick = sessions.take_due(at, view_idle()).remove(0);
+        assert!(tick.keyframe, "a rung change that halved the surface sent a delta");
+        assert_eq!(tick.scale_denominator, 2);
+    }
+
+    // ---- the reduction ----------------------------------------------------
+
+    /// A denominator of one is the identity, which is what makes the shipped
+    /// full-resolution path free of the reduction entirely.
+    #[test]
+    fn a_denominator_of_one_produces_the_source_dimensions_unchanged() {
+        let surface = flat(200, 136, 0x30);
+        let reduced = reduce(&surface, 1);
+        assert_eq!((reduced.width, reduced.height), (200, 136));
+        assert_eq!(reduced.pixels, surface.pixels);
+    }
+
+    /// The divisible case: half the width, half the height, and the sampled
+    /// pixels are the source's own.
+    #[test]
+    fn a_denominator_above_one_halves_a_divisible_surface_exactly() {
+        let mut surface = flat(8, 4, 0x00);
+        // A recognisable pixel at (2, 2), which is (1, 1) after halving.
+        let at = ((2 * 8) + 2) * 4;
+        surface.pixels[at] = 0x77;
+        let reduced = reduce(&surface, 2);
+        assert_eq!((reduced.width, reduced.height), (4, 2));
+        assert_eq!(reduced.pixels.len(), 4 * 2 * 4);
+        // Row 1, column 1 of a four-wide destination.
+        let sampled = (4 + 1) * 4;
+        assert_eq!(reduced.pixels[sampled], 0x77, "the sampled pixel is not the source's");
+    }
+
+    /// **The rounding, at a deliberately awkward width.** 201 and 137 are both
+    /// odd, so a floor would drop the rightmost column and the bottom row —
+    /// a strip of the page never sent, which reads as a rendering fault.
+    #[test]
+    fn a_source_dimension_the_denominator_does_not_divide_loses_no_column_or_row() {
+        let mut surface = flat(201, 137, 0x00);
+        // The last pixel of the last row: the one a floor would throw away.
+        let corner = ((136 * 201) + 200) * 4;
+        surface.pixels[corner] = 0x99;
+        let reduced = reduce(&surface, 2);
+        assert_eq!(
+            (reduced.width, reduced.height),
+            (101, 69),
+            "the reduction rounded down and dropped the edge strips",
+        );
+        // Every source pixel is covered: the destination times the denominator
+        // reaches at least the source's own size.
+        assert!(reduced.width * 2 >= 201 && reduced.height * 2 >= 137);
+        let last = ((68 * 101) + 100) * 4;
+        assert_eq!(
+            reduced.pixels[last], 0x99,
+            "the source's last pixel did not survive the reduction",
+        );
+    }
+
+    /// The header a reduced frame carries: the **reduced** dimensions plus the
+    /// denominator, which is the pair a client multiplies back to the page's
+    /// own size rather than inferring a scale from a ratio.
+    #[test]
+    fn a_reduced_frame_declares_its_denominator_and_its_reduced_dimensions() {
+        let (out, _frames) = tokio::sync::mpsc::unbounded_channel();
+        let surface = reduce(&flat(201, 137, 0x30), 2);
+        let whole = surface.whole();
+        let frame = Frame {
+            connection: 1,
+            tab: 5,
+            frame_seq: 2,
+            last_applied_input: 0,
+            keyframe: true,
+            scale_denominator: 2,
+            surface,
+            out,
+        };
+        let message = compose(&frame, FrameKind::Keyframe, whole).expect("a frame message");
+        let (_, body) = split_channel(&message).expect("a framed message");
+        let header = FrameHeader::from_bytes(body).expect("a header the wire accepts");
+        assert_eq!(header.scale_denominator, 2);
+        assert_eq!((header.frame_width, header.frame_height), (101, 69));
+        assert_eq!((header.tile_width, header.tile_height), (101, 69));
     }
 
     /// An accepted input puts the attachment on the driven cadence, and puts
@@ -2264,7 +2541,7 @@ mod tests {
         // passive interval that was in flight a moment ago.
         assert!(sessions
             .next_tick()
-            .is_some_and(|due| due <= after_input + Duration::from_millis(DRIVEN_TICK_MS)));
+            .is_some_and(|due| due <= after_input + Duration::from_millis(driven_tick_ms())));
     }
 
     // ---- the tile comparison -------------------------------------------
@@ -2468,6 +2745,7 @@ mod tests {
             frame_seq: 9,
             last_applied_input: 1839,
             keyframe: false,
+            scale_denominator: Rung::FASTEST.scale_denominator(),
             surface,
             out,
         };
@@ -2484,7 +2762,7 @@ mod tests {
         assert_eq!((header.tile_x, header.tile_y), (192, 192));
         assert_eq!((header.tile_width, header.tile_height), (8, 8));
         assert_eq!((header.frame_width, header.frame_height), (200, 200));
-        assert_eq!(header.scale_denominator, FULL_SCALE_DENOMINATOR);
+        assert_eq!(header.scale_denominator, Rung::FASTEST.scale_denominator());
         // And the payload is the PNG, sized from the wire's own constant.
         assert!(body.len() > FRAME_HEADER_LEN, "the message carried no payload");
         assert_eq!(&body[FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8], b"\x89PNG\r\n\x1a\n");
@@ -2504,6 +2782,7 @@ mod tests {
             frame_seq: 1,
             last_applied_input: 0,
             keyframe: true,
+            scale_denominator: Rung::FASTEST.scale_denominator(),
             surface,
             out,
         };
@@ -2544,7 +2823,7 @@ mod tests {
     fn a_frame_message_is_the_tag_then_the_header_then_the_payload() {
         let header = FrameHeader {
             kind: FrameKind::Tile,
-            scale_denominator: FULL_SCALE_DENOMINATOR,
+            scale_denominator: Rung::FASTEST.scale_denominator(),
             tab_id: 3,
             frame_seq: 4,
             last_applied_input: 5,
@@ -2568,7 +2847,7 @@ mod tests {
     fn the_idle_threshold_falls_back_to_its_default_and_never_to_zero() {
         assert_eq!(parse_view_idle(Some("250")), Duration::from_millis(250));
         assert_eq!(parse_view_idle(Some("  4000 ")), Duration::from_millis(4000));
-        let default = Duration::from_millis(DEFAULT_VIEW_IDLE_MS);
+        let default = Duration::from_millis(talaria_protocol::wire::DEFAULT_VIEW_IDLE_MS);
         for bad in [None, Some(""), Some("0"), Some("-1"), Some("ages"), Some("2.5")] {
             assert_eq!(parse_view_idle(bad), default, "{bad:?} did not fall back to the default");
         }

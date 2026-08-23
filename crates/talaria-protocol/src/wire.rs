@@ -29,6 +29,8 @@
 //! behind a fixed binary header rather than a base64 string inside a JSON
 //! envelope.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::TabInfo;
@@ -305,6 +307,249 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
 }
 
+/// One rung of the degrade ladder: how often frames are asked for, and at what
+/// resolution.
+///
+/// Every field is a whole number. The interval is whole milliseconds and the
+/// denominator is a whole divisor, because every comparison the client's
+/// controller makes is an integer against an integer — the smoothed round-trip
+/// estimate is the only floating-point value anywhere in that controller, and
+/// it is only ever compared against one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RungEntry {
+    /// The rung this row describes.
+    pub rung: Rung,
+    /// The name this rung travels under on the wire. Written here rather than
+    /// derived from the variant's spelling so a rename in Rust is not silently
+    /// a wire change.
+    pub name: &'static str,
+    /// The interval between frames while the viewer is **driving**, in whole
+    /// milliseconds. An idle attachment always falls back to the slowest rung's
+    /// interval, whichever rung it is on — see [`is_driving`].
+    pub interval_ms: u32,
+    /// The divisor the server applies to the tab's real size before painting:
+    /// 1 for full resolution, 2 for half.
+    pub scale_denominator: u8,
+}
+
+/// The degrade ladder, fastest rung first — **the one place a rung's numbers
+/// are written**, read by the server that produces frames and by the client
+/// that asks for them.
+///
+/// **The property being copied, and where it comes from.** The shell's command
+/// timeouts are the nearest thing in this codebase to a ladder: every bound is
+/// named in one place and the *ordering between them* is load-bearing rather
+/// than incidental (`crates/talaria-shell/src/app.rs`, the socket timeout >
+/// promise wait > load wait > capture deadline chain). The same discipline
+/// applies here, and it is enforced rather than asserted in prose: a test walks
+/// this table and requires the intervals to be **non-decreasing** and the
+/// denominators to be non-decreasing. An entry inserted in the wrong place
+/// fails that test rather than producing a ladder that steps sideways.
+///
+/// **What each rung is for**, so a later reader adding one knows where it
+/// belongs:
+///
+/// | Rung | Interval | Scale | What it is for |
+/// |------|----------|-------|----------------|
+/// | [`Rung::FullResolutionFast`] | 30 ms | 1 | The target. A direct WireGuard path carries it; this is what takeover is supposed to feel like. |
+/// | [`Rung::FullResolutionSteady`] | 60 ms | 1 | Detail kept, rate halved. The first thing to give up, because text stays legible. |
+/// | [`Rung::HalfResolutionSteady`] | 60 ms | 2 | Rate restored, detail halved — about a quarter of the bytes. Aiming a click still works. |
+/// | [`Rung::HalfResolutionSlow`] | 120 ms | 2 | Both halved. Driving is deliberate rather than fluent, and it still lands. |
+/// | [`Rung::PassiveOnly`] | 250 ms | 2 | The floor. Driving gets the same cadence as watching, which is what a relayed link can actually carry. |
+///
+/// **Where the numbers come from.** The shape is `05-RESEARCH.md`'s five-rung
+/// proposal. The fastest rung's interval is bounded below by measurement rather
+/// than by the requirement's number: `05-02-SPIKE.md` drove this tree's real
+/// engine at a 30 ms cadence over 900 ticks in three page shapes and recorded a
+/// production floor of about 13 ms in the worst shape, so 30 ms is a rung the
+/// server can actually produce with headroom rather than one it starts beneath
+/// and never notices. The slowest rung's interval sits inside DIST-02's
+/// 200–500 ms passive band, and it is halved in resolution because the floor is
+/// the rung that has to survive the worst link — a half-resolution frame is
+/// about 138 KB against a full one's 522 KB, which is inside a relayed path's
+/// measured 13 Mbit/s where a full one is not.
+pub const RUNG_LADDER: [RungEntry; 5] = [
+    RungEntry {
+        rung: Rung::FullResolutionFast,
+        name: "full_resolution_fast",
+        interval_ms: 30,
+        scale_denominator: 1,
+    },
+    RungEntry {
+        rung: Rung::FullResolutionSteady,
+        name: "full_resolution_steady",
+        interval_ms: 60,
+        scale_denominator: 1,
+    },
+    RungEntry {
+        rung: Rung::HalfResolutionSteady,
+        name: "half_resolution_steady",
+        interval_ms: 60,
+        scale_denominator: 2,
+    },
+    RungEntry {
+        rung: Rung::HalfResolutionSlow,
+        name: "half_resolution_slow",
+        interval_ms: 120,
+        scale_denominator: 2,
+    },
+    RungEntry {
+        rung: Rung::PassiveOnly,
+        name: "passive_only",
+        interval_ms: 250,
+        scale_denominator: 2,
+    },
+];
+
+/// A named rung of [`RUNG_LADDER`].
+///
+/// An enumerated value rather than a number, which is the whole reason
+/// [`ClientView::Cadence`] changed shape — see that variant's own comment.
+///
+/// The declaration order is the ladder's order, fastest first, and
+/// [`Rung::index`] is the bridge between the two. `Ord` follows the same
+/// order, so "slower than" is a comparison rather than a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rung {
+    /// Full resolution at the driven interval — the target.
+    FullResolutionFast,
+    /// Full resolution at twice the driven interval.
+    FullResolutionSteady,
+    /// Half resolution at twice the driven interval.
+    HalfResolutionSteady,
+    /// Half resolution at four times the driven interval.
+    HalfResolutionSlow,
+    /// The passive cadence, whether or not anybody is driving.
+    PassiveOnly,
+}
+
+impl Rung {
+    /// The fastest rung the ladder has. Where a fresh attachment starts.
+    pub const FASTEST: Rung = Rung::FullResolutionFast;
+
+    /// The slowest rung the ladder has, and the interval any idle attachment
+    /// falls back to.
+    pub const SLOWEST: Rung = Rung::PassiveOnly;
+
+    /// This rung's position in [`RUNG_LADDER`], counting from the fastest.
+    pub fn index(self) -> usize {
+        match self {
+            Rung::FullResolutionFast => 0,
+            Rung::FullResolutionSteady => 1,
+            Rung::HalfResolutionSteady => 2,
+            Rung::HalfResolutionSlow => 3,
+            Rung::PassiveOnly => 4,
+        }
+    }
+
+    /// The rung at `index`, or `None` for a position the ladder does not have.
+    pub fn at(index: usize) -> Option<Self> {
+        RUNG_LADDER.get(index).map(|entry| entry.rung)
+    }
+
+    /// This rung's row of the table.
+    pub fn entry(self) -> &'static RungEntry {
+        // `index` is a total function onto this table's own range, and a test
+        // walks both directions to keep it one.
+        &RUNG_LADDER[self.index()]
+    }
+
+    /// The interval between frames on this rung while the viewer is driving,
+    /// in whole milliseconds.
+    pub fn interval_ms(self) -> u32 {
+        self.entry().interval_ms
+    }
+
+    /// The interval as a [`Duration`], for the two ends that keep clocks.
+    pub fn interval(self) -> Duration {
+        Duration::from_millis(u64::from(self.interval_ms()))
+    }
+
+    /// The divisor the server applies to the tab's size before painting on this
+    /// rung.
+    pub fn scale_denominator(self) -> u8 {
+        self.entry().scale_denominator
+    }
+
+    /// The name this rung travels under on the wire.
+    pub fn name(self) -> &'static str {
+        self.entry().name
+    }
+
+    /// The rung a wire name selects, or `None` for a name this build does not
+    /// know — a rung a newer client invented, which is a thing to answer rather
+    /// than a thing to misread.
+    pub fn from_name(name: &str) -> Option<Self> {
+        RUNG_LADDER.iter().find(|entry| entry.name == name).map(|entry| entry.rung)
+    }
+
+    /// One rung slower, or this rung when it is already the slowest.
+    ///
+    /// Clamped rather than wrapping: the bottom of the ladder is the bottom,
+    /// and a controller that wrapped from it to the top would present a link
+    /// that cannot carry anything as one that can carry everything.
+    pub fn slower(self) -> Self {
+        Rung::at(self.index().saturating_add(1)).unwrap_or(Rung::SLOWEST)
+    }
+
+    /// One rung faster, or this rung when it is already the fastest.
+    pub fn faster(self) -> Self {
+        match self.index().checked_sub(1) {
+            Some(index) => Rung::at(index).unwrap_or(Rung::FASTEST),
+            None => Rung::FASTEST,
+        }
+    }
+}
+
+/// How long after the last accepted input an attachment falls back from the
+/// driven cadence to the passive one, in whole milliseconds.
+///
+/// One second, which is longer than the gap between two keystrokes and shorter
+/// than a pause for thought — a viewer typing must not drop to a quarter-second
+/// cadence between characters, and a viewer who has stopped must not hold the
+/// fast rate indefinitely.
+pub const DEFAULT_VIEW_IDLE_MS: u64 = 1000;
+
+/// The idle threshold's environment override.
+///
+/// Read by **both** ends, so a suite that lowers it does not have to lower it
+/// twice and cannot lower it on one side only.
+pub const VIEW_IDLE_ENV: &str = "TALARIA_VIEW_IDLE_MS";
+
+/// The idle threshold an override spells, or the default.
+///
+/// An unset variable, a value that is not a number, and a value of zero all
+/// fall back to the default — **never to zero and never to unbounded**. Zero
+/// would mean every attachment was permanently driven, which is the whole
+/// browser paying takeover cost for a viewer nobody is touching.
+///
+/// Takes the raw value as a parameter rather than reading the environment, so
+/// what a bad value does is assertable without one test's setting becoming
+/// another test's answer.
+pub fn parse_view_idle_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_VIEW_IDLE_MS)
+}
+
+/// Whether an attachment is in the **driven** cadence, given how long ago its
+/// viewer's last input was accepted.
+///
+/// **The transition, written once and called by both ends**, so the server that
+/// produces frames and the client that asks for them are running one rule
+/// rather than two that happen to agree today.
+///
+/// An attachment enters the driven cadence on the first accepted input for that
+/// tab on that connection, and returns to the passive cadence once the elapsed
+/// time since the last accepted input **reaches** the threshold. An input
+/// arriving exactly at the threshold re-enters the driven cadence, because a
+/// new input always does — the comparison is on elapsed-since-last rather than
+/// on a countdown, so there is one rule and no race between a timer and a
+/// timestamp.
+pub fn is_driving(since_last_input: Option<Duration>, idle: Duration) -> bool {
+    matches!(since_last_input, Some(elapsed) if elapsed < idle)
+}
+
 /// Which pointer button an input message names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -453,9 +698,50 @@ pub enum ClientView {
     Detach { tab: u64 },
     /// The viewer's window changed size; paint `tab` at this size from now on.
     Viewport { tab: u64, width: u32, height: u32 },
-    /// Ask for frames roughly every `interval_ms`. A request, not a promise:
-    /// the server may deliver more slowly when the link cannot carry the rate.
-    Cadence { interval_ms: u32 },
+    /// Ask for frames at a **named rung** of [`RUNG_LADDER`].
+    ///
+    /// **This supersedes the raw interval this variant carried when the wire
+    /// was first written, and the churn is worth it.** An interval a client
+    /// invents is an interval the server has to decide whether to honour: that
+    /// means a validation rule, a clamp, and a disagreement about what happens
+    /// at the edges of both — three decisions, each of which is somewhere a
+    /// mistake can live, and the first of which is also a way for one viewer to
+    /// pin the engine's loop at whatever rate it liked (T-05-12-D). A rung is
+    /// an enumerated value with exactly one meaning at both ends, and the
+    /// fastest one is bounded below by what `05-02-SPIKE.md` measured this
+    /// engine actually producing. The decision is removed rather than bounded.
+    ///
+    /// `None` is a name this build does not know — a rung a newer client
+    /// invented. It decodes to `None` rather than ending the connection, so a
+    /// rung added later is not a breaking change, and the server answers it
+    /// with the one reasonless [`ServerView::Refused`] that every other
+    /// refusal here uses.
+    Cadence {
+        #[serde(
+            serialize_with = "serialize_rung",
+            deserialize_with = "deserialize_rung"
+        )]
+        rung: Option<Rung>,
+    },
+}
+
+/// A rung as its wire name. `None` writes JSON `null`, which no client sends
+/// and which decodes back to `None`.
+fn serialize_rung<S>(rung: &Option<Rung>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    rung.map(|rung| rung.name()).serialize(serializer)
+}
+
+/// A wire name back into a rung, with an unknown name becoming `None` rather
+/// than an error. See [`ClientView::Cadence`] for why that is the shape.
+fn deserialize_rung<'de, D>(deserializer: D) -> Result<Option<Rung>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name: Option<String> = Option::deserialize(deserializer)?;
+    Ok(name.as_deref().and_then(Rung::from_name))
 }
 
 /// A message the server sends on the control channel.
@@ -554,7 +840,8 @@ mod tests {
             ClientView::Attach { tab: 7 },
             ClientView::Detach { tab: 7 },
             ClientView::Viewport { tab: 7, width: 1280, height: 800 },
-            ClientView::Cadence { interval_ms: 30 },
+            ClientView::Cadence { rung: Some(Rung::FullResolutionFast) },
+            ClientView::Cadence { rung: Some(Rung::PassiveOnly) },
         ];
         for message in messages {
             let json = serde_json::to_string(&message).expect("serializable");
@@ -563,6 +850,179 @@ mod tests {
         }
         let json = serde_json::to_string(&ClientView::Attach { tab: 7 }).expect("serializable");
         assert!(json.contains("\"view\":\"attach\""), "{json}");
+    }
+
+    // -- the rung ladder ---------------------------------------------------
+
+    /// The invariant the whole ladder rests on, walked rather than asserted in
+    /// a comment: an entry inserted in the wrong place fails here rather than
+    /// producing a ladder that steps sideways.
+    #[test]
+    fn the_rung_ladders_intervals_and_denominators_are_both_non_decreasing() {
+        for pair in RUNG_LADDER.windows(2) {
+            let [faster, slower] = pair else {
+                panic!("windows(2) yields pairs");
+            };
+            assert!(
+                faster.interval_ms <= slower.interval_ms,
+                "{} ({} ms) is listed above {} ({} ms), so the ladder steps sideways",
+                faster.name,
+                faster.interval_ms,
+                slower.name,
+                slower.interval_ms,
+            );
+            assert!(
+                faster.scale_denominator <= slower.scale_denominator,
+                "{} (1/{}) is listed above {} (1/{}), so the ladder gains detail as it slows",
+                faster.name,
+                faster.scale_denominator,
+                slower.name,
+                slower.scale_denominator,
+            );
+        }
+    }
+
+    /// The interval field's **type** is the assertion: this binding stops
+    /// compiling the day somebody widens it to a float, which is the property
+    /// worth holding — every comparison the controller makes is an integer
+    /// against an integer.
+    #[test]
+    fn every_rungs_interval_is_a_whole_number_of_milliseconds() {
+        fn whole_milliseconds(value: u32) -> u64 {
+            u64::from(value)
+        }
+        for entry in RUNG_LADDER {
+            assert_eq!(
+                whole_milliseconds(entry.interval_ms),
+                entry.rung.interval().as_millis() as u64,
+                "{} does not survive the trip through Duration intact",
+                entry.name,
+            );
+            assert!(entry.interval_ms > 0, "{} has no interval at all", entry.name);
+            assert!(entry.scale_denominator > 0, "{} paints nothing", entry.name);
+        }
+    }
+
+    /// 05-02-SPIKE measured a production floor of about 13 ms in the worst page
+    /// shape. A top rung faster than the server can produce is a ladder that
+    /// starts one step down and never notices.
+    #[test]
+    fn the_fastest_rung_is_not_faster_than_the_engine_was_measured_producing() {
+        const MEASURED_PRODUCTION_FLOOR_MS: u32 = 13;
+        assert!(
+            Rung::FASTEST.interval_ms() >= MEASURED_PRODUCTION_FLOOR_MS,
+            "the fastest rung claims {} ms against a measured floor of {MEASURED_PRODUCTION_FLOOR_MS} ms",
+            Rung::FASTEST.interval_ms(),
+        );
+        assert_eq!(Rung::FASTEST.scale_denominator(), 1, "the target rung is full resolution");
+    }
+
+    /// DIST-02 names 200–500 ms for a viewer who is only watching.
+    #[test]
+    fn the_slowest_rungs_interval_is_inside_the_passive_band_the_requirement_names() {
+        let interval = Rung::SLOWEST.interval_ms();
+        assert!(
+            (200..=500).contains(&interval),
+            "the passive rung is {interval} ms, outside DIST-02's 200-500 ms band",
+        );
+    }
+
+    #[test]
+    fn every_rung_resolves_to_its_own_row_and_back() {
+        for (index, entry) in RUNG_LADDER.iter().enumerate() {
+            assert_eq!(entry.rung.index(), index, "{} is not at its own index", entry.name);
+            assert_eq!(Rung::at(index), Some(entry.rung));
+            assert_eq!(entry.rung.entry(), entry);
+            assert_eq!(Rung::from_name(entry.name), Some(entry.rung));
+            assert_eq!(entry.rung.name(), entry.name);
+        }
+        assert_eq!(Rung::at(RUNG_LADDER.len()), None);
+        assert_eq!(Rung::from_name("quarter_resolution_someday"), None);
+        assert_eq!(Rung::from_name(""), None);
+    }
+
+    #[test]
+    fn stepping_off_either_end_of_the_ladder_stays_on_it() {
+        assert_eq!(Rung::FASTEST.faster(), Rung::FASTEST);
+        assert_eq!(Rung::SLOWEST.slower(), Rung::SLOWEST);
+        let mut rung = Rung::FASTEST;
+        for _ in 0..RUNG_LADDER.len() * 2 {
+            rung = rung.slower();
+        }
+        assert_eq!(rung, Rung::SLOWEST);
+        for _ in 0..RUNG_LADDER.len() * 2 {
+            rung = rung.faster();
+        }
+        assert_eq!(rung, Rung::FASTEST);
+    }
+
+    #[test]
+    fn one_step_down_and_back_up_returns_to_where_it_started() {
+        for entry in RUNG_LADDER {
+            if entry.rung == Rung::SLOWEST {
+                continue;
+            }
+            assert_eq!(entry.rung.slower().faster(), entry.rung, "{}", entry.name);
+            assert!(entry.rung < entry.rung.slower(), "{}", entry.name);
+        }
+    }
+
+    #[test]
+    fn a_cadence_request_names_a_rung_and_an_unknown_name_decodes_to_nothing() {
+        let json = serde_json::to_string(&ClientView::Cadence {
+            rung: Some(Rung::HalfResolutionSlow),
+        })
+        .expect("serializable");
+        assert_eq!(json, "{\"view\":\"cadence\",\"rung\":\"half_resolution_slow\"}");
+
+        let newer = "{\"view\":\"cadence\",\"rung\":\"quarter_resolution_someday\"}";
+        assert_eq!(
+            serde_json::from_str::<ClientView>(newer).expect("decodable"),
+            ClientView::Cadence { rung: None },
+            "a rung a newer client invented must decode to nothing rather than \
+             ending the connection",
+        );
+    }
+
+    /// The interval is no longer expressible on the wire at all, which is what
+    /// makes the unbounded-cadence case unreachable rather than bounded.
+    #[test]
+    fn a_cadence_request_carrying_a_raw_interval_is_no_longer_this_wires_vocabulary() {
+        let interval = "{\"view\":\"cadence\",\"interval_ms\":1}";
+        assert!(
+            serde_json::from_str::<ClientView>(interval).is_err(),
+            "a raw interval still decodes, so a client can still name a number",
+        );
+    }
+
+    // -- the idle threshold, which both ends read --------------------------
+
+    #[test]
+    fn the_idle_threshold_falls_back_to_its_default_and_never_to_zero() {
+        assert_eq!(parse_view_idle_ms(None), DEFAULT_VIEW_IDLE_MS);
+        assert_eq!(parse_view_idle_ms(Some("")), DEFAULT_VIEW_IDLE_MS);
+        assert_eq!(parse_view_idle_ms(Some("0")), DEFAULT_VIEW_IDLE_MS);
+        assert_eq!(parse_view_idle_ms(Some("not a number")), DEFAULT_VIEW_IDLE_MS);
+        assert_eq!(parse_view_idle_ms(Some("-5")), DEFAULT_VIEW_IDLE_MS);
+        assert_eq!(parse_view_idle_ms(Some("  250 ")), 250);
+    }
+
+    /// The boundary, at it and one millisecond either side. Both ends call this
+    /// function, so this is the one place the rule is tested.
+    #[test]
+    fn an_attachment_returns_to_passive_exactly_at_the_idle_threshold() {
+        let idle = Duration::from_millis(1000);
+        assert!(!is_driving(None, idle), "a viewer that has never driven is passive");
+        assert!(is_driving(Some(Duration::from_millis(999)), idle));
+        assert!(
+            !is_driving(Some(Duration::from_millis(1000)), idle),
+            "the threshold itself is passive: the rule is `reaches`, not `exceeds`",
+        );
+        assert!(!is_driving(Some(Duration::from_millis(1001)), idle));
+        assert!(
+            is_driving(Some(Duration::ZERO), idle),
+            "an input that just landed always re-enters the driven cadence",
+        );
     }
 
     #[test]
