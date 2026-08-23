@@ -141,6 +141,31 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Added
 
+- **A remote human can now click, scroll and type into an agent's tab — and into
+  nothing else.** Input arriving on the `/view` channel enters the engine through
+  one module, `crates/talaria-shell/src/remote_input.rs`, which reaches a
+  webview's input entry point and, by construction rather than by check, reaches
+  no chrome, no browser-shortcut handler, no interface action, no panel, no
+  active-tab state, no view mode and no window focus. That absence is the
+  guarantee: an actor that can aim synthetic input at the chrome can aim it at
+  the credentials control, the bookmark star, or a downloads row's open control,
+  which hands a file to the operating system's default application — the
+  argument `ChromeRect`'s own doc comment already made for agents, applied
+  verbatim to the party this adds. A tab the human owns is resolved through the
+  agent-only lookup, so it is unrepresentable on this path rather than refused
+  downstream, and it takes the same exit a tab that never existed takes. The
+  per-connection input sequence is strictly increasing and a non-increasing
+  value is dropped, which is replay resistance within a connection, the ordering
+  rule under coalescing, and the latency measurement a frame header will echo —
+  one field doing three jobs. The three pointer forwarders now take a webview
+  and a point **already relative to that tab's viewport**, with the local
+  window's toolbar subtraction moved to the local call site, because a remote
+  client draws no server toolbar and a shared subtraction would put a silent
+  toolbar-height error on every remote click that nothing would report. The
+  end-to-end suite proves the click lands on the element it was aimed at by
+  naming the destination it reached, on a fixture carrying a decoy link one
+  toolbar-height above each real one (`crates/talaria-shell/src/remote_input.rs`,
+  `app.rs`, `keyutils.rs`, `view.rs`, `tests/e2e/remote_view_test.py`).
 - **Talaria can now advertise an identity it did not bind, and be reached over a
   secure transport without ever handling one.** A new optional
   `remote_access.advertised_url` key in `config.json` names the origin clients
