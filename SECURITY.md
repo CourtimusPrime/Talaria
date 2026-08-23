@@ -14,21 +14,44 @@ reporting](https://github.com/CourtimusPrime/Talaria/security/advisories/new)
 rather than in a public issue.
 
 Useful reports include the version or commit, the transport in use (the Unix
-control socket, the stdio MCP proxy, or the loopback HTTP listener), and whether
-the attacker in your scenario is a web page, an agent connected over MCP,
-another local user account, or an unauthenticated network peer.
+control socket, the stdio MCP proxy, the loopback HTTP listener, or the remote
+view channel that rides on it), and whether the attacker in your scenario is a
+web page, an agent connected over MCP, another local user account, an
+unauthenticated network peer, or a remote human holding a bearer token.
 
 There is no bounty. This is a personal project.
 
 ## The trust model, stated plainly
 
-Four parties, and they are not equally trusted.
+Five parties, and they are not equally trusted.
 
 **The human at the keyboard is the trust root.** Anything a user can do in a
 normal browser, they can do in Talaria: type a `file://` URL into the address bar,
 open a local page, browse anywhere. Talaria does not second-guess its own user,
 and hardening work must not quietly restrict the human path in the course of
 restricting the agent one.
+
+**A remote human is the trust root at a distance, and that is a real
+distance.** This is the fifth party, and it arrived with the remote view
+channel. It sits between the human at the keyboard and a connected agent, in
+both directions. *More* trusted than an agent, because it is the same person:
+the sentence above — hardening must not quietly restrict the human path —
+applies to them, and a remote takeover that a security measure made unusable
+would have removed the feature rather than protected it. *Less* verifiable than
+the human at the keyboard, because their identity is **a bearer token rather
+than physical presence**. Nobody checked that the person at the far end is the
+person who approved the token; what was checked is that the connection presents
+a credential this browser issued and has not revoked.
+
+And the part that is genuinely new: **this is the first party in this browser's
+history that sends raw input rather than tool calls.** An agent asks for
+`navigate`, `evaluate`, `screenshot` — a fixed vocabulary that a reviewer can
+enumerate and a policy can be written against. A remote human sends a click at
+a coordinate, a scroll, a keystroke. Raw input into an already-logged-in session
+is a different kind of reach from an allowlisted vocabulary: there is no list of
+what it can do, because it can do whatever the page in that tab can be made to
+do by a person operating it. That is the feature, and the section
+"What a remote viewer is, plainly" below says so without hedging.
 
 **A connected agent is semi-trusted.** It gets a real, already-logged-in
 session — that is the entire point of the product — but it is not the user and
@@ -43,6 +66,22 @@ Talaria had a network transport: anything that can open a TCP connection to the
 HTTP listener, which means every other user account on this machine and every
 page running in every browser on it. It is not a party you connected; it is a
 party that can reach a port.
+
+**And that party's size is now set outside this repository.** "Anything that can
+open a connection to the loopback listener" was a sentence about one machine.
+Under the overlay-network exposure this browser is designed for — `tailscaled`
+terminating TLS and proxying to the unchanged `127.0.0.1` listener — the set
+widens to *any device in the tailnet, plus whatever the tailnet's access rules
+admit*, and those rules live in a web console, not in this source tree. Read the
+old sentence as still bounding the set and you will be wrong by however much
+somebody has shared that tailnet with.
+
+What did **not** change is the local half. Between the overlay daemon and this
+browser the traffic is still plain HTTP on loopback. Every local account on this
+machine can still reach the port, `SO_PEERCRED` still has no TCP equivalent, and
+the bearer token is still the entire local boundary. Fronting the listener with
+a daemon that speaks TLS to the network did not make the listener itself
+private.
 
 That fourth party also *changes* the third. "A connected agent" used to be a
 synonym for "a process running as you" — the Unix control socket says so with a
@@ -75,6 +114,28 @@ collapses them into one path is a change to the trust model, not a refactor.
   carrying an `Origin` header cover the case of a local web page finding the
   port — a real MCP client sends no `Origin` and a page always does — but they
   are defence in depth, **not a substitute for the token**.
+- **The remote view channel is off by default, checks the token itself, and can
+  only ever name an agent's tab** — and, as above, every clause of that is
+  load-bearing. `GET /view` exists only when the listener does, so a default
+  installation has **no input channel at all**, not a closed one. It performs
+  its **own** direct call to the shared authorization provider rather than
+  inheriting a check: the SDK's middleware chain covers only its own transport
+  handlers, so a route merged beside them would have been origin-checked and
+  host-checked and *unauthenticated*, which is the worst of the three
+  combinations because it looks protected. A viewer may attach to **agent tabs
+  only**, through `TabManager::agent_tab`, a lookup that cannot return a
+  human-owned tab — so remoting one of your own tabs is *unrepresentable* on
+  this path rather than refused somewhere downstream. Refusals carry no reason:
+  "that tab belongs to the human", "there is no such tab" and "the attachment
+  cap is full" are one answer, so the channel is not an enumeration oracle for
+  what you have open. Input reaches a webview and nothing else — no chrome, no
+  browser-shortcut handler, no panel, no active-tab state, no view mode, no
+  window focus — which is why a click at the credentials control's real
+  coordinates opens nothing at all. Revoking a viewer **closes its socket**, not
+  merely its next message, and that closure is asserted from the client's own
+  side of the wire in `tests/e2e/revocation_test.py`. The per-connection input
+  sequence is strictly increasing and a non-increasing value is dropped, so a
+  replay within a connection is a no-op.
 - **Approval is a native control, not a web page.** Getting a token means
   getting a human's approval, and that approval happens in the browser's own
   chrome. The page an authorization request serves has no form, no button and
@@ -113,6 +174,82 @@ collapses them into one path is a change to the trust model, not a refactor.
   the browser chrome with copy controls. Talaria does not write your password
   into the page's DOM, where every script on that page could read it, and where
   it would collide with an agent's own `evaluate` scripting the same form.
+
+### Why the remote viewer is a native program, and must stay one
+
+This is a property, not an inconvenience, and it is written down here because it
+does not look like one from the outside.
+
+`build_router` applies `refuse_page_originated` as the **outermost** layer over
+every route, and it refuses any request that carries an `Origin` header at all —
+not one from a disapproved origin, *any*. WebSockets are not subject to the
+same-origin policy and they have no preflight, so a browser will happily open one
+across origins and hand the response to the page's script; origin enforcement on
+a WebSocket is entirely the server's job, and forgetting it is precisely what
+cross-site WebSocket hijacking (CSWSH) is. Talaria's layer closes that class **by
+construction** rather than by remembering to check, and it closes it in the
+strictest available direction: a browser always sends `Origin`, so **a browser
+can never connect to this listener at all**.
+
+The consequence is that `talaria-client` is a native binary as a *result* of that
+layer, not as a preference. A browser-based remote viewer for Talaria is
+structurally impossible, and that is the intended state.
+
+**What its deletion would look like**, so that a reader who meets one recognises
+it: a diff that replaces the blanket refusal with an **origin allowlist**, most
+likely justified as "so a small web viewer can connect". That change does not
+add a feature to an unrelated defence — it removes the property above. If it is
+ever made deliberately, CSWSH becomes a live threat class against a process
+holding a credential vault and a logged-in session, and the reasoning for
+accepting that belongs in this document beside the diff.
+
+### The public-internet exposure variant is refused, by name
+
+Tailscale Serve proxies a tailnet-private name to a loopback port. **Tailscale
+Funnel** is the sibling command that does the same thing to the **open
+internet**. They differ by a few characters on the command line.
+
+Funnel is not an option for Talaria and is refused rather than merely omitted:
+`scripts/tailscale-serve.sh` refuses an argument asking for it, and the reason is
+in the refusal. The process on the other end of that mapping holds an encrypted
+credential vault and a human's logged-in browsing sessions, and the entire local
+boundary is a bearer token. Publishing it to the internet moves the fourth party
+from "devices on a private overlay network" to "everyone", against a boundary
+that was never designed for that.
+
+A named non-option is safer than an unconsidered one. If you need reach beyond a
+tailnet, that is a fronting-proxy design question, not a one-word substitution.
+
+### What a remote viewer is, plainly
+
+An authorised remote viewer **is a remote-control primitive**. By design. That is
+the feature, and none of the layers above stop it — nor should they. The boundary
+is *which clients you authorise*: the same sentence this document already uses
+about agents, now with sharper teeth, because a viewer sends real clicks into a
+logged-in session rather than tool calls into an allowlisted surface. Approve a
+viewer only where you would hand somebody the machine.
+
+The asymmetry is the interesting part, so state what a viewer still cannot do. It
+cannot see or drive the human's own tabs — they are not in the snapshot and not
+nameable by the lookup. It cannot reach the chrome, so it cannot touch the
+credentials control, the bookmark star, or a downloads row's handoff to the
+operating system's default application. It cannot open a tab, navigate one, close
+one, evaluate script in one, or download anything: the view channel has no
+message for any of those, which is an absence in the wire types rather than a
+runtime check. And it cannot move, refocus or blank anything on the local
+screen — attaching holds a tab *shown*, deliberately not focused, and the tab the
+local human is displaying always wins.
+
+### The overlay daemon's injected identity headers are not a boundary
+
+A Serve-proxied request arrives carrying `tailscale-user-login`,
+`tailscale-user-name` and `tailscale-user-profile-pic`, filled in by the daemon
+from the tailnet's own identity. They are genuinely useful and they are also
+**spoofable by any local process that can reach the loopback port**, which is
+every account on this machine — the daemon is not the only thing that can send
+bytes to `127.0.0.1:PORT`. The bearer token is checked first and these are at
+most a second check. Treating them as authentication would hand the listener to
+the weakest party in the model.
 
 ## What revocation guarantees
 
@@ -199,6 +336,12 @@ every request, but the thing on the far side of it still gets filesystem read
 access for your account. Approve agents accordingly, and revoke ones you no
 longer use.
 
+**And a remote human widens it once more, in a way no allowlist reaches.** An
+authorised viewer cannot call `evaluate` — the view channel has no such
+message — but it can type into the page, and a page the human is logged into is a
+page whose own scripting the human can invoke. The party on the far side of this
+gap is now "anything holding a token" *and* "anybody who can click".
+
 ### A wedged script still costs one command timeout
 
 **Requirement:** MCP-10, partially closed.
@@ -224,9 +367,10 @@ repository.
 agent should give up sooner, and close the tab — `tabs_close` still works.
 
 The same widening applies here in a smaller way: an authorized remote client can
-also wedge a tab and spend one command timeout doing it. The cost is bounded and
-per-tab, and it is one more reason the set of clients you approve should be the
-set you actually use.
+also wedge a tab and spend one command timeout doing it, and so can a remote
+human who merely clicks a link to a page whose script never yields. The cost is
+bounded and per-tab, and it is one more reason the set of clients you approve
+should be the set you actually use.
 
 ## Out of scope, on purpose
 
@@ -249,12 +393,26 @@ Authentication arrived with the network transport, because remote access is what
 made it necessary. What is deliberately **not** yet true, so that nobody reads
 more into this than is there:
 
-- **There is no TLS, and there is no non-loopback bind.** Both are the next
-  milestone's. They belong together: staying on loopback is what makes shipping
-  without TLS *conformant* rather than skipped — OAuth 2.1 requires HTTPS for
-  authorization-server endpoints with an explicit loopback exception, and
-  Talaria takes that exception rather than ignoring the requirement. A bind to
-  any other address needs a certificate story first.
+- **There is no non-loopback bind, and there never will be.** The listener binds
+  `127.0.0.1` and only `127.0.0.1`, and that is now **permanent rather than
+  provisional**. The bind host is a module constant used at exactly one place;
+  `config.json` cannot express an address, and a hand-edited `bind` key is
+  refused out loud. Remote reach is not obtained by widening the bind — it is
+  obtained by putting an overlay-network daemon in front of it, which terminates
+  TLS and proxies to the loopback port that was already there.
+
+  So **this browser issues, loads and renews no certificate at all**: no key on
+  disk, no expiry timer, no resolver re-reading files, no day-ninety-one
+  outage in the process that also holds your credential vault. `config.json`
+  gains only `remote_access.advertised_url` — the origin clients actually reach
+  this browser at — and every OAuth URL this browser publishes uses the secure
+  scheme once that identity is set, which is OAuth 2.1 §1.5 **met** rather than
+  excepted. (With nothing advertised, the loopback exception still applies and
+  every published string is byte-identical to what shipped before.)
+
+  What it costs: exposure requires an overlay-network node on both ends. Anyone
+  wanting a different fronting proxy is on their own documented path, and it is a
+  fronting proxy — not a certificate feature added to this process.
 - **There is still no per-agent permission scoping**, per the section above.
   A token is binary: an agent that holds one gets the tool surface.
 - **There is no audit trail.** Talaria logs what it did; it does not keep a
