@@ -366,7 +366,18 @@ impl Presenter {
         }
         let held = self.held.as_ref().map(|held| (held.size, held.last_seq));
         match decide(held, header) {
-            Application::Discard => false,
+            // A frame that changes nothing: it arrived after one that
+            // superseded it, or before this attachment had any surface to
+            // composite onto. Debug rather than warn — on a lossy link this is
+            // the ordering rule working, not a fault.
+            Application::Discard => {
+                log::debug!(
+                    "discarding frame {} for tab {}, which does not advance what is held",
+                    header.frame_seq,
+                    header.tab_id,
+                );
+                false
+            },
             Application::Replace(size) => {
                 let Some(image) = decode(payload, size.width, size.height) else {
                     // One frame, not the view: the picture already held is left

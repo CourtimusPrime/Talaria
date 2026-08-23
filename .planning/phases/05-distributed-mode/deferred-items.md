@@ -403,3 +403,65 @@ them fail and should know they were checked rather than skipped.
 **The general lesson for later plans:** a source criterion of the form "`grep -c X` is 0" should be
 established against the pre-task baseline when it is written, and scoped to shipped code when that
 is what it means. Both of these were sound in intent and unachievable as literals.
+
+---
+
+## Resolved by 05-09: remote keyboard input **does** reach a held-but-not-focused background tab
+
+**Raised by:** 05-08 (above). **Answered by:** 05-09, Task 3.
+
+The measurement the entry above asks for was made, with the real client binary rather than a
+synthetic wire message: the local human is in the Me view looking at their own tab, the client is
+attached to a background agent tab, and real keystrokes at the **client's** window are typed with
+`xdotool type`. The field's value read back over the control socket is `hey`.
+
+**So a held tab is typeable into while shown and blurred, and no hold had to be weakened to get
+there.** `tests/e2e/remote_view_test.py`'s real-client section carries the standing assertion
+(`CLIENT TYPED`). The entry above can be struck from `VERIFICATION.md`'s manual list.
+
+What is *not* answered, and stays a manual item: whether this holds when the local human is
+actively typing into a different tab at the same moment. The suite types into one window at a time,
+because one X display has one keyboard focus.
+
+---
+
+## Bug (shell): `screenshot` on a tab a viewer is watching silently stops that viewer's clicks landing
+
+**Raised by:** 05-09, Task 3, by a test that was written to pass and did not.
+
+**What happens.** `Shared::capture_now` takes a `hide_after` flag, and `process_pending_captures`
+passes `true` for a background tab — the tab was shown only to produce a frame, so it is hidden
+again afterwards (`crates/talaria-shell/src/app.rs`, around the `webview.hide()` in `capture_now`
+and the `webview.show()` that queues the capture). **That path does not consult
+`Tab::held_for_view`.** So an agent's tab that a remote viewer is attached to — held shown by
+05-08 precisely so Servo will answer a hit test for it — is hidden the moment anybody takes a
+screenshot of it over the control socket.
+
+**Why it is nasty rather than merely wrong.** Every visible symptom points somewhere else:
+
+- The hold count still reads 1, so the lease looks intact.
+- Frames keep arriving and their sequence keeps advancing, because `view::capture` paints and reads
+  the tab's *own* offscreen context and never asks whether the webview is shown. The viewer's
+  picture is live and correct throughout.
+- Only input stops working, and it stops **silently**: the shell logs
+  `Empty hit test result for input event, ignoring`, the wire carries no refusal, and the frame
+  header's `last_applied_input` simply stops advancing.
+
+Reproduced directly: attach a client to a background agent tab, click a link through it (navigates),
+`rpc("screenshot", tab_id=...)`, click the same link again — nothing happens, and typing into the
+page's field leaves it empty, while `reading.frame_seq` climbs past 30.
+
+**Not fixed here.** 05-09 is a client plan; its acceptance criteria require
+`git status --porcelain crates/talaria-shell/src/` to be empty, and this is server source. The
+end-to-end suite routes around it — `tab_viewport` reads the tab's size out of the page with
+`evaluate` rather than out of a screenshot, and says so at the function — so the plan's own
+assertions are unaffected.
+
+**The fix, when somebody takes it.** `hide_after` should be `tabs.view_holds(tab_id) == 0` rather
+than "this tab was not displayed", or equivalently the re-hide should go through
+`sync_visibility`/`visibility_of`, which already knows about holds and is the one place that
+decision is supposed to live. A regression test belongs next to it: screenshot a held tab, then
+assert a remote click still navigates.
+
+**Related:** the same class of bug 05-06 hit and 05-08 closed — a hidden webview answers no hit
+test. This is that bug returning through a second door.

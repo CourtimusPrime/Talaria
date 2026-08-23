@@ -93,12 +93,47 @@ And then the frame half, also DIST-02:
   * **Closing the attached tab detaches the viewer and stops the frames**
     without dropping its connection.
 
+And then the whole loop, DIST-01 and DIST-02 together — the **real client
+binary**, and this is the one section that does not speak the wire directly:
+
+  * Every section above composes wire messages by hand. This one starts
+    `talaria-client` and drives its **window** with a real pointer and real
+    keystrokes, because a synthetic wire message bypasses exactly the
+    client-side transform most likely to be wrong: the picture is fitted into
+    the client's own page area, and a pointer has to be mapped back through the
+    inverse of that fit before it means anything to a page.
+  * **The client renders its empty state before any agent tab exists**, rather
+    than a blank pane.
+  * **Attaching happens through the client's own control**, clicked for real,
+    and the server's own hold count is what proves it landed.
+  * **The server's tab viewport is unchanged by the attachment.** Read before
+    and after. The viewer adapts to the page; the page does not reflow because
+    somebody started watching, and the client window is deliberately resized to
+    a size and an aspect ratio the server's tab does not share so the transform
+    is exercised rather than accidentally being the identity.
+  * **A click lands on the element it was aimed at, in both directions**, with
+    the same decoy discipline the wire path uses — and the assertion is made
+    over the control socket, not over the frame path, so the thing under test is
+    not also the thing reporting success.
+  * **Keystrokes reach a background agent tab**, which is the case an attachment
+    makes possible: the tab is held shown and not focused, and the local human
+    is looking at their own tab throughout.
+  * **A click in the letterboxed margin sends nothing**, and neither does a
+    click on the client's own controls. Not a clamped edge position — nothing.
+  * **The picture is actually arriving**, asserted without reading a pixel: the
+    client reports the last frame sequence it applied and the last input
+    sequence the server echoed, and both are checked. "The client is connected"
+    is not "the client is showing the page".
+
 **Its honest limits.** Everything here runs on loopback under software
 rendering. That proves the protocol, the authorisation and the delta behaviour,
 and proves **nothing** about the network or about what this costs on real
 hardware: TLS termination, the tailnet `Host`, relay behaviour, the rate
 ladder and the two-machine case are 05-10's and the manual verification's, not
-this suite's. **Nothing here makes a timing claim of any kind**, deliberately:
+this suite's. In particular the real-client section below proves the *protocol
+and the authorisation* of Success Criterion 1 over loopback; **the two-machine
+run remains a manual item**, because two machines are not something a suite on
+one machine can produce. **Nothing here makes a timing claim of any kind**, deliberately:
 measuring on loopback and declaring a budget met is the pitfall the phase's
 research names by name.
 
@@ -518,11 +553,111 @@ def window_title(wid, env):
                           capture_output=True, text=True).stdout.strip()
 
 
+def tab_viewport(tab_id):
+    """The tab's own viewport in device pixels, over the control socket.
+
+    Read out of the **page** rather than out of the view channel's own attach
+    acknowledgement: this is the fact the real-client section asserts is
+    *unchanged* by an attachment, and reading it over the channel under test
+    would make the assertion circular.
+
+    Deliberately **not** ``screenshot``, which would be the obvious way to ask a
+    tab how big it is. That command's background-tab path hides the webview
+    again once it has read the pixels, without consulting the view hold count —
+    so screenshotting a tab a viewer is watching silently stops that viewer's
+    clicks from landing while its frames carry on arriving. Recorded in this
+    phase's ``deferred-items.md``; this suite routes around it rather than
+    proving the client broken by it."""
+    width, height = evaluate(
+        tab_id,
+        "[window.innerWidth * window.devicePixelRatio,"
+        " window.innerHeight * window.devicePixelRatio]",
+    )
+    return round(width), round(height)
+
+
+def client_rect(client, name):
+    """One of the real client's named controls, from its most recent frame."""
+    return harness.wait_for_client_rect(client, name)
+
+
+def client_reading(client, name):
+    """One of the real client's numeric readings, as ``(width, height)``.
+
+    The client puts these on the same geometry line its control rectangles ride,
+    under the same test hook, with the value in the rectangle's dimensions — see
+    its ``record_readings``. They are how this suite tells "the client is
+    connected" from "the client is showing the page", which is a distinction no
+    assertion about the connection can make."""
+    rect = harness.wait_for_client_rect(client, name)
+    return rect["width"], rect["height"]
+
+
+def client_screen(client, wid, point):
+    """A point in the client's logical points, as a screen coordinate."""
+    scale_factor, _ = client_reading(client, "reading.points_per_pixel")
+    origin_x, origin_y = harness.window_origin(wid, X)
+    x, y = point
+    return (str(round(origin_x + x * scale_factor)),
+            str(round(origin_y + y * scale_factor)))
+
+
+def click_client_point(client, wid, point):
+    """Drive a genuine pointer click at a point in the client's own window.
+
+    The same shape ``harness.click_rect`` uses against the server's window —
+    focus, move, click — aimed at the other process. There is no window manager
+    on the test display, so both windows sit at the origin and the client, being
+    the later of the two, is the one on top; the focus call makes that explicit
+    rather than relying on it."""
+    target = client_screen(client, wid, point)
+    subprocess.run(["xdotool", "windowfocus", "--sync", wid], env=X)
+    time.sleep(0.3)
+    subprocess.run(["xdotool", "mousemove", *target], env=X)
+    time.sleep(0.4)
+    subprocess.run(["xdotool", "click", "1"], env=X)
+    time.sleep(1.5)
+    return target
+
+
+def click_client(wid, rect):
+    """Click the centre of one of the client's own named controls."""
+    return click_client_point(CLIENT[0], wid,
+                              (rect["x"] + rect["width"] / 2,
+                               rect["y"] + rect["height"] / 2))
+
+
+def click_page(client, wid, page_point):
+    """Click a **page** coordinate, through the client's own fitted picture.
+
+    The conversion is the client's own transform read back out of its recorded
+    geometry — the fitted surface's rectangle and the page's size in its own
+    device pixels — so this aims where the client is *drawing* that page pixel.
+    That is what makes the assertion downstream a statement about the client's
+    inverse transform: if the inverse forgot the client's own interface offset,
+    or rounded the wrong way, the click would land somewhere else and the decoy
+    would name it."""
+    surface = client_rect(client, "page.surface")
+    page_width, page_height = client_reading(client, "reading.page_size")
+    x, y = page_point
+    return click_client_point(client, wid, (
+        surface["x"] + x * surface["width"] / page_width,
+        surface["y"] + y * surface["height"] / page_height,
+    ))
+
+
+# The one running client, so `click_client` can reach it without every call site
+# passing it. A list rather than a bare name because it is assigned inside the
+# suite body and read from a function defined above it.
+CLIENT = [None]
+
+
 xvfb = harness.start_xvfb()
 X = harness.x_env()
 log = None
 tal = None
 fixture = None
+client = None
 sockets = []
 try:
     log = open(SHELL_LOG, "w")
@@ -1179,8 +1314,257 @@ try:
     print(f"CLOSED: tab {watched} closing detached the viewer, released the "
           f"hold and stopped the frames, without dropping the connection")
 
+
+    # ======================================================================
+    # Success Criterion 1: the real client binary, driven by a real pointer.
+    #
+    # Everything above composes wire messages by hand. Nothing below does.
+    # ======================================================================
+
+    # --- 35. the client's empty state, before there is anything to list ---
+    # Every agent tab the sections above left behind is closed first, so "no
+    # agent has opened a tab on this server" is the *true* state rather than a
+    # pane that happens to be blank. The empty-state label is only drawn while
+    # the client is connected, which makes finding it the connection assertion
+    # too — a client that never reached the server draws the connection copy and
+    # no tab surface at all.
+    for stale in [tab["tab_id"] for tab in rpc("tabs_list")["result"]["tabs"]
+                  if tab["owner"] != "me"]:
+        rpc("tabs_close", tab_id=stale)
+    viewer.close()
+    seer.close()
+
+    client = harness.start_client(f"http://127.0.0.1:{port}", rust_log="info",
+                                  TALARIA_CLIENT_TOKEN=TOKEN)
+    CLIENT[0] = client
+    harness.wait_for_client_rect(client, "tabs.empty")
+    print("CLIENT EMPTY STATE: the real client connected and drew the "
+          "no-agent-tabs copy rather than a blank pane")
+
+    # --- 36. an agent tab appears in the real client's list ---------------
+    remote = rpc("tabs_open", client="agent-remote", url=f"{BASE}/index.html")
+    assert remote["outcome"] == "ok", remote
+    remote = remote["result"]["tab"]["tab_id"]
+    assert wait_for_url(remote, "/index.html").endswith("/index.html"), \
+        ("the client's tab never reached the fixture", tab_url(remote))
+    harness.wait_for_client_rect(client, "tabs.row.0")
+    watch = harness.wait_for_client_rect(client, "tabs.attach.0")
+    print(f"CLIENT LISTED: agent tab {remote} has a row and a Watch control in "
+          f"the real client")
+
+    # --- 37. the client's window, deliberately the wrong size -------------
+    # The transform must be exercised rather than accidentally be the identity.
+    # The client's page area is already narrower than the server's tab — its own
+    # controls take a fixed strip — and the window is resized on top of that so
+    # neither the size nor the aspect ratio matches. A letterboxed margin is then
+    # guaranteed to exist, which is what section 44 aims at.
+    client_window = None
+    for _ in range(20):
+        found = subprocess.run(["xdotool", "search", "--name", "remote view"],
+                               env=X, capture_output=True, text=True).stdout.split()
+        if found:
+            client_window = found[0]
+            break
+        time.sleep(1)
+    assert client_window, "the remote view client's window never appeared"
+    before_area = client_rect(client, "page.area")
+    subprocess.run(["xdotool", "windowsize", client_window, "1000", "700"], env=X)
+    time.sleep(2.0)
+    after_area = client_rect(client, "page.area")
+    assert (after_area["width"], after_area["height"]) \
+        != (before_area["width"], before_area["height"]), \
+        ("the client's window did not resize, so the fit transform may be the "
+         "identity and would prove nothing", before_area, after_area)
+    print(f"MISMATCHED: the client's page area is "
+          f"{after_area['width']:.0f}x{after_area['height']:.0f} points against "
+          f"a server tab this section reads below")
+
+    # --- 38. the server's tab viewport, before anybody attaches ----------
+    viewport_before = tab_viewport(remote)
+    assert view_holds(remote) == 0, "a tab was held before anyone attached"
+
+    # --- 39. attach through the client's OWN control, with a real pointer -
+    click_client(client_window, watch)
+    held = None
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if view_holds(remote) == 1:
+            held = 1
+            break
+        time.sleep(0.3)
+    assert held == 1, (
+        "a real click on the client's Watch control did not produce an "
+        "attachment on the server", view_holds(remote))
+    attached_tab, _ = client_reading(client, "reading.attached_tab")
+    assert attached_tab == float(remote), (
+        "the client believes it is watching a different tab from the one the "
+        "server is holding", attached_tab, remote)
+    print(f"CLIENT ATTACHED: a real click on the client's own control attached "
+          f"it to tab {remote}, and the server holds it once")
+
+    # --- 40. and the server's tab viewport is unchanged by it ------------
+    # The decision this whole design turns on: the viewer adapts to the page.
+    # A client that asked the server to resize the tab to its own window would
+    # make an agent's layout a function of who is looking at it.
+    viewport_after = tab_viewport(remote)
+    assert viewport_after == viewport_before, (
+        "attaching a differently-sized viewer resized the server's tab viewport",
+        viewport_before, viewport_after)
+    page_size = client_reading(client, "reading.page_size")
+    assert page_size == (float(viewport_before[0]), float(viewport_before[1])), (
+        "the client's idea of the page's size is not the tab's own viewport",
+        page_size, viewport_before)
+    print(f"VIEWPORT UNMOVED: the tab is still "
+          f"{viewport_before[0]}x{viewport_before[1]} device pixels, and the "
+          f"client adapted to it rather than the other way round")
+
+    # --- 41. a real click through the client lands on the LOWER link ------
+    # The same decoy discipline the wire path uses, aimed across a process
+    # boundary and through the client's own transform. Asserted over the control
+    # socket, so the frame path is not also the thing reporting success.
+    marks = centres(remote, scale)
+    click_page(client, client_window, marks["lower"])
+    landed = wait_for_url(remote, "/lower.html")
+    assert landed.endswith("/lower.html"), (
+        "a real pointer in the real client, aimed at the lower link, did not "
+        "reach it", landed, marks["lower"])
+    assert "/decoy-lower.html" not in landed, (
+        "the click landed one toolbar-height high, through the client", landed)
+    assert "/upper.html" not in landed, ("the click hit the upper link", landed)
+    print(f"CLIENT AIMED LOWER: a real pointer in the client's window reached "
+          f"{landed.rsplit('/', 1)[-1]}, not the decoy above it")
+
+    # --- 42. the decoy is reachable through the client too ---------------
+    assert rpc("navigate", tab_id=remote, url=f"{BASE}/index.html")["outcome"] == "ok"
+    wait_for_url(remote, "/index.html")
+    click_page(client, client_window, marks["decoy-lower"])
+    landed = wait_for_url(remote, "/decoy-lower.html")
+    assert landed.endswith("/decoy-lower.html"), (
+        "the decoy band is not reachable through the client, so 'not the decoy' "
+        "proves nothing about where the click went", landed)
+    print("CLIENT DECOY REACHABLE: aimed at deliberately, the band one "
+          "toolbar-height above the lower link is hit — so the offset "
+          "regression would be named rather than merely missed")
+
+    # --- 43. and the other direction, at the UPPER link ------------------
+    assert rpc("navigate", tab_id=remote, url=f"{BASE}/index.html")["outcome"] == "ok"
+    wait_for_url(remote, "/index.html")
+    click_page(client, client_window, marks["upper"])
+    landed = wait_for_url(remote, "/upper.html")
+    assert landed.endswith("/upper.html"), (
+        "a real pointer in the real client, aimed at the upper link, did not "
+        "reach it", landed, marks["upper"])
+    assert "/decoy-upper.html" not in landed, (
+        "the click landed one toolbar-height high, through the client", landed)
+    assert "/lower.html" not in landed, ("the click hit the lower link", landed)
+    print(f"CLIENT AIMED UPPER: a real pointer reached "
+          f"{landed.rsplit('/', 1)[-1]}, so the transform is proven in both "
+          f"directions rather than coincidentally right in one")
+
+    # --- 44. real keystrokes reach a BACKGROUND agent tab ----------------
+    # The local human has been looking at their own tab since section 23, so
+    # this tab is shown-and-blurred rather than displayed. Servo's keyboard
+    # focus is a different thing from visibility, and this is the assertion that
+    # settles whether a held tab can be typed into at all.
+    assert rpc("navigate", tab_id=remote, url=f"{BASE}/index.html")["outcome"] == "ok"
+    wait_for_url(remote, "/index.html")
+    marks = centres(remote, scale)
+    click_page(client, client_window, marks["field"])
+    time.sleep(1.0)
+    subprocess.run(["xdotool", "type", "--delay", "120", "hey"], env=X)
+    typed = None
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        typed = evaluate(remote, "document.getElementById('field').value")
+        if typed == "hey":
+            break
+        time.sleep(0.5)
+    assert typed == "hey", (
+        "real keystrokes at the client's window did not reach the background "
+        "agent tab it is attached to", typed)
+    print(f"CLIENT TYPED: the field of a background agent tab reads {typed!r} "
+          f"after real keystrokes at the client's own window")
+
+    # --- 45. a click in the letterboxed MARGIN sends nothing -------------
+    # Inside the client's page area and outside the fitted picture, which the
+    # mismatched window size guarantees exists. Not clamped to the page's edge:
+    # clamping would turn "the human aimed at the margin" into a click at the
+    # edge of the page, which is a click they did not make.
+    area = client_rect(client, "page.area")
+    surface = client_rect(client, "page.surface")
+    margin = surface["y"] - area["y"]
+    assert margin > 4.0, (
+        "there is no letterboxed margin to aim at, so this assertion would be "
+        "measuring nothing", area, surface)
+    quiet_url = tab_url(remote)
+    click_client_point(client, client_window,
+                       (surface["x"] + surface["width"] / 2, area["y"] + margin / 2))
+    time.sleep(2.5)
+    assert tab_url(remote) == quiet_url, (
+        "a click in the letterboxed margin reached the page", quiet_url,
+        tab_url(remote))
+    assert evaluate(remote, "document.getElementById('field').value") == "hey", (
+        "a click in the letterboxed margin changed the page's state")
+    print(f"MARGIN SILENT: a real click {margin:.0f} points above the picture, "
+          f"inside the client's page area, reached the server not at all")
+
+    # --- 46. and a click on the client's OWN controls sends nothing ------
+    row = client_rect(client, "tabs.row.0")
+    click_client(client_window, row)
+    time.sleep(2.5)
+    assert tab_url(remote) == quiet_url, (
+        "a click on one of the client's own controls reached the page",
+        quiet_url, tab_url(remote))
+    assert evaluate(remote, "document.getElementById('field').value") == "hey", (
+        "a click on one of the client's own controls changed the page's state")
+    assert view_holds(remote) == 1, \
+        "the client detached itself during the refusal assertions"
+    print("CLIENT CHROME: a real click on the client's own tab row reached the "
+          "page not at all, and the attachment survived it")
+
+    # --- 47. the picture is arriving, and the echo reached the click -----
+    # Without reading a pixel. The client reports what it applied and what the
+    # server echoed; a page change is forced first, because silence is the
+    # correct answer to a static page and never a symptom.
+    applied_before, _ = client_reading(client, "reading.frame_seq")
+    sent, _ = client_reading(client, "reading.input_seq")
+    assert sent > 0, "the client sent no input at all, so nothing was measured"
+    applied_after = applied_before
+    echoed = 0.0
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        evaluate(remote, "document.getElementById('lower').style.background = "
+                         "`#0${Math.floor(Math.random() * 8)}f`")
+        time.sleep(0.6)
+        applied_after, _ = client_reading(client, "reading.frame_seq")
+        echoed, _ = client_reading(client, "reading.last_applied_input")
+        if applied_after > applied_before and echoed >= sent:
+            break
+    assert applied_after > applied_before, (
+        "the client applied no further frame after the page changed, so it is "
+        "connected but not showing the page", applied_before, applied_after)
+    assert echoed >= sent, (
+        "no frame the client applied echoed an input sequence at or past the "
+        "one it sent, so it cannot tell which of its own clicks a frame "
+        "postdates", sent, echoed)
+    print(f"CLIENT SHOWING: frame sequence advanced {applied_before:.0f} -> "
+          f"{applied_after:.0f}, and the echoed input sequence {echoed:.0f} "
+          f"reached the {sent:.0f} the client had sent")
+
+    # --- 48. the local human's window never moved -------------------------
+    assert window_title(wid, X) == displayed_before, (
+        "the real client changed the displayed tab or the view mode",
+        displayed_before, window_title(wid, X))
+    print(f"LOCAL DISPLAY STILL UNMOVED: the server's own window still reads "
+          f"{displayed_before!r} after a whole remote session")
+
     print("REMOTE VIEW CHECKS PASSED")
 finally:
+    if client is not None:
+        client.terminate()
+        time.sleep(0.5)
+        client.kill()
+        client.wait()
     for ws in sockets:
         ws.close()
     if fixture is not None:

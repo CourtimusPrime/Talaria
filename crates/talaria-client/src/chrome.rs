@@ -296,7 +296,7 @@ impl Chrome {
             }
         });
 
-        record_readings(rects.as_mut(), present, sent);
+        record_readings(rects.as_mut(), present, sent, ui.ctx().pixels_per_point());
 
         if let Some(rects) = rects {
             self.chrome_rects = Some(rects);
@@ -317,7 +317,12 @@ impl Chrome {
 /// Why they are exposed at all: "the client is connected" is not "the client is
 /// showing the page", and an end-to-end suite that asserted only the former
 /// would pass against a client whose picture never arrived.
-fn record_readings(rects: Option<&mut Vec<ChromeRect>>, present: &Presenter, sent: u64) {
+fn record_readings(
+    rects: Option<&mut Vec<ChromeRect>>,
+    present: &Presenter,
+    sent: u64,
+    points_per_pixel: f32,
+) {
     let Some(rects) = rects else { return };
     let mut reading = |name: &str, width: f32, height: f32| {
         rects.push(ChromeRect { name: name.to_owned(), x: 0.0, y: 0.0, width, height });
@@ -334,6 +339,12 @@ fn record_readings(rects: Option<&mut Vec<ChromeRect>>, present: &Presenter, sen
     reading("reading.frame_seq", present.last_frame_seq() as f32, 0.0);
     reading("reading.last_applied_input", present.last_applied_input() as f32, 0.0);
     reading("reading.input_seq", sent as f32, 0.0);
+    // Every rectangle above is in logical points. A caller converting one to a
+    // screen coordinate needs this to finish the job, and it is the client's own
+    // rather than the server's — the two windows may be on displays with
+    // different scale factors, which is the ordinary case for the machine pair
+    // this whole phase exists for.
+    reading("reading.points_per_pixel", points_per_pixel, 0.0);
 }
 
 impl Default for Chrome {

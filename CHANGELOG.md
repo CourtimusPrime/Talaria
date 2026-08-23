@@ -141,6 +141,31 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Added
 
+- **The remote view client shows the page and drives it.** `talaria-client` now
+  presents the frames of the agent tab it is attached to and sends the human's
+  pointer and keyboard back into it, which is Success Criterion 1 demonstrable
+  rather than assembled: a keyframe replaces the whole surface, a delta is
+  uploaded into exactly the region its header names, a frame whose sequence does
+  not exceed the last one applied is discarded, and a payload that does not
+  decode costs one frame rather than the view. The picture is fitted into the
+  client's own page area preserving aspect ratio, and a pointer is mapped back
+  through **the inverse of that same value** — one transform, defined in
+  `present.rs` and inverted in `input.rs`, because two written separately
+  disagree the first time either changes and the disagreement is a click landing
+  somewhere the human did not aim. A position in the letterboxed margin or over
+  the client's own controls sends *nothing*, rather than a position moved to the
+  page's nearest edge, which would be a click nobody made at the edge of the page
+  where a confirm button lives. The rounding is a floor, so a pointer anywhere
+  within the screen pixel showing page pixel *n* means *n*. **Nothing asks the
+  server to resize a tab**: the viewer adapts to the page, because the
+  alternative reflows an agent's layout because somebody started watching it. The
+  end-to-end suite drives the real client binary with a real pointer and real
+  keystrokes at a deliberately mismatched window size and asserts the effect on
+  the server over the control socket — including that a background agent tab can
+  be typed into, which 05-08 left as an open question
+  (`crates/talaria-client/src/present.rs`, `crates/talaria-client/src/input.rs`,
+  `tests/e2e/remote_view_test.py`).
+
 - **A remote viewer now receives pixels: a keyframe on attach, only what changed
   afterwards, and nothing at all while the page is static.** Attaching to a tab
   takes a *visibility hold* on it (`crates/talaria-shell/src/tabs.rs`) — a count
