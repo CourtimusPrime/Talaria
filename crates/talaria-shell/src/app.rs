@@ -992,7 +992,7 @@ impl ApplicationHandler<AppEvent> for App {
         // `Copy`. See `settings::RemoteAccessConfig::advertised_url`.
         let configured = state.settings.borrow().remote_access.clone();
         if configured.enabled {
-            start_remote_listener(&state, configured.port);
+            start_remote_listener(&state, &configured);
         }
 
         state.open_tab(initial_url.clone(), TabOwner::Me);
@@ -1403,7 +1403,7 @@ fn forward_wheel(state: &Shared, delta: MouseScrollDelta) {
 /// (T-04-03-03). The state goes to `Starting` here rather than to `Bound`:
 /// only the listener's own event may claim an address, because only the
 /// listener knows one.
-fn start_remote_listener(state: &Rc<Shared>, port: u16) {
+fn start_remote_listener(state: &Rc<Shared>, remote: &crate::settings::RemoteAccessConfig) {
     if state.remote.borrow().is_live() {
         return;
     }
@@ -1418,7 +1418,11 @@ fn start_remote_listener(state: &Rc<Shared>, port: u16) {
     // The registry comes back empty and fills itself in when the bind lands —
     // it is the listener that knows what state a revoke has to reach, and it
     // does not know until it has an address.
-    let (shutdown, streams) = crate::http::spawn(proxy, agents, port);
+    // The advertised origin travels with the port because both are facts the
+    // listener needs before it binds, and both come from configuration — never
+    // from a request. See `settings::RemoteAccessConfig::advertised_url`.
+    let (shutdown, streams) =
+        crate::http::spawn(proxy, agents, remote.port, remote.advertised_url.clone());
     *state.remote_shutdown.borrow_mut() = Some(shutdown);
     *state.remote_streams.borrow_mut() = streams;
     state.window.request_redraw();
@@ -1683,7 +1687,7 @@ fn apply_ui_actions(state: &Rc<Shared>, actions: Vec<UiAction>) {
                     // `start_remote_listener` is a no-op while one is already
                     // bound or starting, so a second click during a bind in
                     // flight cannot produce a second listener (T-04-03-03).
-                    true => start_remote_listener(state, configured.port),
+                    true => start_remote_listener(state, &configured),
                     false => {
                         // Taken, not cloned: the handle is consumed, so the
                         // same listener cannot be shut down twice. In-flight

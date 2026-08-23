@@ -18,10 +18,21 @@
 //! are load-bearing rather than stylistic: the listener is **off by default**
 //! (no configuration means no thread and no bound port at all — an absence,
 //! not a flag consulted per request), and when on it binds [`BIND_HOST`] and
-//! nothing else. A non-loopback bind is Phase 5's, and must arrive with TLS:
-//! OAuth 2.1 requires HTTPS for authorization-server endpoints *with a
-//! loopback exception*, which is what makes shipping without TLS here
-//! conformant rather than merely unfinished.
+//! nothing else. OAuth 2.1 requires the secure scheme for authorization-server
+//! endpoints *with a loopback exception*, which is what made shipping Phase 4
+//! without transport security conformant rather than merely unfinished.
+//!
+//! **Phase 5 kept the bind exactly where it is and put transport security in
+//! front of it.** D-05-03: a reverse proxy the operating system's own daemon
+//! runs terminates it and forwards to loopback, which is the one proxy target
+//! that daemon supports and exactly what this listener already binds. So the
+//! loopback-only property is now *permanent* rather than provisional, this
+//! process owns nothing about renewal, and what changes instead is that the
+//! origin a client reaches this browser at stops being the address this
+//! listener bound. That second fact is [`crate::oauth::AdvertisedIdentity`],
+//! it comes from configuration and never from a request header, and it is what
+//! the host allowlist and [`refuse_page_originated`] admit alongside the bound
+//! address.
 //!
 //! **The token is now real.** 04-03 shipped this listener behind an interim
 //! provider that refused every credential unconditionally, so the transport
@@ -101,7 +112,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::app::AppEvent;
 use crate::control::{command_timeout_secs, next_session_id, AgentRequest};
-use crate::oauth::{ConsentRaiser, SharedAgents, TalariaAuth};
+use crate::oauth::{AdvertisedIdentity, ConsentRaiser, SharedAgents, TalariaAuth};
 
 /// The only address this listener ever binds.
 ///
@@ -201,7 +212,11 @@ impl ShutdownHandle {
 
 /// The path a synthetic internal request names, and the only path the SDK's
 /// Streamable-HTTP handler serves.
-const MCP_PATH: &str = "/mcp";
+///
+/// `pub(crate)` so that [`crate::oauth::canonical_resource`] appends *this*
+/// path rather than a second spelling of it: the canonical resource identifier
+/// is the MCP endpoint's own URL, and it is compared byte for byte.
+pub(crate) const MCP_PATH: &str = "/mcp";
 
 /// The legacy HTTP-plus-event-stream transport's path.
 ///
@@ -865,6 +880,7 @@ pub fn spawn(
     proxy: EventLoopProxy<AppEvent>,
     agents: SharedAgents,
     port: u16,
+    advertised: Option<String>,
 ) -> (ShutdownHandle, StreamRegistry) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let streams = StreamRegistry::default();
@@ -885,7 +901,7 @@ pub fn spawn(
                     return;
                 },
             };
-            runtime.block_on(serve(proxy, agents, port, shutdown_rx, installed));
+            runtime.block_on(serve(proxy, agents, port, advertised, shutdown_rx, installed));
         });
     if let Err(error) = thread {
         log::error!("remote access thread could not be spawned: {error}");
@@ -898,6 +914,7 @@ async fn serve(
     proxy: EventLoopProxy<AppEvent>,
     agents: SharedAgents,
     port: u16,
+    advertised: Option<String>,
     shutdown: oneshot::Receiver<()>,
     streams: StreamRegistry,
 ) {
@@ -952,15 +969,28 @@ async fn serve(
     // owner label a tool call carries is now the **verified** `client_id` from
     // the presented token rather than a name the peer typed. See
     // [`Handler::handle_call_tool_request`].
+    // **The two facts, resolved once, here — the one place that knows both.**
+    // `bound` is the socket: what was actually bound, what the chrome shows,
+    // and what a local client addresses. `identity` is what this browser
+    // *publishes about itself*, which is the same string only when nothing
+    // fronts the listener. Everything downstream takes whichever of the two it
+    // actually means, and neither is ever re-derived from a request.
+    let identity = AdvertisedIdentity::new(&bound, advertised.as_deref());
     let sink = EventLoopSink { proxy: proxy.clone(), session_id: next_session_id() };
     let connections = Arc::new(Connections::default());
     let (app, directory) =
-        build_router(proxy.clone(), sink, agents, &bound, Arc::clone(&connections));
+        build_router(proxy.clone(), sink, agents, &bound, &identity, Arc::clone(&connections));
     // Installed before the first connection is accepted, so there is no window
     // in which a session exists and a revoke cannot reach it.
     streams.install(Arc::clone(&directory), tokio::runtime::Handle::current());
 
-    log::info!("remote access listening at http://{bound}/mcp");
+    // The socket, not the advertised identity: this line is a statement about
+    // what this process bound, and a log that named an origin the operator
+    // configured would stop being evidence of what actually happened.
+    log::info!("remote access listening at {BIND_HOST}:{port}{MCP_PATH} (bound {bound})");
+    if identity.authority() != bound {
+        log::info!("remote access is advertised as {}", identity.origin());
+    }
     let _ = proxy.send_event(AppEvent::RemoteListenerBound { addr: bound.clone() });
 
     // Two clocks, because `axum`'s graceful shutdown waits for every open
@@ -1046,6 +1076,7 @@ fn build_router(
     sink: EventLoopSink,
     agents: SharedAgents,
     bound: &str,
+    identity: &AdvertisedIdentity,
     connections: Arc<Connections>,
 ) -> (rust_mcp_axum::axum::Router, Arc<dyn SessionDirectory>) {
     // The real provider. 04-03's interim refuse-everything one was deleted
@@ -1062,7 +1093,10 @@ fn build_router(
     let raise: ConsentRaiser = Arc::new(move |request| {
         proxy.send_event(AppEvent::ConsentRequested(request)).map_err(|_| ())
     });
-    let auth: Arc<dyn AuthProvider> = Arc::new(TalariaAuth::new(agents, raise, bound));
+    let auth: Arc<dyn AuthProvider> = Arc::new(TalariaAuth::new(agents, raise, identity));
+    // The two names this server answers to, enumerated once and shared by both
+    // layers that check a `Host`. See [`admitted_hosts`].
+    let admitted: Arc<[String]> = admitted_hosts(bound, identity).into();
     let state = Arc::new(McpAppState {
         session_store: Arc::new(InMemorySessionStore::default()),
         // `UuidGenerator` with one addition; see [`RecordingIds`] for why the
@@ -1089,9 +1123,9 @@ fn build_router(
     // 1. the `Origin` refusal, because a page-originated request should be
     //    turned away before anything else looks at it;
     // 2. the SDK's host validation, with `allowed_hosts` set **explicitly**
-    //    from the address actually bound rather than inferred from a
-    //    configured one — this is on top of the refusal above, not instead of
-    //    it (T-2);
+    //    from the address actually bound and the origin this browser
+    //    advertises, rather than inferred from a request — this is on top of
+    //    the refusal above, not instead of it (T-2);
     // 3. the auth middleware, which is what returns the 401 and builds the
     //    `WWW-Authenticate` challenge from the provider's answer;
     // 4. a read-only note of the identity the middleware above verified,
@@ -1100,7 +1134,7 @@ fn build_router(
     //    exists to work around.
     let middlewares: Vec<Arc<dyn Middleware>> = vec![
         Arc::new(RefuseOriginHeader),
-        Arc::new(DnsRebindProtector::new(Some(vec![bound.to_owned()]), None)),
+        Arc::new(DnsRebindProtector::new(Some(admitted.to_vec()), None)),
         Arc::new(AuthMiddleware::new(auth.clone())),
         Arc::new(NoteVerifiedIdentity),
     ];
@@ -1161,10 +1195,39 @@ fn build_router(
         // refused twice, and a future SDK that stopped composing the chain
         // would cost this browser nothing.
         .layer(rust_mcp_axum::axum::middleware::from_fn_with_state(
-            Arc::<str>::from(bound),
+            admitted,
             refuse_page_originated,
         ));
     (router, directory)
+}
+
+/// The complete set of authorities this server answers to: the address it
+/// bound, and the origin it advertises.
+///
+/// **Two entries, and never more.** The set is *enumerated from configuration*
+/// before the first connection is accepted. Nothing grows it, and in
+/// particular no request does — see [`crate::oauth::AdvertisedIdentity`] for
+/// why reading the advertised host off a request header would be threat
+/// T-05-09 rather than a shortcut.
+///
+/// Deduplicated when the two coincide, which is the no-advertised-URL case and
+/// therefore the default: with nothing configured this returns exactly the
+/// one-element list Phase 4 built, so the default path did not move.
+///
+/// The second entry is what makes a proxied request admissible at all.
+/// `05-01-SPIKE.md` measured one arriving with `Host: <tailnet-name>:<port>` —
+/// the client's own name and the proxy's port, not the loopback target — so a
+/// server that admitted only the bound address would refuse every one of them.
+/// Had the proxy rewritten `Host` to the loopback target instead, this entry
+/// would be unnecessary for admission and still correct to carry: what a proxy
+/// rewrites is not a property this browser controls, and admitting the name
+/// this browser itself publishes is not a widening.
+fn admitted_hosts(bound: &str, identity: &AdvertisedIdentity) -> Vec<String> {
+    let mut hosts = vec![bound.to_owned()];
+    if !identity.authority().eq_ignore_ascii_case(bound) {
+        hosts.push(identity.authority().to_owned());
+    }
+    hosts
 }
 
 /// Refuse anything page-originated or misaddressed, on every route (T-2).
@@ -1176,12 +1239,28 @@ fn build_router(
 ///    is a program, and programs do not send one. A page always does. See
 ///    [`RefuseOriginHeader`], whose reasoning this shares and whose place in
 ///    the SDK chain it does not take.
-/// 2. **Does `Host` name the address actually bound?** This is the DNS
-///    rebinding answer: a page served from `http://rebind.evil:PORT/` whose A
-///    record has been re-pointed at loopback is *same-origin* with this server
-///    as far as the browser is concerned, so it can read every response it
-///    gets — but it cannot change the `Host` header the browser sends, and
-///    that header still says `rebind.evil:PORT`.
+/// 2. **Does `Host` name one of the two authorities this server answers to?**
+///    This is the DNS rebinding answer: a page served from
+///    `http://rebind.evil:PORT/` whose A record has been re-pointed at
+///    loopback is *same-origin* with this server as far as the browser is
+///    concerned, so it can read every response it gets — but it cannot change
+///    the `Host` header the browser sends, and that header still says
+///    `rebind.evil:PORT`.
+///
+/// **There are two admitted names rather than one, and the reason is
+/// D-05-03.** A reverse proxy in front of a loopback listener means the
+/// address a client addresses and the address this process bound are
+/// legitimately different strings; refusing the former would refuse every
+/// proxied request, which is exactly what this server would do today
+/// (`05-01-SPIKE.md` measured the `Host` a proxied request carries). So the
+/// set is the bound address plus the advertised authority, deduplicated when
+/// they coincide.
+///
+/// **The set is enumerated from configuration, before the first connection is
+/// accepted.** It is never grown by a request, and the header compared below
+/// is never a *source* for it — only ever the thing being compared. Reading
+/// the advertised host off `Host` would let a local page choose the identity
+/// this browser publishes, which is threat T-05-09. See [`admitted_hosts`].
 ///
 /// A missing `Host` is a refusal, not a pass, which is the SDK's rule too.
 /// The one consequence worth naming: a client speaking HTTP/2 with prior
@@ -1196,7 +1275,9 @@ fn build_router(
 /// distinguishes "wrong Host" from "had an Origin", and the log line names the
 /// path and no attacker-chosen value.
 async fn refuse_page_originated(
-    rust_mcp_axum::axum::extract::State(bound): rust_mcp_axum::axum::extract::State<Arc<str>>,
+    rust_mcp_axum::axum::extract::State(admitted): rust_mcp_axum::axum::extract::State<
+        Arc<[String]>,
+    >,
     request: rust_mcp_axum::axum::extract::Request,
     next: rust_mcp_axum::axum::middleware::Next,
 ) -> rust_mcp_axum::axum::response::Response {
@@ -1205,7 +1286,9 @@ async fn refuse_page_originated(
         let addressed_here = headers
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|host| host.eq_ignore_ascii_case(&bound));
+            .is_some_and(|host| {
+                admitted.iter().any(|admitted| host.eq_ignore_ascii_case(admitted))
+            });
         if headers.contains_key(header::ORIGIN) || !addressed_here {
             log::debug!(
                 "remote access refused a page-originated or misaddressed request to {}",
@@ -1524,6 +1607,11 @@ impl Middleware for RefuseOriginHeader {
 mod tests {
     use super::*;
 
+    /// The origin `05-01-SPIKE.md` measured a Serve-proxied request actually
+    /// arriving at — the tailnet name *and the proxy's own port*, which is why
+    /// an advertised identity has to be able to carry a port at all.
+    const ADVERTISED: &str = "https://thinkpad.tailcd3cc6.ts.net:8449";
+
     /// A session directory with no server behind it.
     ///
     /// The point of the trait: every property worth asserting about
@@ -1701,6 +1789,58 @@ mod tests {
             assert!(
                 !is_public_discovery(path),
                 "{path} is exempt from the Origin and Host refusal"
+            );
+        }
+        // And the set of names those checked routes admit: exactly two when an
+        // identity is advertised, exactly one when none is, and never a third.
+        let bound = "127.0.0.1:8779";
+        let advertised = AdvertisedIdentity::new(bound, Some(ADVERTISED));
+        let admitted = admitted_hosts(bound, &advertised);
+        assert_eq!(
+            admitted,
+            vec![bound.to_owned(), "thinkpad.tailcd3cc6.ts.net:8449".to_owned()],
+            "the host allowlist is not the two names the advertised identity implies"
+        );
+        // A third plausible name — the same tailnet node on the port an
+        // unrelated service is already served at — is not in the set.
+        assert!(
+            !admitted.iter().any(|name| name == "thinkpad.tailcd3cc6.ts.net:8443"),
+            "a name nobody configured is admitted: {admitted:?}"
+        );
+    }
+
+    /// **The zero-regression half.** With nothing advertised, the allowlist is
+    /// exactly the one entry Phase 4 built — deduplicated rather than doubled,
+    /// so the default path did not move.
+    #[test]
+    fn with_no_advertised_url_the_host_allowlist_is_the_one_bound_address() {
+        let bound = "127.0.0.1:8779";
+        let admitted = admitted_hosts(bound, &AdvertisedIdentity::new(bound, None));
+        assert_eq!(admitted, vec![bound.to_owned()]);
+    }
+
+    /// The allowlist is enumerated from configuration and closed. Neither the
+    /// tailnet name without its Serve port, nor a rebound DNS name, nor a
+    /// second tailnet node is in it — which is what stands between a rebound
+    /// name and the authorization server (T-05-09).
+    #[test]
+    fn the_host_allowlist_admits_two_names_and_refuses_every_other() {
+        let bound = "127.0.0.1:8779";
+        let admitted = admitted_hosts(bound, &AdvertisedIdentity::new(bound, Some(ADVERTISED)));
+        assert_eq!(admitted.len(), 2);
+        for refused in [
+            // The advertised name without the proxy's port: a different
+            // authority, and the spike measured the port as present.
+            "thinkpad.tailcd3cc6.ts.net",
+            "thinkpad.tailcd3cc6.ts.net:8443",
+            "rebind.evil:8779",
+            "localhost:8779",
+            "127.0.0.1:8780",
+            "",
+        ] {
+            assert!(
+                !admitted.iter().any(|name| name.eq_ignore_ascii_case(refused)),
+                "{refused:?} is admitted"
             );
         }
     }

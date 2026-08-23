@@ -212,6 +212,13 @@ def write_agents(talaria_dir, client_id, client_name, token, **kwargs):
     it is about to bind (``http://127.0.0.1:PORT/mcp``), because verification
     compares it byte for byte — see ``oauth::canonical_resource``.
 
+    **When a suite configures an advertised URL** (``write_config`` with
+    ``remote_access.advertised_url``), that identifier is built from *that*
+    origin and not from the loopback address — ``https://NAME:PORT/mcp`` — and
+    the audience seeded here must match it byte for byte too, because the
+    advertised spelling is then the only canonical one. No existing suite
+    configures one, so no existing suite changes.
+
     ``extra_tokens`` takes a list of ``(token, audience)`` pairs for the cases
     a suite needs a *second* credential for, such as one minted for another
     resource server. They belong to the same client and their own family.

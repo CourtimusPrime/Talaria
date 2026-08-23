@@ -80,6 +80,8 @@ use rust_mcp_sdk::mcp_http::http::{
 use rust_mcp_sdk::mcp_http::{GenericBody, GenericBodyExt, McpAppState, McpHttpError};
 use url::Url;
 
+use crate::http::MCP_PATH;
+
 use crate::agents::{
     digest_of, digests_match, Agents, RefreshOutcome, DEFAULT_ACCESS_TTL_MS,
     DEFAULT_REFRESH_TTL_MS,
@@ -126,7 +128,100 @@ const DIGEST_PREFIX_LEN: usize = 8;
 /// records, with **no `await` inside it**. An async mutex would invite one.
 pub type SharedAgents = Arc<Mutex<Agents>>;
 
-/// The canonical resource identifier for a listener bound at `bound`.
+/// The scheme a loopback listener publishes about itself when nothing fronts
+/// it.
+///
+/// A constant rather than a literal at each site, so that "which scheme does
+/// this browser publish" has one answer and a `grep` for a hardcoded one finds
+/// nothing. Which of the two applies is [`AdvertisedIdentity`]'s decision and
+/// is taken once.
+const LOOPBACK_SCHEME: &str = "http";
+
+/// **The one identity this browser publishes about itself: a scheme and an
+/// authority, together.**
+///
+/// Every security-critical string this module produces — the RFC 8707
+/// canonical resource identifier, the RFC 9728 metadata URL, the RFC 8414
+/// issuer, the four endpoint URLs built from it, the authorization server the
+/// protected-resource document names, and (in [`crate::http`]) the host
+/// allowlist and the outermost layer's `Host` comparison — derives from this
+/// one value. That is not tidiness. `canonical_resource`'s doc comment below
+/// says why: those strings are compared byte for byte, and four independent
+/// constructions would be four places to disagree.
+///
+/// **There are now two facts where there was one**, and conflating them is the
+/// bug this type exists to make impossible:
+///
+/// - *the address the listener bound* — always loopback, read off the socket
+///   itself, and what every surface shows the human about the listener's own
+///   state;
+/// - *the origin clients actually reach this browser at* — which, when a
+///   reverse proxy terminates transport security in front of that loopback
+///   listener (D-05-03), is a different string entirely. `05-01-SPIKE.md`
+///   measured a proxied request arriving with the tailnet name and the proxy's
+///   own port in its `Host`, so a browser that published the bound address
+///   would refuse every proxied request and hand every client a URL it cannot
+///   reach.
+///
+/// **Its only producer is the settings loader.** It is never derived from a
+/// request header. Reading the advertised host off `Host` is free, always
+/// correct-looking, and threat T-05-09: a local page could then choose the
+/// authorization server this browser points a client at. See
+/// [`crate::settings::RemoteAccessConfig::advertised_url`].
+///
+/// With nothing advertised it falls back to the bound address under
+/// [`LOOPBACK_SCHEME`], which is byte-for-byte what Phase 4 published — so the
+/// absent case needs no branch at any use site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvertisedIdentity {
+    /// Scheme and authority, no trailing slash: the base every published URL
+    /// is appended to.
+    origin: String,
+    /// The authority alone (`host` or `host:port`), which is what a `Host`
+    /// header carries and what a host allowlist is written in.
+    authority: String,
+}
+
+impl AdvertisedIdentity {
+    /// The identity a listener bound at `bound` publishes, given whatever
+    /// `advertised` the configuration named.
+    ///
+    /// `advertised` has already been through
+    /// [`crate::settings::is_valid_advertised_url`], which is why the split
+    /// below can be a split rather than a parse: a value that reached here is
+    /// a scheme, `://`, and an authority with nothing after it.
+    pub fn new(bound: &str, advertised: Option<&str>) -> Self {
+        match advertised {
+            Some(origin) => Self {
+                origin: origin.to_owned(),
+                authority: origin
+                    .split_once("://")
+                    .map_or(origin, |(_scheme, authority)| authority)
+                    .to_owned(),
+            },
+            // Byte-for-byte what this browser published before an advertised
+            // identity was expressible.
+            None => Self {
+                origin: format!("{LOOPBACK_SCHEME}://{bound}"),
+                authority: bound.to_owned(),
+            },
+        }
+    }
+
+    /// Scheme and authority, with no trailing slash — the base for every URL
+    /// this browser publishes about itself.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// The authority alone: what a client's `Host` header carries when it
+    /// reaches this browser at this identity.
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+}
+
+/// The canonical resource identifier for a browser reached at `identity`.
 ///
 /// RFC 8707 audience validation needs exactly one string that names this
 /// server, and it is compared **byte for byte** — so this function is the only
@@ -135,13 +230,19 @@ pub type SharedAgents = Arc<Mutex<Agents>>;
 /// (`127.0.0.1` against `localhost`, a trailing slash against none), which
 /// presents as tokens that were issued and then mysteriously never worked.
 ///
+/// **That reason now covers a second spelling.** Since D-05-03 the address
+/// this listener *bound* and the origin a client *reaches it at* are two
+/// different facts, and a browser that let them disagree would issue tokens
+/// that validate against one and mysteriously never work against the other.
+/// [`AdvertisedIdentity`] is what makes them one value; this function is what
+/// keeps them one string.
+///
 /// It is the MCP endpoint's own URL, which is what the specification names as
-/// the canonical URI of an MCP server, and it is derived from the address the
-/// listener *actually bound* — `Shared::remote`'s single source of truth —
-/// rather than from the configured port, so the metadata document, the token
-/// records and the URL a human was given cannot disagree.
-pub fn canonical_resource(bound: &str) -> String {
-    format!("http://{bound}/mcp")
+/// the canonical URI of an MCP server, and the identity it is built from is
+/// resolved once where the listener knows both facts — so the metadata
+/// document, the token records and the URL a human was given cannot disagree.
+pub fn canonical_resource(identity: &AdvertisedIdentity) -> String {
+    format!("{}{MCP_PATH}", identity.origin())
 }
 
 /// The absolute URL of the protected-resource metadata document.
@@ -149,8 +250,8 @@ pub fn canonical_resource(bound: &str) -> String {
 /// Absolute, because it goes into the `WWW-Authenticate` challenge on a `401`
 /// and a client that only knows the endpoint URL has to be able to follow it
 /// without guessing a base.
-pub fn metadata_url(bound: &str) -> String {
-    format!("http://{bound}{OAUTH_PROTECTED_RESOURCE_BASE}")
+pub fn metadata_url(identity: &AdvertisedIdentity) -> String {
+    format!("{}{OAUTH_PROTECTED_RESOURCE_BASE}", identity.origin())
 }
 
 /// A short, non-reversible way for a log line to name a token.
@@ -1080,9 +1181,10 @@ fn random_request_id() -> u64 {
 /// Talaria's OAuth provider: the resource server today, and in 04-06 the
 /// authorization server beside it.
 ///
-/// Every derived string is built once, at construction, from the address the
-/// listener actually bound — see [`canonical_resource`] for why a second
-/// construction site would be a bug rather than a duplication.
+/// Every derived string is built once, at construction, from the one
+/// [`AdvertisedIdentity`] the listener resolved — see [`canonical_resource`]
+/// for why a second construction site would be a bug rather than a
+/// duplication.
 pub struct TalariaAuth {
     /// The live store. Read on every verification and never copied out of.
     agents: SharedAgents,
@@ -1090,12 +1192,11 @@ pub struct TalariaAuth {
     resource: String,
     /// The absolute URL of the metadata document, for the `401` challenge.
     metadata_url: String,
-    /// The `host:port` this listener bound, which is also the issuer identity
-    /// the metadata document names as its authorization server.
-    bound: String,
-    /// This server's issuer identifier, `http://{bound}` — the value the RFC
-    /// 8414 document names as `issuer` and the value the RFC 9207 `iss`
-    /// parameter carries. Built once so the two cannot disagree.
+    /// This server's issuer identifier — the advertised origin itself, which
+    /// is the value the RFC 8414 document names as `issuer`, the value the RFC
+    /// 9207 `iss` parameter carries, and the authorization server the
+    /// protected-resource document names. Built once, from
+    /// [`AdvertisedIdentity`], so those three cannot disagree.
     issuer: String,
     /// The endpoints this provider declares. The SDK builds its auth router by
     /// folding over these keys, so an entry here *is* a route.
@@ -1116,8 +1217,17 @@ pub struct TalariaAuth {
 }
 
 impl TalariaAuth {
-    /// Build a provider for a listener bound at `bound` (`host:port`).
-    pub fn new(agents: SharedAgents, raise_consent: ConsentRaiser, bound: &str) -> Self {
+    /// Build a provider for a browser reached at `identity`.
+    ///
+    /// Takes the resolved identity rather than a bare address, because every
+    /// string below is one this browser *publishes* — and what it publishes is
+    /// the origin a client reaches it at, which since D-05-03 need not be the
+    /// address it bound. See [`AdvertisedIdentity`].
+    pub fn new(
+        agents: SharedAgents,
+        raise_consent: ConsentRaiser,
+        identity: &AdvertisedIdentity,
+    ) -> Self {
         // The resource server's document, and the authorization server this
         // browser co-hosts: its metadata, registration, authorization and
         // token endpoints, plus the path the holding page refreshes to.
@@ -1157,10 +1267,13 @@ impl TalariaAuth {
         endpoints.insert(REVOCATION_PATH.to_owned(), OauthEndpoint::RevocationEndpoint);
         Self {
             agents,
-            resource: canonical_resource(bound),
-            metadata_url: metadata_url(bound),
-            bound: bound.to_owned(),
-            issuer: format!("http://{bound}"),
+            resource: canonical_resource(identity),
+            metadata_url: metadata_url(identity),
+            // **Not a second construction.** The issuer *is* the advertised
+            // origin — the same value `canonical_resource` and `metadata_url`
+            // above were handed — so there is nothing here to disagree with
+            // them about.
+            issuer: identity.origin().to_owned(),
             endpoints,
             scopes: vec![TALARIA_SCOPE.to_owned()],
             consent: SharedConsent::default(),
@@ -1281,8 +1394,11 @@ impl TalariaAuth {
             // and the one every token is checked against.
             "resource": self.resource,
             // Talaria is its own authorization server. 04-06 publishes the
-            // RFC 8414 document at this issuer.
-            "authorization_servers": [format!("http://{}", self.bound)],
+            // RFC 8414 document at this issuer — and it is `self.issuer`
+            // rather than a string built again here, because a client that
+            // followed this key to an address the RFC 8414 document does not
+            // call itself would be entitled to reject the pair.
+            "authorization_servers": [self.issuer],
             // Header only. The specification forbids access tokens in query
             // strings, and saying so here is how a conformant client knows not
             // to try — a URL is logged, cached and sent in a `Referer`.
@@ -1300,10 +1416,11 @@ impl TalariaAuth {
 
     /// The metadata document as a response: `200`, JSON, and uncacheable.
     ///
-    /// `no-store` because the document names the address this listener is
-    /// bound to, and that changes when the human switches remote access off
-    /// and on again. A cached copy pointing at a port nothing is listening on
-    /// would send a client to a closed door with no way to tell it was stale.
+    /// `no-store` because the document names the origin this browser is
+    /// reachable at, and that changes when the human switches remote access
+    /// off and on again — or when whatever fronts it moves. A cached copy
+    /// pointing at a port nothing is listening on would send a client to a
+    /// closed door with no way to tell it was stale.
     fn metadata_response(&self) -> Response<GenericBody> {
         let mut headers = HeaderMap::new();
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -2189,6 +2306,22 @@ mod tests {
     const BOUND: &str = "127.0.0.1:40501";
     const OTHER: &str = "127.0.0.1:40502";
 
+    /// The tailnet name and proxy port `05-01-SPIKE.md` measured a proxied
+    /// request actually arriving with. Used wherever a test needs an
+    /// advertised identity that is *not* the bound address.
+    const ADVERTISED: &str = "https://thinkpad.tailcd3cc6.ts.net:8449";
+
+    /// The identity a listener bound at `bound` publishes when nothing fronts
+    /// it — the default case, and the one every pre-existing test here means.
+    fn identity(bound: &str) -> AdvertisedIdentity {
+        AdvertisedIdentity::new(bound, None)
+    }
+
+    /// The identity that same listener publishes when a reverse proxy does.
+    fn fronted(bound: &str) -> AdvertisedIdentity {
+        AdvertisedIdentity::new(bound, Some(ADVERTISED))
+    }
+
     /// The `agents.json` path idiom `agents.rs` and `bookmarks.rs` share:
     /// a uniquely-named file in the temp directory that removes itself, and
     /// its `.tmp` staging sibling, when the test ends. `tempfile` is not a
@@ -2231,14 +2364,14 @@ mod tests {
             .authorize(
                 &client.client_id,
                 NOW,
-                &canonical_resource(BOUND),
+                &canonical_resource(&identity(BOUND)),
                 TALARIA_SCOPE,
                 60_000,
                 600_000,
             )
             .expect("authorize the fixture client");
         let agents: SharedAgents = Arc::new(Mutex::new(store));
-        let auth = TalariaAuth::new(agents.clone(), Chrome::default().raiser(), BOUND);
+        let auth = TalariaAuth::new(agents.clone(), Chrome::default().raiser(), &identity(BOUND));
         (auth, agents, client.client_id, access)
     }
 
@@ -2285,7 +2418,7 @@ mod tests {
         let info = auth.verify(&token, NOW).expect("a live token verifies");
         assert_eq!(info.client_id.as_deref(), Some(client_id.as_str()));
         assert_eq!(info.scopes, Some(vec![TALARIA_SCOPE.to_owned()]));
-        assert_eq!(info.audience, Some(Audience::Single(canonical_resource(BOUND))));
+        assert_eq!(info.audience, Some(Audience::Single(canonical_resource(&identity(BOUND)))));
         assert_eq!(info.token_unique_id, digest_of(&token));
         assert!(!info.token_unique_id.contains(&token), "the identity carries the token itself");
         // Never `None`: the SDK's middleware rejects an `AuthInfo` with no
@@ -2324,7 +2457,7 @@ mod tests {
                 "some-family",
                 NOW + 600_000,
                 // Minted for a different resource server entirely.
-                &canonical_resource(OTHER),
+                &canonical_resource(&identity(OTHER)),
                 TALARIA_SCOPE,
             );
         let error = auth.verify(&foreign, NOW).unwrap_err();
@@ -2332,7 +2465,7 @@ mod tests {
         // And the same token verifies against a provider whose canonical
         // identifier *is* that other one — so this test is about the audience
         // check and not about the token being broken.
-        let elsewhere = TalariaAuth::new(agents.clone(), Chrome::default().raiser(), OTHER);
+        let elsewhere = TalariaAuth::new(agents.clone(), Chrome::default().raiser(), &identity(OTHER));
         assert!(elsewhere.verify(&foreign, NOW).is_ok());
     }
 
@@ -2345,7 +2478,7 @@ mod tests {
             &client_id,
             "some-family",
             NOW + 600_000,
-            &canonical_resource(OTHER),
+            &canonical_resource(&identity(OTHER)),
             TALARIA_SCOPE,
         );
         let unknown = message(&auth.verify("no-such-token", NOW).unwrap_err());
@@ -2377,7 +2510,7 @@ mod tests {
             &client_id,
             "some-family",
             NOW + 600_000,
-            &canonical_resource(BOUND),
+            &canonical_resource(&identity(BOUND)),
             TALARIA_SCOPE,
         );
         let error = auth.verify(&refresh, NOW).unwrap_err();
@@ -2424,12 +2557,12 @@ mod tests {
         let temp = TempPath::new();
         let (auth, _agents, _client_id, _token) = fixture(temp.path());
         let document = auth.metadata_document();
-        assert_eq!(document["resource"], serde_json::json!(canonical_resource(BOUND)));
+        assert_eq!(document["resource"], serde_json::json!(canonical_resource(&identity(BOUND))));
         let servers = document["authorization_servers"]
             .as_array()
             .expect("authorization_servers is an array")
             .clone();
-        assert_eq!(servers, vec![serde_json::json!(format!("http://{BOUND}"))]);
+        assert_eq!(servers, vec![serde_json::json!(identity(BOUND).origin().to_owned())]);
         assert_eq!(document["bearer_methods_supported"], serde_json::json!(["header"]));
         assert_eq!(document["scopes_supported"], serde_json::json!([TALARIA_SCOPE]));
     }
@@ -2483,12 +2616,12 @@ mod tests {
         let temp = TempPath::new();
         let (auth, _agents, _client_id, _token) = fixture(temp.path());
         let url = auth.protected_resource_metadata_url().expect("a metadata URL");
-        assert_eq!(url, format!("http://{BOUND}{OAUTH_PROTECTED_RESOURCE_BASE}"));
+        assert_eq!(url, metadata_url(&identity(BOUND)));
         assert!(url.starts_with("http://"), "{url}");
         // The pointer and the route agree, which is the whole point of the
         // challenge: a client that follows it must arrive somewhere real.
         assert!(auth.auth_endpoints().is_some_and(|map| map
-            .contains_key(url.trim_start_matches(&format!("http://{BOUND}")))));
+            .contains_key(url.trim_start_matches(&identity(BOUND).origin().to_owned()))));
     }
 
     #[test]
@@ -2519,13 +2652,167 @@ mod tests {
     }
 
     #[test]
-    fn the_canonical_identifier_comes_from_the_bound_address_and_nowhere_else() {
-        assert_eq!(canonical_resource(BOUND), format!("http://{BOUND}/mcp"));
-        assert_ne!(canonical_resource(BOUND), canonical_resource(OTHER));
+    fn the_canonical_identifier_comes_from_the_advertised_identity_and_nowhere_else() {
+        // Pinned against a literal, not against a second call to the same
+        // constructor: this assertion is the *value*, and a tautology here
+        // would let the whole scheme change without a test noticing.
+        assert_eq!(canonical_resource(&identity(BOUND)), "http://127.0.0.1:40501/mcp");
+        assert_ne!(canonical_resource(&identity(BOUND)), canonical_resource(&identity(OTHER)));
         // `localhost` is a different byte string, and therefore a different
         // audience. That is the intended reading: the identifier is compared
         // byte for byte, and the listener reports `127.0.0.1:port`.
-        assert_ne!(canonical_resource("127.0.0.1:1"), canonical_resource("localhost:1"));
+        assert_ne!(
+            canonical_resource(&identity("127.0.0.1:1")),
+            canonical_resource(&identity("localhost:1"))
+        );
+    }
+
+    /// **The zero-regression guard for D-05-03.** With nothing advertised,
+    /// every string this browser publishes about itself is byte-identical to
+    /// what Phase 4 published — asserted against literals rather than against
+    /// the constructors that produce them, so a change of scheme or shape
+    /// cannot pass unnoticed.
+    #[test]
+    fn with_no_advertised_url_every_published_string_is_what_phase_four_published() {
+        let temp = TempPath::new();
+        let (auth, _agents, _client_id, _token) = fixture(temp.path());
+
+        assert_eq!(auth.resource, "http://127.0.0.1:40501/mcp");
+        assert_eq!(
+            auth.metadata_url,
+            "http://127.0.0.1:40501/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(auth.issuer, "http://127.0.0.1:40501");
+
+        let protected = auth.metadata_document();
+        assert_eq!(
+            protected["authorization_servers"],
+            serde_json::json!(["http://127.0.0.1:40501"])
+        );
+
+        let server = auth.authorization_server_metadata();
+        for key in [
+            "authorization_endpoint",
+            "token_endpoint",
+            "registration_endpoint",
+            "revocation_endpoint",
+        ] {
+            let named = server[key].as_str().expect("an endpoint URL");
+            assert!(
+                named.starts_with("http://127.0.0.1:40501/"),
+                "{key} is {named}, which is not at the bound address"
+            );
+        }
+    }
+
+    /// The other side of the same coin: with an identity advertised, all six
+    /// derive from it, carry its scheme, and agree with each other exactly.
+    /// Nothing is left pointing at the address the listener bound, because
+    /// that address is one no remote client can reach.
+    #[test]
+    fn with_an_advertised_url_every_published_string_derives_from_it() {
+        let temp = TempPath::new();
+        let store = Agents::load_from(temp.path());
+        let agents: SharedAgents = Arc::new(Mutex::new(store));
+        let auth =
+            TalariaAuth::new(agents, Chrome::default().raiser(), &fronted(BOUND));
+
+        assert_eq!(auth.resource, format!("{ADVERTISED}/mcp"));
+        assert_eq!(
+            auth.metadata_url,
+            format!("{ADVERTISED}/.well-known/oauth-protected-resource")
+        );
+        assert_eq!(auth.issuer, ADVERTISED);
+
+        let protected = auth.metadata_document();
+        assert_eq!(protected["authorization_servers"], serde_json::json!([ADVERTISED]));
+        assert_eq!(protected["resource"], serde_json::json!(format!("{ADVERTISED}/mcp")));
+
+        let server = auth.authorization_server_metadata();
+        assert_eq!(server["issuer"], serde_json::json!(ADVERTISED));
+        for key in [
+            "authorization_endpoint",
+            "token_endpoint",
+            "registration_endpoint",
+            "revocation_endpoint",
+        ] {
+            let named = server[key].as_str().expect("an endpoint URL");
+            assert!(
+                named.starts_with(&format!("{ADVERTISED}/")),
+                "{key} is {named}, which is not at the advertised identity"
+            );
+            // Every published OAuth URL carries the secure scheme once an
+            // identity is advertised, which is OAuth 2.1 §1.5 met rather than
+            // excepted (T-05-03).
+            assert!(named.starts_with("https://"), "{key} is {named}");
+        }
+        assert!(auth.resource.starts_with("https://"), "{}", auth.resource);
+        assert!(auth.metadata_url.starts_with("https://"), "{}", auth.metadata_url);
+    }
+
+    /// **The case that would silently break a real deployment.** RFC 8707
+    /// audience validation is byte for byte and there is exactly one canonical
+    /// spelling, so a token minted for the bound loopback address does not
+    /// verify against a browser advertising a proxied origin — and vice versa.
+    /// A browser that accepted both would be a browser with two identities.
+    #[test]
+    fn an_audience_is_the_advertised_spelling_and_not_the_bound_one() {
+        let temp = TempPath::new();
+        let mut store = Agents::load_from(temp.path());
+        let client = store
+            .register("e2e agent".to_owned(), vec!["http://127.0.0.1/cb".to_owned()], NOW)
+            .expect("register the fixture client");
+        let (for_advertised, _refresh) = store
+            .authorize(
+                &client.client_id,
+                NOW,
+                &canonical_resource(&fronted(BOUND)),
+                TALARIA_SCOPE,
+                60_000,
+                600_000,
+            )
+            .expect("authorize against the advertised identity");
+        let for_bound = store.mint_for_test(
+            TokenKind::Access,
+            &client.client_id,
+            "bound-family",
+            NOW + 600_000,
+            &canonical_resource(&identity(BOUND)),
+            TALARIA_SCOPE,
+        );
+        let agents: SharedAgents = Arc::new(Mutex::new(store));
+        let auth =
+            TalariaAuth::new(agents, Chrome::default().raiser(), &fronted(BOUND));
+
+        assert!(auth.verify(&for_advertised, NOW).is_ok(), "the advertised audience is refused");
+        let error = auth.verify(&for_bound, NOW).unwrap_err();
+        assert_eq!(
+            message(&error),
+            message(&refused()),
+            "a token minted for the bound spelling was accepted by an advertised server"
+        );
+    }
+
+    /// The advertised identity is a scheme and an authority together, and the
+    /// two halves must agree: the authority is what a `Host` header carries,
+    /// the origin is what a URL is built on, and neither is re-derived from
+    /// the other at a use site.
+    #[test]
+    fn an_advertised_identity_splits_its_origin_into_a_scheme_and_an_authority() {
+        let fronted = fronted(BOUND);
+        assert_eq!(fronted.origin(), ADVERTISED);
+        assert_eq!(fronted.authority(), "thinkpad.tailcd3cc6.ts.net:8449");
+
+        // With nothing advertised, the authority *is* the bound address and
+        // the origin is that address under the insecure scheme — Phase 4's
+        // behaviour, reproduced without a branch at any use site.
+        let plain = identity(BOUND);
+        assert_eq!(plain.authority(), BOUND);
+        assert_eq!(plain.origin(), "http://127.0.0.1:40501");
+
+        // An advertised origin with no port keeps its authority portless.
+        let bare = AdvertisedIdentity::new(BOUND, Some("https://thinkpad.tailcd3cc6.ts.net"));
+        assert_eq!(bare.authority(), "thinkpad.tailcd3cc6.ts.net");
     }
 
     #[test]
@@ -2560,14 +2847,14 @@ mod tests {
             .expect("register the fixture client");
         let agents: SharedAgents = Arc::new(Mutex::new(store));
         let chrome = Chrome::default();
-        let auth = TalariaAuth::new(agents.clone(), chrome.raiser(), BOUND);
+        let auth = TalariaAuth::new(agents.clone(), chrome.raiser(), &identity(BOUND));
         (auth, agents, chrome, client.client_id)
     }
 
     /// An authorization query with every parameter valid, then whatever the
     /// caller wants to override or remove.
     fn authorization_query(client_id: &str, overrides: &[(&str, Option<&str>)]) -> String {
-        let resource = canonical_resource(BOUND);
+        let resource = canonical_resource(&identity(BOUND));
         let mut pairs: Vec<(String, String)> = vec![
             ("response_type".to_owned(), "code".to_owned()),
             ("client_id".to_owned(), client_id.to_owned()),
@@ -2671,7 +2958,7 @@ mod tests {
             serde_json::json!(["S256"]),
             "a client that saw `plain` here would be entitled to use it"
         );
-        assert_eq!(document["issuer"], serde_json::json!(format!("http://{BOUND}")));
+        assert_eq!(document["issuer"], serde_json::json!(identity(BOUND).origin().to_owned()));
         assert_eq!(
             document["grant_types_supported"],
             serde_json::json!(["authorization_code", "refresh_token"])
@@ -2824,7 +3111,7 @@ mod tests {
             .authorize(
                 &first,
                 NOW,
-                &canonical_resource(BOUND),
+                &canonical_resource(&identity(BOUND)),
                 TALARIA_SCOPE,
                 crate::agents::DEFAULT_ACCESS_TTL_MS,
                 crate::agents::DEFAULT_REFRESH_TTL_MS,
@@ -2952,7 +3239,7 @@ mod tests {
     fn the_wrong_resource_parameter_is_refused() {
         let temp = TempPath::new();
         let (auth, _agents, chrome, client_id) = authorized_fixture(temp.path());
-        for resource in [canonical_resource(OTHER), "http://127.0.0.1:40501".to_owned()] {
+        for resource in [canonical_resource(&identity(OTHER)), "http://127.0.0.1:40501".to_owned()] {
             let query = authorization_query(&client_id, &[("resource", Some(&resource))]);
             let refusal = auth.validate_authorization(&query).expect_err("refused");
             assert!(matches!(refusal, Refusal::Redirect { error: "invalid_target", .. }));
@@ -3263,7 +3550,7 @@ mod tests {
         let agents: SharedAgents = Arc::new(Mutex::new(store));
         // The browser is shutting down: nothing is there to raise a panel.
         let closed: ConsentRaiser = Arc::new(|_| Err(()));
-        let auth = TalariaAuth::new(agents, closed, BOUND);
+        let auth = TalariaAuth::new(agents, closed, &identity(BOUND));
         let query = authorization_query(&client.client_id, &[]);
         let response = auth.handle_authorization(&authorization_request(&query), now_ms()).await;
         assert_eq!(response.status(), StatusCode::FOUND);
@@ -3794,7 +4081,7 @@ mod tests {
             .authorize(
                 &client.client_id,
                 NOW,
-                &canonical_resource(BOUND),
+                &canonical_resource(&identity(BOUND)),
                 TALARIA_SCOPE,
                 60_000,
                 600_000,
@@ -3924,7 +4211,7 @@ mod tests {
         let document = auth.authorization_server_metadata();
         assert_eq!(
             document["revocation_endpoint"],
-            serde_json::json!(format!("http://{BOUND}{REVOCATION_PATH}"))
+            serde_json::json!(format!("{}{REVOCATION_PATH}", identity(BOUND).origin()))
         );
         assert_eq!(
             document["revocation_endpoint_auth_methods_supported"],
