@@ -402,6 +402,19 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Changed
 
+- **`axum`'s WebSocket support is now available to the shell.** `axum` is
+  declared directly in `[workspace.dependencies]` at the `0.8.9` already
+  resolved here, with its `ws` feature, and `talaria-shell` takes it by
+  workspace inheritance. It is a unification rather than a new resolution:
+  `axum 0.8.9` was already in the tree through `rust-mcp-axum` and
+  `crates/talaria-shell/src/http.rs` already used it by name through that
+  re-export, so there is exactly one `axum` node before and after. **One crate
+  entered the lockfile** — `tokio-tungstenite 0.29.0`, whose sibling
+  `tungstenite 0.29.0` Servo's own network stack already pulls in — and nothing
+  already in the lockfile changed version, so the `primeorder 0.14.0-rc.14` pin
+  that keeps this workspace buildable survived untouched. No runtime behaviour
+  changes yet: no WebSocket route is mounted (`Cargo.toml`, `Cargo.lock`,
+  `crates/talaria-shell/Cargo.toml`).
 - **The HTTP and OAuth dependency stack is now available to the shell.**
   `rust-mcp-sdk`'s feature list widened to `server`, `macros`, `stdio`,
   `streamable-http` and `auth`, and `talaria-shell` gained `rust-mcp-sdk`,
