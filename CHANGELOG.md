@@ -8,6 +8,73 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Fixed
 
+- **A remote viewer can no longer make the browser stop responding to the person
+  sitting at it.** Three separate ways it could, all reachable by a party whose
+  only qualification is holding an accepted token, and all of them ending with a
+  window the local human cannot get a click into — including the click that
+  would revoke the token, because the Access panel is drawn by the loop being
+  saturated.
+
+  Every accepted input pulled the next frame forward to *now*, so the frame rate
+  the ladder was built to bound applied only while a viewer was silent; one
+  sending in-bounds pointer messages in a loop made the browser paint and read
+  its framebuffer back once per message. The pull-forward now respects a floor
+  of one fastest-rung interval, which is a viewer driving as hard as it can
+  getting exactly the rate a legitimate viewer at the top of the ladder gets and
+  nothing above it.
+
+  The concurrent-attachment cap was counted per *connection* and nothing capped
+  connections, so it bounded a number the holder of the token chose. There is
+  now a ceiling on live view connections (four, `TALARIA_VIEW_MAX_CONNECTIONS`)
+  and a ceiling on attachments across all of them (eight,
+  `TALARIA_VIEW_MAX_TOTAL_ATTACH`). A client that hits the connection ceiling is
+  told so in as many words rather than being told its credential was refused —
+  and only after its credential was accepted, so the answer is no use to anyone
+  who does not already hold one.
+
+  Each viewer's outbound frame queue was unbounded with no policy for a reader
+  that falls behind, so a viewer that stopped reading — hostile, or ordinary on
+  a slow relayed path — grew it without limit in the process that holds your
+  encrypted credential vault and your logged-in sessions. The pump now stops
+  producing for a viewer with frames still waiting, rather than discarding what
+  it has already produced: the queue holds a short run of small, in-order
+  updates the viewer catches up on by reading, instead of needing a whole fresh
+  picture to resynchronise. Inbound messages are capped at 64 KiB apiece, down
+  from the web framework's 64 MiB default (`crates/talaria-shell/src/view.rs`,
+  `crates/talaria-shell/src/http.rs`).
+- **A remote viewer's scroll wheel now travels as far as the local one's.** The
+  local path multiplies a wheel notch by the engine's line size and the remote
+  path passed the raw line count straight through, so one notch of a viewer's
+  wheel moved a page one seventy-sixth as far as one notch of the human's — on a
+  page a screenful tall, no visible movement at all. Both paths now read the one
+  constant. The wheel was the only input verb with no end-to-end coverage, which
+  is why this shipped; there is now a test that turns real wheel notches at the
+  client's own window and asserts the *distance* the page moved
+  (`crates/talaria-shell/src/remote_input.rs`).
+- **A tab a viewer is watching is no longer left painting for nobody.** The
+  screenshot path's re-hide decision asked whether a tab was active *in its own
+  view* rather than whether it was the tab on screen, so an agent screenshotting
+  the human's active tab while the human was looking at the Agents view left two
+  webviews shown and painting until the next tab change tidied it up
+  (`crates/talaria-shell/src/app.rs`).
+- **Watching a background tab no longer takes focus away from the tab you are
+  using.** The engine's blur call carries no webview identity and clears focus
+  on every tab at once, and the visibility sync fired one per non-displayed tab
+  while walking the table in order — so whenever your tab was not last in that
+  order, the focus it had just been given was immediately cleared. Anything a
+  page can see about focus saw it: text carets, `:focus` styling, focus and blur
+  handlers. The sync now grants focus once, by name, after everything else, and
+  clears it only when nothing should hold it (`crates/talaria-shell/src/tabs.rs`).
+- **The remote view's latency figure now counts only input that reached a
+  page.** The number the client reports, and the one the two-machine check calls
+  the evidence for the takeover-latency claim, was computed from a counter that
+  also advances on input the server *refused* — a click in the letterboxed
+  margin, on a crashed tab, or on a tab the viewer had not attached to. Those
+  round trips never included a hit test or a repaint, so they biased the figure
+  low, in the direction that flatters it. Refusals still consume their sequence
+  number, which is what stops one being replayed; they no longer feed the
+  measurement (`crates/talaria-shell/src/view.rs`,
+  `crates/talaria-protocol/src/wire.rs`).
 - **Every authorization-server endpoint is now origin- and host-checked, not just
   `/mcp`.** `rust-mcp-sdk` dispatches its auth routes through an *empty*
   middleware chain, so `/register`, `/authorize`, `/authorize/status`, `/token`
