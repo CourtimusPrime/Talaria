@@ -5,13 +5,13 @@ milestone_name: milestone
 current_phase: 5
 current_phase_name: v2
 status: executing
-stopped_at: Completed 05-06-PLAN.md
-last_updated: "2026-08-23T15:10:45.256Z"
+stopped_at: Completed 05-07-PLAN.md
+last_updated: "2026-08-23T16:13:10.335Z"
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 34
-  completed_plans: 29
+  completed_plans: 30
 ---
 
 # Project State
@@ -26,13 +26,21 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 6 of 11 executed (waves 1-3 complete)
-Status: Ready to execute
+Plan: 7 of 11 executed (waves 1-3 complete; wave 4 half done — 05-07 landed, 05-08 next)
+Status: Executing
 Next: `/gsd-execute-phase 5`
 
 Phase 4 is closed. AUTH-01, AUTH-02 and AUTH-03 are Complete; verification passed after four
-code-review blockers were fixed. 296 unit tests, e2e 22/22. Phases 1–3 (v1) remain
-feature-complete.
+code-review blockers were fixed. Phases 1–3 (v1) remain feature-complete. At 05-07's tip the tree
+stands at **410 unit tests** and **e2e 23/23, `failed: none`**.
+
+**05-07 added a second binary.** `talaria-client` is D-05-01's other half: 222 dependency crates
+against the shell's 690, a 19 MB binary against 183 MB, and no web engine at all. It connects over a
+`wss://` socket whose certificate verification is structural rather than configurable — there is no
+argument to `connect_async` that relaxes it, so turning it off would mean writing new code. It
+connects, authenticates and lists agent tabs; **frames are not delivered yet**, which is 05-08's and
+05-09's, and is the same gap 05-06 recorded: a hidden webview answers no hit test, and an attachment
+neither shows one nor ticks a pump until 05-08 fixes it.
 
 **Phase 5 is planned:** 11 plans across 8 waves, plan-checker APPROVED at revision 3. Scope was cut
 from four requirements to two — DIST-03 and DIST-04 moved to a new **Phase 5.1** — because an
@@ -122,6 +130,7 @@ Phase 5 keeps per-task commits.
 | Phase 05 P04 | 48 min | 3 tasks | 7 files |
 | Phase 5 P5 | 54 | 3 tasks | 9 files |
 | Phase 05 P06 | 76min | 3 tasks | 6 files |
+| Phase 05 P07 | 96min | 3 tasks | 8 files |
 
 ## Accumulated Context
 
@@ -230,6 +239,10 @@ Recent decisions affecting current work:
 - [Phase ?]: 05-06: remote_input reaches a webview's input entry point and nothing else — chrome, shortcut handler, interface-action queue, active tab, view mode and window focus are absences asserted by four greps at zero
 - [Phase ?]: 05-06: a remote input message refused downstream still spends its sequence number, because a reusable number is a replayable message once the refusing state changes
 - [Phase ?]: 05-06: an e2e fixture carries a decoy link one toolbar-height above each real one, so the coordinate regression navigates to a named wrong destination instead of to nothing
+- [Phase ?]: 05-07: the client's graphics context is surfman taken directly at the version the engine already resolves — zero added packages, versus a new subtree for glutin
+- [Phase ?]: 05-07: certificate verification is structural, not configurable — connect_async with no connector verifies against native roots, so disabling it would mean writing new code
+- [Phase ?]: 05-07: a non-loopback http:// base URL is refused rather than downgraded, because deriving ws:// from it would put the bearer token on the wire in the clear
+- [Phase ?]: 05-07: the client has no retry loop; every failed state names a human next step and UiAction::Reconnect is a press
 
 ### Pending Todos
 
@@ -280,6 +293,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T15:10:36.088Z
-Stopped at: Completed 05-06-PLAN.md
+Last session: 2026-08-23T16:12:51.231Z
+Stopped at: Completed 05-07-PLAN.md
 Resume file: None
