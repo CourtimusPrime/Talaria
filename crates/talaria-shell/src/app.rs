@@ -1586,9 +1586,19 @@ fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEven
 /// How far one line of wheel scroll travels, in pixels.
 ///
 /// Named once and read by **both** input paths — the local one converting
-/// winit's `LineDelta`, and [`crate::remote_input`] converting a wire wheel in
-/// [`talaria_protocol::wire::WheelMode::Line`] units — so a viewer's scroll
-/// covers the same distance the human's does.
+/// winit's `LineDelta` in [`forward_wheel`], and [`crate::remote_input`]
+/// converting a wire wheel in [`talaria_protocol::wire::WheelMode::Line`]
+/// units in `wheel_scale` — so a viewer's scroll covers the same distance the
+/// human's does. `grep -rn WHEEL_LINE_PIXELS crates/` naming only this file is
+/// how the 76× remote-scroll defect shipped, so the second reader is worth
+/// checking for rather than assuming.
+///
+/// **The scaled value is still handed to the engine as `DeltaLine` and that is
+/// not a mistake**: it is what Servo's own embedding example does
+/// (`servo-0.4.0/examples/winit_minimal.rs:136-137`), so 76 units per notch is
+/// the convention this engine is fed. Both paths therefore multiply *and* keep
+/// the mode, because a path that did only one of the two would differ from the
+/// other in a way no test of a single path could see.
 pub(crate) const WHEEL_LINE_PIXELS: f32 = 76.0;
 
 /// The rectangle a webview's own input coordinates live in: its size, with its

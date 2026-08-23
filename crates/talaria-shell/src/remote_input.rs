@@ -125,11 +125,17 @@ pub fn apply(state: &Shared, connection: u64, message: &InputMessage) -> bool {
             mouse_button(*button),
             button_action(*action),
         ),
-        InputMessage::Wheel { x, y, dx, dy, mode, .. } => app::deliver_wheel(
-            &webview,
-            point(*x, *y),
-            WheelDelta { x: *dx, y: *dy, z: 0.0, mode: wheel_mode(*mode) },
-        ),
+        // The one place a wire wheel delta is converted, and the one thing on
+        // this path that is *not* carried through untouched. See
+        // [`wheel_scale`] for why a coordinate and a delta differ here.
+        InputMessage::Wheel { x, y, dx, dy, mode, .. } => {
+            let scale = wheel_scale(*mode);
+            app::deliver_wheel(
+                &webview,
+                point(*x, *y),
+                WheelDelta { x: dx * scale, y: dy * scale, z: 0.0, mode: wheel_mode(*mode) },
+            )
+        },
         InputMessage::Key { state, key, named, .. } => {
             let Some(event) = keyutils::keyboard_event_from_wire(
                 key_state(*state),
@@ -230,6 +236,30 @@ fn key_state(action: ButtonAction) -> servo::KeyState {
     match action {
         ButtonAction::Down => servo::KeyState::Down,
         ButtonAction::Up => servo::KeyState::Up,
+    }
+}
+
+/// How far one unit of a wire wheel delta travels, in the units the engine is
+/// then told the delta is in.
+///
+/// **The one conversion on this path, and it exists because a delta is not a
+/// coordinate.** A wire coordinate is already in the target tab's own device
+/// pixels and goes through untouched; a wire *line count* is a notch of a
+/// wheel, and how far a notch travels is the embedder's decision rather than
+/// the wire's. The local path makes that decision by multiplying winit's
+/// `LineDelta` by [`app::WHEEL_LINE_PIXELS`] and still labelling the result
+/// `DeltaLine`, which is what Servo's own embedding example does — so this
+/// reads the same constant rather than respelling it, and a viewer's notch
+/// covers exactly the distance the human's does. Before this existed a remote
+/// notch travelled 1/76th of a local one, which on a page a screenful tall is
+/// no visible movement at all.
+///
+/// A pixel delta is already in the units the engine wants and is carried
+/// through at one.
+fn wheel_scale(mode: WheelMode) -> f64 {
+    match mode {
+        WheelMode::Line => f64::from(app::WHEEL_LINE_PIXELS),
+        WheelMode::Pixel => 1.0,
     }
 }
 
@@ -444,6 +474,29 @@ mod tests {
         assert_eq!(InputMessage::from_json(payload), None);
         assert_eq!(wheel_mode(WheelMode::Line), ServoWheelMode::DeltaLine);
         assert_eq!(wheel_mode(WheelMode::Pixel), ServoWheelMode::DeltaPixel);
+    }
+
+    #[test]
+    fn a_remote_line_notch_travels_exactly_as_far_as_the_local_human_s() {
+        // The regression the 76× defect was: the remote path passed the raw
+        // line count through while the local path multiplied it, so one notch
+        // of a viewer's wheel moved a page by one pixel. Asserted against the
+        // *constant* rather than against 76.0, because the property is that
+        // the two paths read one number and not that the number is any
+        // particular one.
+        let local_notch = f64::from(1.0_f32 * app::WHEEL_LINE_PIXELS);
+        assert_eq!(1.0 * wheel_scale(WheelMode::Line), local_notch);
+        assert!(
+            wheel_scale(WheelMode::Line) > 1.0,
+            "a line delta reaching the engine unscaled is the 76x defect",
+        );
+    }
+
+    #[test]
+    fn a_remote_pixel_delta_is_carried_through_at_one() {
+        // A pixel is already the engine's unit. Scaling it would be the same
+        // error in the other direction.
+        assert_eq!(wheel_scale(WheelMode::Pixel), 1.0);
     }
 
     #[test]

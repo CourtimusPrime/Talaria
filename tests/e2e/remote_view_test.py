@@ -197,6 +197,25 @@ PROTOCOL_VERSION = 1
 # there *is* a ceiling and that crossing it is refused, not what the number is.
 MAX_ATTACH = 2
 
+
+def wheel_line_pixels():
+    """How far the shell says one wheel notch travels, read out of its source.
+
+    Read rather than spelled, for the reason the client's key-table drift test
+    reads the server's table with ``include_str!``: the property under test is
+    that the remote wheel path and the local one scale by **one** number, and a
+    number copied into this file would agree with the constant right up until
+    somebody changed the constant. A miss fails loudly rather than silently
+    substituting a default — a suite that fell back to 1.0 here would assert
+    exactly the defect it exists to catch."""
+    source = os.path.join(os.path.dirname(os.path.dirname(T)),
+                          "crates", "talaria-shell", "src", "app.rs")
+    with open(source, encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip().startswith("pub(crate) const WHEEL_LINE_PIXELS"):
+                return float(line.split("=")[1].strip().rstrip(";"))
+    raise AssertionError(f"WHEEL_LINE_PIXELS is not declared in {source}")
+
 # The fixture, and every number in it is load-bearing.
 #
 # Two destinations at **known, well-separated** vertical positions, so hitting
@@ -223,12 +242,19 @@ FIXTURE = b"""<!doctype html><html><head><meta charset="utf-8"><title>fixture</t
   #lower       { top: 500px;  height: 24px; background: #ccf; }
   #field       { position: absolute; top: 620px; left: 40px;
                  width: 300px; height: 30px; }
+  /* The wheel assertion needs a page taller than any viewport this suite
+     runs in, and needs it without disturbing a single number above. Absolute
+     and one pixel wide: it takes no space in the flow, paints nothing, moves
+     nothing, and extends the scrollable overflow area to 4000px. */
+  #tall        { position: absolute; top: 0; left: 0; width: 1px;
+                 height: 4000px; }
 </style></head><body>
 <a id="decoy-upper" href="/decoy-upper.html">DECOY ABOVE THE UPPER LINK</a>
 <a id="upper" href="/upper.html">UPPER LINK</a>
 <a id="decoy-lower" href="/decoy-lower.html">DECOY ABOVE THE LOWER LINK</a>
 <a id="lower" href="/lower.html">LOWER LINK</a>
 <input id="field" type="text">
+<div id="tall"></div>
 </body></html>"""
 
 
@@ -1551,7 +1577,63 @@ try:
           f"{applied_after:.0f}, and the echoed input sequence {echoed:.0f} "
           f"reached the {sent:.0f} the client had sent")
 
-    # --- 48. the local human's window never moved -------------------------
+    # --- 48. a remote wheel notch travels as far as a local one -----------
+    # The one input verb that shipped with no end-to-end assertion at all,
+    # which is why a 76x error in it survived a phase. The quantity asserted
+    # is a **distance**, not "something moved": the defect delivered the
+    # client's raw line count straight to the engine while the local path
+    # multiplied the identical value by WHEEL_LINE_PIXELS, so a notch scrolled
+    # one pixel instead of seventy-six — a page-sized error that "scrollY is
+    # non-zero" would have called a pass.
+    #
+    # The bar is half a notch per notch, and half rather than exact because
+    # the engine is entitled to clamp at the end of the document, to apply the
+    # scroll over more than one frame, and to have a device pixel ratio of its
+    # own. Nothing near the unscaled value can clear it.
+    notch = wheel_line_pixels()
+    notches = 3
+    surface = client_rect(client, "page.surface")
+    assert rpc("navigate", tab_id=remote, url=f"{BASE}/index.html")["outcome"] == "ok"
+    wait_for_url(remote, "/index.html")
+    time.sleep(1.0)
+    assert evaluate(remote, "window.scrollY") == 0, \
+        "the page was already scrolled, so this measures the wrong thing"
+    scrollable = evaluate(remote, "document.documentElement.scrollHeight "
+                                  "- window.innerHeight")
+    assert scrollable > notches * notch, (
+        "the fixture is not tall enough for the scroll under test to have "
+        "anywhere to go", scrollable, notches * notch)
+    # Over the middle of the fitted picture, so the pointer is genuinely on the
+    # page rather than in the letterboxed margin, and then real wheel-down
+    # button presses at the client's own window. Button 5 is wheel-down in the
+    # X11 core protocol, which winit reports as one LineDelta.
+    subprocess.run(["xdotool", "windowfocus", "--sync", client_window], env=X)
+    time.sleep(0.3)
+    subprocess.run(["xdotool", "mousemove", *client_screen(
+        client, client_window,
+        (surface["x"] + surface["width"] / 2,
+         surface["y"] + surface["height"] / 2))], env=X)
+    time.sleep(0.4)
+    for _ in range(notches):
+        subprocess.run(["xdotool", "click", "5"], env=X)
+        time.sleep(0.4)
+    scrolled = 0
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        scrolled = evaluate(remote, "window.scrollY")
+        if scrolled >= notches * notch / 2:
+            break
+        time.sleep(0.5)
+    assert scrolled >= notches * notch / 2, (
+        f"{notches} real wheel notches at the client scrolled the page "
+        f"{scrolled} device pixels, and {notches} notches on the local path "
+        f"travel {notches * notch}: the remote wheel is not scaled by "
+        f"WHEEL_LINE_PIXELS", scrolled, notch)
+    print(f"WHEEL SCALED: {notches} real notches at the client scrolled the "
+          f"agent tab {scrolled} px, against the {notches * notch:.0f} px the "
+          f"local path's own constant says {notches} notches travel")
+
+    # --- 49. the local human's window never moved -------------------------
     assert window_title(wid, X) == displayed_before, (
         "the real client changed the displayed tab or the view mode",
         displayed_before, window_title(wid, X))
