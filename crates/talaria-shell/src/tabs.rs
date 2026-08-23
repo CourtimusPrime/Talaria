@@ -63,6 +63,25 @@ pub struct Tab {
     /// first) the tab reports as loading. A `window.open()` with no URL never
     /// navigates, so this has to time out rather than wait forever.
     pub initial_blank_until: Option<Instant>,
+    /// How many remote viewers are holding this tab shown right now.
+    ///
+    /// **What it prevents.** [`TabManager::sync_visibility`] runs on every
+    /// tab-set change and hides every tab that is not the displayed one.
+    /// Without this counter a tab a viewer is watching would be hidden the
+    /// next time the local human opened a tab, switched view or closed one —
+    /// and the viewer's frames would simply stop, with nothing erroring
+    /// anywhere. Servo needs a shown webview to answer a hit test at all, so
+    /// the same absence takes remote input down with the pixels.
+    ///
+    /// **A count and not a flag**, because two viewers may hold one tab and
+    /// the first of them to detach must not release it out from under the
+    /// second.
+    ///
+    /// **Held means shown and deliberately *not* focused.** Focus belongs to
+    /// the tab the local human is driving; a viewer attaching must change
+    /// nothing on this window, and taking focus would be the first half of
+    /// letting a remote party steer what somebody sitting here is typing at.
+    pub held_for_view: usize,
     /// Set when the load currently in flight on this tab was started by an
     /// agent rather than by the human — today, by a `Command::Evaluate`
     /// script that can navigate the tab by assigning `location.href`.
@@ -80,6 +99,39 @@ pub struct Tab {
 pub enum ViewMode {
     Me,
     Agents,
+}
+
+/// What [`TabManager::sync_visibility`] does with one tab.
+///
+/// Split out from the loop that applies it because every `Tab` owns a live
+/// `WebView` and a real tab table therefore cannot exist in a unit test, while
+/// the *decision* — which of three states a tab is in, given whether it is
+/// displayed and how many viewers hold it — needs no engine at all. The three
+/// engine calls are then two lines each, and their `and` cannot drift from the
+/// table this enum makes assertable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// The tab the local human is looking at: shown **and** focused.
+    DisplayedAndFocused,
+    /// Held shown for at least one remote viewer, and deliberately not
+    /// focused — see [`Tab::held_for_view`].
+    HeldForViewing,
+    /// Neither displayed nor held: hidden and blurred, as before.
+    Hidden,
+}
+
+/// The visibility one tab should be in.
+///
+/// Displayed wins over held, and it wins rather than merely coming first: a
+/// viewer attached to the tab the human happens to be looking at must not
+/// downgrade it out of focus, which is the one way this table could have let a
+/// remote party change something local.
+pub fn visibility_of(displayed: bool, held_for_view: usize) -> Visibility {
+    match (displayed, held_for_view) {
+        (true, _) => Visibility::DisplayedAndFocused,
+        (false, 0) => Visibility::Hidden,
+        (false, _) => Visibility::HeldForViewing,
+    }
 }
 
 pub struct TabManager {
@@ -155,6 +207,9 @@ impl TabManager {
             location,
             location_dirty: false,
             initial_blank_until: adopted.then(|| Instant::now() + ADOPTED_BLANK_GRACE),
+            // A tab is born held by nobody: a lease is taken by an attach and
+            // never inherited from the tab that opened this one.
+            held_for_view: 0,
             // A tab starts out carrying the human's own first load: `open`
             // is reached from the address bar and from `open_for_user`, and
             // an agent-owned tab is filtered out on its owner anyway.
@@ -202,22 +257,80 @@ impl TabManager {
         self.sync_visibility();
     }
 
-    /// Invariant: exactly the displayed tab is shown (and focused); every
-    /// other webview is hidden. This matters beyond bookkeeping — a webview's
-    /// hidden→shown transition is what makes servo produce a fresh frame, and
-    /// `paint()` without a fresh frame is a no-op that leaves the shared
-    /// framebuffer stale (the "view switched but page didn't" bug).
+    /// Invariant: the displayed tab is shown and focused, a tab **held for a
+    /// remote viewer** is shown and *not* focused, and every other webview is
+    /// hidden. This matters beyond bookkeeping — a webview's hidden→shown
+    /// transition is what makes servo produce a fresh frame, and `paint()`
+    /// without a fresh frame is a no-op that leaves the shared framebuffer
+    /// stale (the "view switched but page didn't" bug).
+    ///
+    /// The held arm is the one that is invisible in a diff, so it is written
+    /// down: this function is what runs whenever the local human opens,
+    /// closes, switches or cycles a tab, and before [`Tab::held_for_view`]
+    /// existed every one of those actions hid a tab a viewer was watching.
+    /// The interaction runs the other way too — holding a background tab shown
+    /// disturbs nothing the human sees, because each tab renders into its own
+    /// framebuffer (see [`Tab::rendering_context`]).
     pub fn sync_visibility(&self) {
         let displayed_id = self.displayed().map(|tab| tab.id);
         for tab in &self.tabs {
-            if Some(tab.id) == displayed_id {
-                tab.webview.show();
-                tab.webview.focus();
-            } else {
-                tab.webview.hide();
-                tab.webview.blur();
+            match visibility_of(Some(tab.id) == displayed_id, tab.held_for_view) {
+                Visibility::DisplayedAndFocused => {
+                    tab.webview.show();
+                    tab.webview.focus();
+                },
+                Visibility::HeldForViewing => {
+                    tab.webview.show();
+                    tab.webview.blur();
+                },
+                Visibility::Hidden => {
+                    tab.webview.hide();
+                    tab.webview.blur();
+                },
             }
         }
+    }
+
+    /// Hold `id` shown for a remote viewer, if an agent owns it.
+    ///
+    /// Through the agent-only predicate for the same reason
+    /// [`TabManager::agent_tab`] exists: a tab the human owns must be
+    /// unrepresentable on the remote path rather than refused after the fact.
+    /// Answers whether the hold was taken, so a caller cannot record a lease
+    /// on a tab that never took one.
+    pub fn hold_for_view(&mut self, id: u64) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id && t.owner.is_agent()) else {
+            return false;
+        };
+        tab.held_for_view += 1;
+        // Re-established rather than assumed: the tab may have been hidden a
+        // moment ago and this is what shows it.
+        self.sync_visibility();
+        true
+    }
+
+    /// Release one hold on `id`.
+    ///
+    /// Releasing a hold that was never taken, or one on a tab that has since
+    /// closed, is not an error — a lease outliving its tab is the ordinary
+    /// case, and the tab table is the one that decides a closed tab has no
+    /// visibility left to restore. When the last hold goes the tab returns to
+    /// whatever visibility the local view state says it should have, which is
+    /// [`TabManager::sync_visibility`]'s answer and never a remembered one.
+    pub fn release_view_hold(&mut self, id: u64) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        if tab.held_for_view == 0 {
+            return;
+        }
+        tab.held_for_view -= 1;
+        self.sync_visibility();
+    }
+
+    /// How many viewers hold `id` shown. `None` for a tab that is not there.
+    pub fn view_holds(&self, id: u64) -> Option<usize> {
+        self.get(id).map(|tab| tab.held_for_view)
     }
 
     pub fn get(&self, id: u64) -> Option<&Tab> {
@@ -335,5 +448,37 @@ mod tests {
             TabOwner::Agent { session_id: 1, client: "client-a".into() }.view(),
             ViewMode::Agents
         );
+    }
+
+    /// The whole visibility decision table, across displayed and held — the
+    /// three states and every combination that reaches them.
+    #[test]
+    fn the_visibility_table_shows_a_held_tab_and_hides_only_an_unheld_one() {
+        assert_eq!(visibility_of(false, 0), Visibility::Hidden);
+        assert_eq!(visibility_of(false, 1), Visibility::HeldForViewing);
+        assert_eq!(visibility_of(false, 2), Visibility::HeldForViewing);
+        assert_eq!(visibility_of(true, 0), Visibility::DisplayedAndFocused);
+    }
+
+    /// A viewer attached to the tab the human is *already* looking at does not
+    /// downgrade it out of focus. Displayed wins, and it wins for every hold
+    /// count rather than only for the one somebody happened to test.
+    #[test]
+    fn a_hold_never_takes_focus_from_the_displayed_tab() {
+        for holds in 0..4 {
+            assert_eq!(
+                visibility_of(true, holds),
+                Visibility::DisplayedAndFocused,
+                "{holds} viewers changed what the local human is focused on"
+            );
+        }
+    }
+
+    /// A held tab is shown and **not** focused: the two shown states are
+    /// distinct values, so "shown" can never silently mean "focused".
+    #[test]
+    fn a_held_tab_is_shown_without_being_focused() {
+        assert_ne!(visibility_of(false, 1), Visibility::DisplayedAndFocused);
+        assert_ne!(visibility_of(false, 1), Visibility::Hidden);
     }
 }

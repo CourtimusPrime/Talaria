@@ -264,7 +264,7 @@ mod tests {
         sessions: &mut ViewSessions,
         connection: u64,
         tab: u64,
-        tabs: &dyn ViewTabs,
+        tabs: &mut dyn ViewTabs,
     ) -> Viewer {
         let viewer = connect(sessions, connection, "client-a");
         attach(sessions, &viewer, tab, tabs);
@@ -280,18 +280,18 @@ mod tests {
 
     #[test]
     fn a_sequence_that_increased_is_accepted_and_recorded() {
-        let tabs = FakeTabs::with(&[(1, true)]);
+        let mut tabs = FakeTabs::with(&[(1, true)]);
         let mut sessions = ViewSessions::default();
-        let viewer = attached(&mut sessions, 1, 1, &tabs);
+        let viewer = attached(&mut sessions, 1, 1, &mut tabs);
         assert!(admit(&mut sessions, &tabs, viewer.connection, &moved(1, 5)));
         assert!(admit(&mut sessions, &tabs, viewer.connection, &moved(1, 6)));
     }
 
     #[test]
     fn a_sequence_that_did_not_increase_is_dropped() {
-        let tabs = FakeTabs::with(&[(1, true)]);
+        let mut tabs = FakeTabs::with(&[(1, true)]);
         let mut sessions = ViewSessions::default();
-        let viewer = attached(&mut sessions, 1, 1, &tabs);
+        let viewer = attached(&mut sessions, 1, 1, &mut tabs);
         assert!(admit(&mut sessions, &tabs, viewer.connection, &moved(1, 5)));
         // Equal, and lower. Both are replays within the connection.
         assert!(!admit(&mut sessions, &tabs, viewer.connection, &moved(1, 5)));
@@ -301,10 +301,10 @@ mod tests {
 
     #[test]
     fn the_sequence_space_is_per_connection_and_two_viewers_do_not_interfere() {
-        let tabs = FakeTabs::with(&[(1, true)]);
+        let mut tabs = FakeTabs::with(&[(1, true)]);
         let mut sessions = ViewSessions::default();
-        let first = attached(&mut sessions, 1, 1, &tabs);
-        let second = attached(&mut sessions, 2, 1, &tabs);
+        let first = attached(&mut sessions, 1, 1, &mut tabs);
+        let second = attached(&mut sessions, 2, 1, &mut tabs);
 
         assert!(admit(&mut sessions, &tabs, first.connection, &moved(1, 900)));
         // The second viewer's low sequence is its own space, not a replay of
@@ -316,9 +316,9 @@ mod tests {
     fn a_message_refused_downstream_still_consumes_its_sequence_number() {
         // A number that could be reused is a message that could be replayed
         // later, once the state it was refused for has changed (T-05-15).
-        let tabs = FakeTabs::with(&[(1, true), (2, true)]);
+        let mut tabs = FakeTabs::with(&[(1, true), (2, true)]);
         let mut sessions = ViewSessions::default();
-        let viewer = attached(&mut sessions, 1, 1, &tabs);
+        let viewer = attached(&mut sessions, 1, 1, &mut tabs);
 
         // Refused: tab 2 is agent-owned but unattached.
         assert!(!admit(&mut sessions, &tabs, viewer.connection, &moved(2, 40)));
@@ -329,9 +329,9 @@ mod tests {
 
     #[test]
     fn a_tab_this_connection_never_attached_to_is_refused() {
-        let tabs = FakeTabs::with(&[(1, true), (2, true)]);
+        let mut tabs = FakeTabs::with(&[(1, true), (2, true)]);
         let mut sessions = ViewSessions::default();
-        let viewer = attached(&mut sessions, 1, 1, &tabs);
+        let viewer = attached(&mut sessions, 1, 1, &mut tabs);
         // Agent-owned, and still refused: attachment is what the concurrent
         // attachment cap is counted against, so input that skipped it would
         // skip the cap.
@@ -342,13 +342,13 @@ mod tests {
     fn a_tab_the_human_owns_is_refused() {
         // `D-05-02`. The Me tab is where the human's history rows, bookmarks
         // and autofilled credentials live.
-        let tabs = FakeTabs::with(&[(1, true), (2, false)]);
+        let mut tabs = FakeTabs::with(&[(1, true), (2, false)]);
         let mut sessions = ViewSessions::default();
         let viewer = connect(&mut sessions, 1, "client-a");
         // It cannot even be attached to, so the refusal holds twice over: the
         // attach was refused, and the input is refused again here.
         let frame = control_request(&talaria_protocol::wire::ClientView::Attach { tab: 2 });
-        assert!(matches!(sessions.message(viewer.connection, &frame, &tabs), Handled::Done));
+        assert!(matches!(sessions.message(viewer.connection, &frame, &mut tabs), Handled::Done));
         assert!(!admit(&mut sessions, &tabs, viewer.connection, &moved(2, 1)));
     }
 
@@ -370,9 +370,9 @@ mod tests {
     fn admitting_input_answers_the_viewer_nothing_at_all() {
         // Every refusal is silent beyond the fact of not happening: the viewer
         // is told nothing, and so is told nothing that differs.
-        let tabs = FakeTabs::with(&[(1, true), (2, false)]);
+        let mut tabs = FakeTabs::with(&[(1, true), (2, false)]);
         let mut sessions = ViewSessions::default();
-        let mut viewer = attached(&mut sessions, 1, 1, &tabs);
+        let mut viewer = attached(&mut sessions, 1, 1, &mut tabs);
         let _ = viewer.drain();
 
         assert!(admit(&mut sessions, &tabs, viewer.connection, &moved(1, 1)));
@@ -474,14 +474,14 @@ mod tests {
     fn an_input_frame_reaches_this_module_and_is_delivered_nowhere_before_it() {
         // The wiring assertion: `ViewSessions` decodes and hands back, and
         // acting on the message is this module's alone.
-        let tabs = FakeTabs::with(&[(1, true)]);
+        let mut tabs = FakeTabs::with(&[(1, true)]);
         let mut sessions = ViewSessions::default();
-        let viewer = attached(&mut sessions, 1, 1, &tabs);
+        let viewer = attached(&mut sessions, 1, 1, &mut tabs);
         let frame = encode(
             Channel::Input,
             moved(1, 4).to_json().expect("well formed").as_bytes(),
         );
-        match sessions.message(viewer.connection, &frame, &tabs) {
+        match sessions.message(viewer.connection, &frame, &mut tabs) {
             Handled::Input(message) => {
                 assert!(admit(&mut sessions, &tabs, viewer.connection, &message));
             },

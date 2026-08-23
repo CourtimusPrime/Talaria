@@ -498,6 +498,10 @@ impl Shared {
         // raises the events the second drain then delivers.
         self.process_pending_tab_work();
         self.process_pending_events();
+        // And the frame pump, for the same reason and gated by its own
+        // deadlines rather than by which handler happened to run: an
+        // attachment that is not due costs the comparison of one instant.
+        self.process_view_frames();
     }
 
     /// Turn queued completed navigations into history rows.
@@ -723,17 +727,24 @@ impl Shared {
         });
     }
 
-    /// Earliest deadline among queued captures/loads/evals and outstanding
-    /// evaluates, for WaitUntil scheduling. The in-flight registry is a
-    /// source here because a deadline nothing wakes for is not a deadline:
-    /// an entry whose callback was lost must expire on time, not whenever
-    /// the loop happens to turn next.
+    /// Earliest deadline among queued captures/loads/evals, outstanding
+    /// evaluates and the frame pump's next tick, for WaitUntil scheduling.
+    /// The in-flight registry is a source here because a deadline nothing
+    /// wakes for is not a deadline: an entry whose callback was lost must
+    /// expire on time, not whenever the loop happens to turn next.
+    ///
+    /// **The frame pump joins this computation rather than installing a
+    /// second control-flow source**, which is the whole of how its cadence is
+    /// scheduled: two things deciding when the loop wakes is how a loop stops
+    /// waking. With no viewer attached the pump contributes `None` and the
+    /// loop waits exactly as it did before.
     pub fn next_capture_deadline(&self) -> Option<std::time::Instant> {
         let captures = self.pending_captures.borrow().iter().map(|c| c.deadline).min();
         let loads = self.pending_loads.borrow().iter().map(|l| l.deadline).min();
         let evals = self.pending_evals.borrow().iter().map(|e| e.next).min();
         let evaluating = self.evaluating.borrow().iter().map(|g| g.deadline).min();
-        [captures, loads, evals, evaluating].into_iter().flatten().min()
+        let frames = self.views.borrow().next_tick();
+        [captures, loads, evals, evaluating, frames].into_iter().flatten().min()
     }
 
     /// Keep the window title in step with whatever tab is displayed (tab
@@ -779,12 +790,14 @@ impl Shared {
         // shared borrow that is released before the session table is touched
         // again, so a message can never wedge the loop it reports into.
         let handled = {
-            let tabs = self.tabs.borrow();
-            self.views.borrow_mut().message(connection, frame, &*tabs)
+            // Mutable now that an attach takes a visibility hold on the tab
+            // table, and still scoped for the same reason it always was.
+            let mut tabs = self.tabs.borrow_mut();
+            self.views.borrow_mut().message(connection, frame, &mut *tabs)
         };
         match handled {
             crate::view::Handled::Done => {},
-            crate::view::Handled::Close => self.views.borrow_mut().closed(connection),
+            crate::view::Handled::Close => self.view_closed(connection),
             crate::view::Handled::Input(message) => {
                 // Whether it was applied is not reported to the peer: every
                 // refusal is silent beyond the fact of not happening, and none
@@ -806,9 +819,72 @@ impl Shared {
         self.views.borrow_mut().publish(&*tabs);
     }
 
-    /// A viewer's socket ended. Release everything it held.
+    /// A viewer's socket ended. Release everything it held — the attachment
+    /// records here, and the visibility holds those records took on the tab
+    /// table, which is what returns each tab to whatever the local view state
+    /// says it should be.
     pub fn view_closed(&self, connection: u64) {
-        self.views.borrow_mut().closed(connection);
+        let mut tabs = self.tabs.borrow_mut();
+        self.views.borrow_mut().closed(connection, &mut *tabs);
+    }
+
+    /// One turn of the frame pump: paint and read back every attachment that
+    /// is due, and hand each buffer onward.
+    ///
+    /// **The whole of what the winit loop spends on a viewer.** The tile
+    /// comparison and the encode are not here — they are the encoder thread's,
+    /// because the readback buffer is `Send` and moving them off the loop is
+    /// the difference between the pump costing about a twentieth of a tick and
+    /// about a quarter of it (05-02 measured 5.8 % on a settled page and 21 %
+    /// while scrolling, with the comparison and the encode already excluded).
+    ///
+    /// The borrows are both scoped and both released before the paint: the due
+    /// list is taken out of the session table first, and the two engine
+    /// handles are cloned out of the tab table second, so neither cell is held
+    /// across the slowest step. Servo borrows the same tab table from its own
+    /// delegate callbacks.
+    pub fn process_view_frames(&self) {
+        let due = {
+            let mut views = self.views.borrow_mut();
+            if views.is_empty() {
+                return;
+            }
+            views.take_due(std::time::Instant::now(), crate::view::view_idle())
+        };
+        for tick in due {
+            let handles = {
+                // Through the agent-only lookup, so a tab the human owns is
+                // not merely refused here — it cannot be named.
+                let tabs = self.tabs.borrow();
+                tabs.agent_tab(tick.tab)
+                    .map(|tab| (tab.webview.clone(), tab.rendering_context.clone()))
+            };
+            // The lease outlived its tab. `publish_views` detaches it on this
+            // same turn, so nothing is said here.
+            let Some((webview, context)) = handles else {
+                continue;
+            };
+            match crate::view::capture(&webview, &context) {
+                crate::view::CaptureOutcome::Painted(surface) => {
+                    self.views.borrow_mut().frame_captured(&tick, surface);
+                },
+                // A skipped tick and nothing more: the lease is still good and
+                // the next tick will try again. Warn rather than error,
+                // because this is a degraded fallback the user should know
+                // about and not a subsystem failing.
+                crate::view::CaptureOutcome::ReadFailed => {
+                    log::warn!(
+                        "framebuffer read failed for tab {} on view connection {}; \
+                         skipping this frame",
+                        tick.tab,
+                        tick.connection
+                    );
+                    if tick.keyframe {
+                        self.views.borrow_mut().require_keyframe_again(&tick);
+                    }
+                },
+            }
+        }
     }
 
     /// Queue an unsolicited event for the session that owns the tab it
@@ -2543,6 +2619,25 @@ fn execute_agent_command(state: &Rc<Shared>, request: AgentRequest) {
                 result: ResultPayload::ChromeRects {
                     rects,
                     scale: state.window.scale_factor(),
+                },
+            });
+        },
+        Command::ViewHolds { tab_id } => {
+            // Gated and refused identically to `Command::ChromeRects` — see
+            // that arm for why a test hook is refused as *unrecognised* rather
+            // than as forbidden, and `Command::ViewHolds` for why a count of
+            // who is watching is not an agent's to read.
+            if std::env::var("TALARIA_TEST_HOOKS").as_deref() != Ok("1") {
+                let _ = reply.send(Outcome::Error { message: "unknown command".into() });
+                return;
+            }
+            let holds = state.tabs.borrow().view_holds(tab_id);
+            let _ = reply.send(Outcome::Ok {
+                result: ResultPayload::Value {
+                    value: match holds {
+                        Some(count) => serde_json::Value::from(count),
+                        None => serde_json::Value::Null,
+                    },
                 },
             });
         },

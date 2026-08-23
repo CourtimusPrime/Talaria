@@ -77,6 +77,18 @@ pub enum Command {
     /// control socket carries it for tests, the agent tool surface does not
     /// carry it at all.
     ChromeRects,
+    /// **Test hook.** How many remote viewers are currently holding `tab_id`
+    /// shown, or `null` for a tab that is not there.
+    ///
+    /// Refused exactly as [`Command::ChromeRects`] is, and withheld for a
+    /// related reason: the count is a statement about who is watching this
+    /// browser, and a production agent that could read it could enumerate the
+    /// remote sessions attached to tabs it does not own. What it exists for is
+    /// the one assertion an e2e suite cannot make from the outside — that a
+    /// lease was *released* — because a released hold is an absence, and every
+    /// other symptom of it (a tab going hidden, frames stopping) is
+    /// indistinguishable from a viewer that simply had nothing to send.
+    ViewHolds { tab_id: u64 },
 }
 
 /// One named chrome element's rectangle, in egui's own logical points with
