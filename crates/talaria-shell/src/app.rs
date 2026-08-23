@@ -258,7 +258,22 @@ pub struct Shared {
     pub toolbar_height: Cell<f32>,
     /// Last cursor position, physical pixels.
     pub last_cursor: Cell<Option<PhysicalPosition<f64>>>,
-    /// Last cursor position relative to the webview viewport, device pixels.
+    /// The **local** cursor's last position relative to the webview viewport,
+    /// in device pixels.
+    ///
+    /// Written by [`forward_mouse_move`] and read by [`forward_mouse_button`]
+    /// and [`forward_wheel`], and **deliberately not shared with any other
+    /// input source**. This one `Cell` is the mechanism by which the toolbar
+    /// subtraction reaches all three local forwarders while only one of them
+    /// names it, so a second input source writing here would inherit a local
+    /// window's chrome offset without any line saying so — and a remote client
+    /// draws no server toolbar (T-05-04-A). It would contaminate in the other
+    /// direction too: the human moving the mouse would re-aim a remote
+    /// viewer's next click (T-05-04-B).
+    ///
+    /// [`crate::remote_input`] therefore never touches this field; the wire
+    /// carries coordinates on every pointer message precisely so it needs no
+    /// cached previous position.
     pub webview_point: Cell<euclid::Point2D<f32, DevicePixel>>,
     pub modifiers: Cell<ModifiersState>,
     /// Last window title we set, so the per-frame refresh only touches the
@@ -1424,30 +1439,111 @@ fn handle_browser_shortcut(state: &Rc<Shared>, key_event: &winit::event::KeyEven
     }
 }
 
+/// How far one line of wheel scroll travels, in pixels.
+///
+/// Named once and read by **both** input paths — the local one converting
+/// winit's `LineDelta`, and [`crate::remote_input`] converting a wire wheel in
+/// [`talaria_protocol::wire::WheelMode::Line`] units — so a viewer's scroll
+/// covers the same distance the human's does.
+pub(crate) const WHEEL_LINE_PIXELS: f32 = 76.0;
+
+/// The rectangle a webview's own input coordinates live in: its size, with its
+/// top-left as the origin.
+///
+/// Always the **given** webview's, never the displayed tab's. A containment
+/// test run against a different tab's size is exactly how a remote click would
+/// end up bounded by whatever page the local human happened to switch to.
+fn viewport_of(webview: &WebView) -> euclid::Rect<f32, DevicePixel> {
+    let size = webview.size();
+    euclid::Rect::new(
+        euclid::Point2D::zero(),
+        euclid::Size2D::new(size.width, size.height),
+    )
+}
+
+/// Deliver one pointer motion to `webview`.
+///
+/// `point` is **already relative to `webview`'s own viewport**; applying any
+/// window-chrome offset in here would be applying it twice, because the one
+/// caller that has a window subtracts it before calling. Returns whether the
+/// point was inside the viewport and the event was delivered — a point outside
+/// is a refusal and never a clamp to the nearest edge, since clamping turns
+/// "aim at nothing" into "aim at the nearest thing".
+pub(crate) fn deliver_mouse_move(
+    webview: &WebView,
+    point: euclid::Point2D<f32, DevicePixel>,
+) -> bool {
+    if !viewport_of(webview).contains(point) {
+        return false;
+    }
+    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point.into())));
+    true
+}
+
+/// Deliver one pointer button event to `webview`.
+///
+/// `point` is **already relative to `webview`'s own viewport**; applying any
+/// window-chrome offset in here would be applying it twice. Returns whether it
+/// was delivered.
+pub(crate) fn deliver_mouse_button(
+    webview: &WebView,
+    point: euclid::Point2D<f32, DevicePixel>,
+    button: ServoMouseButton,
+    action: MouseButtonAction,
+) -> bool {
+    if !viewport_of(webview).contains(point) {
+        return false;
+    }
+    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+        action,
+        button,
+        point.into(),
+    )));
+    true
+}
+
+/// Deliver one wheel event to `webview`.
+///
+/// `point` is **already relative to `webview`'s own viewport**; applying any
+/// window-chrome offset in here would be applying it twice. Returns whether it
+/// was delivered.
+pub(crate) fn deliver_wheel(
+    webview: &WebView,
+    point: euclid::Point2D<f32, DevicePixel>,
+    delta: WheelDelta,
+) -> bool {
+    if !viewport_of(webview).contains(point) {
+        return false;
+    }
+    webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(delta, point.into())));
+    true
+}
+
 fn forward_mouse_move(state: &Shared, position: PhysicalPosition<f64>) {
     let webview = state.tabs.borrow().displayed().map(|t| t.webview.clone());
     let Some(webview) = webview else { return };
 
     let mut point = euclid::Point2D::<f32, DevicePixel>::new(position.x as f32, position.y as f32);
+    // The toolbar subtraction lives at the **call site** rather than inside
+    // `deliver_mouse_move`, and that placement is the input half of `D-05-01`.
+    // A window coordinate has a chrome strip above the page; a remote viewer's
+    // coordinate does not, because a client draws no server toolbar. Shared,
+    // this line would put a silent toolbar-height error on every remote click:
+    // nothing errors, links near the top of a page still work, and links below
+    // a control look "flaky".
     point.y -= state.toolbar_height_device();
 
     let previous = state.webview_point.get();
     state.webview_point.set(point);
 
-    let size = webview.size();
-    let viewport = euclid::Rect::new(
-        euclid::Point2D::zero(),
-        euclid::Size2D::new(size.width, size.height),
-    );
-    if !viewport.contains(point) {
-        if viewport.contains(previous) {
-            webview.notify_input_event(InputEvent::MouseLeftViewport(
-                MouseLeftViewportEvent::default(),
-            ));
-        }
-        return;
+    // The left-viewport transition is the local path's alone: it needs a
+    // previous position, and the remote path deliberately keeps none — every
+    // wire pointer message carries its own coordinates instead.
+    if !deliver_mouse_move(&webview, point) && viewport_of(&webview).contains(previous) {
+        webview.notify_input_event(InputEvent::MouseLeftViewport(
+            MouseLeftViewportEvent::default(),
+        ));
     }
-    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point.into())));
 }
 
 fn forward_mouse_button(
@@ -1458,15 +1554,11 @@ fn forward_mouse_button(
     let webview = state.tabs.borrow().displayed().map(|t| t.webview.clone());
     let Some(webview) = webview else { return };
 
+    // Read back out of the **local** cursor cache, which is the mechanism by
+    // which the toolbar subtraction above reaches this function and
+    // `forward_wheel` without either of them naming it. Deliberately not
+    // shared with any other input source — see the field's own doc comment.
     let point = state.webview_point.get();
-    let size = webview.size();
-    let viewport = euclid::Rect::new(
-        euclid::Point2D::zero(),
-        euclid::Size2D::new(size.width, size.height),
-    );
-    if !viewport.contains(point) {
-        return;
-    }
 
     let mouse_button = match button {
         winit::event::MouseButton::Left => ServoMouseButton::Left,
@@ -1480,11 +1572,7 @@ fn forward_mouse_button(
         ElementState::Pressed => MouseButtonAction::Down,
         ElementState::Released => MouseButtonAction::Up,
     };
-    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-        action,
-        mouse_button,
-        point.into(),
-    )));
+    deliver_mouse_button(&webview, point, mouse_button, action);
 }
 
 fn forward_wheel(state: &Shared, delta: MouseScrollDelta) {
@@ -1492,16 +1580,16 @@ fn forward_wheel(state: &Shared, delta: MouseScrollDelta) {
     let Some(webview) = webview else { return };
 
     let (dx, dy, mode) = match delta {
-        MouseScrollDelta::LineDelta(x, y) => {
-            ((x * 76.0) as f64, (y * 76.0) as f64, WheelMode::DeltaLine)
-        },
+        MouseScrollDelta::LineDelta(x, y) => (
+            (x * WHEEL_LINE_PIXELS) as f64,
+            (y * WHEEL_LINE_PIXELS) as f64,
+            WheelMode::DeltaLine,
+        ),
         MouseScrollDelta::PixelDelta(delta) => (delta.x, delta.y, WheelMode::DeltaPixel),
     };
+    // The local cursor cache again, for the same reason it is read above.
     let point = state.webview_point.get();
-    webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-        WheelDelta { x: dx, y: dy, z: 0.0, mode },
-        point.into(),
-    )));
+    deliver_wheel(&webview, point, WheelDelta { x: dx, y: dy, z: 0.0, mode });
 }
 
 /// Start the remote MCP listener, and record that it is starting.
