@@ -164,3 +164,33 @@ constant bump.
 to land `2026-07-28`, then revisiting the session model rather than the version
 constant. This entry exists so that whoever does it knows 5.1's reconnect design
 is downstream of the same decision.
+
+## Two concurrent e2e runs on one X display SIGKILL each other
+
+**Found during plan 05-01, and it cost a red CI run.**
+
+`harness.start_xvfb()` calls `pkill` for stale Xvfb on its display, and
+`kill_shells_on_display` reaps shells there. Neither takes a lock. So when the
+self-hosted Actions runner and a local run use the same display, whichever
+starts second kills the other's shell, and the first fails with a
+`BrokenPipeError` on the control socket — a failure that looks like a product
+bug and is not one.
+
+That is exactly what happened: CI's `e2e.yml` pins `TALARIA_E2E_DISPLAY: ":98"`,
+and local execution briefs had been reusing `:98` because that is the value the
+workflow file shows. CI went red on `takeover_test` alone with 21 other suites
+passing, which is the signature.
+
+**Immediate handling:** local runs on this machine use a display other than
+`:98`. `:98` belongs to CI.
+
+**Not fixed here, and worth fixing.** Two candidates:
+- An advisory lock file per display in `harness.start_xvfb`, so the second run
+  waits or fails loudly with a legible message instead of silently killing the
+  first.
+- Have the harness pick a free display itself when `TALARIA_E2E_DISPLAY` is
+  unset, rather than defaulting to a fixed `:99`.
+
+The first is the smaller change and turns a confusing failure into an obvious
+one. Neither is Phase 5 business; both belong wherever the harness is next
+touched.
