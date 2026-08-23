@@ -162,6 +162,78 @@ def start_shell(url, log=subprocess.DEVNULL, rust_log="error", wait=8.0, **env_e
     return shell
 
 
+# The prefix the client puts in front of each frame's control geometry on its
+# own standard output, matching `GEOMETRY_PREFIX` in
+# `crates/talaria-client/src/main.rs`.
+CLIENT_RECTS_PREFIX = "talaria-client-rects "
+
+
+def start_client(server, rust_log="error", wait=10.0, **env_extra):
+    """Launch the remote view client against ``server`` and wait for a frame.
+
+    **Its own readiness signal, and deliberately not the shell's.**
+    ``start_shell`` above waits for the control socket to appear on disk. A
+    client owns no socket -- it is the thing that *connects* to a server, not
+    a thing agents connect to -- so an existence check on ``SOCK`` here would be
+    answering a question about an entirely different process, and would answer
+    it "yes" the moment any shell was running.
+
+    What the client offers instead is a line it writes itself. Under
+    ``TALARIA_TEST_HOOKS=1`` -- the same variable, and the same reasoning, as
+    the shell's chrome-geometry hook -- it prints one ``talaria-client-rects``
+    line per drawn frame, carrying that frame's control geometry as JSON.
+    Waiting for the first of those is a stronger signal than either the process
+    being alive or a window existing: it means GL came up, the interface ran,
+    and a frame was actually painted. A client whose graphics context failed
+    would be alive, would own a window, and would never print one.
+
+    The same lines are what lets a suite find a control by name rather than by
+    hardcoded coordinate -- see ``client_rects``.
+
+    Returns the ``Popen``; its ``frames`` attribute is the list of geometry
+    lines seen so far, appended to by a reader thread for the process's life."""
+    env = x_env(RUST_LOG=rust_log, TALARIA_TEST_HOOKS="1", **env_extra)
+    client = subprocess.Popen([CLIENT_BINARY, server], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              text=True, bufsize=1)
+    frames = []
+
+    def pump():
+        # Drains for the process's whole life, so the pipe never fills and
+        # blocks the client mid-frame.
+        for line in client.stdout:
+            if line.startswith(CLIENT_RECTS_PREFIX):
+                frames.append(line[len(CLIENT_RECTS_PREFIX):].strip())
+
+    threading.Thread(target=pump, daemon=True).start()
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline and not frames:
+        if client.poll() is not None:
+            break
+        time.sleep(0.05)
+    client.frames = frames
+    return client
+
+
+def client_rects(client):
+    """The control geometry of the client's most recently drawn frame.
+
+    A list of ``{"name", "x", "y", "width", "height"}``, mirroring the shell's
+    ``chrome_rects`` command. Empty until the first frame has been drawn."""
+    return json.loads(client.frames[-1]) if client.frames else []
+
+
+def wait_for_client_rect(client, name, timeout=10.0):
+    """Wait until the client draws a control called ``name``, and return it."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for rect in client_rects(client):
+            if rect["name"] == name:
+                return rect
+        time.sleep(0.1)
+    raise AssertionError(f"the client never drew a control called {name!r}")
+
+
 def free_port():
     """A loopback port nothing is listening on right now.
 
