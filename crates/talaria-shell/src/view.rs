@@ -822,6 +822,14 @@ struct Attachment {
     next_frame_seq: u64,
     /// When this attachment is next due to be painted.
     due: Instant,
+    /// When this attachment last had a tick taken, if ever. `None` before the
+    /// first one.
+    ///
+    /// **The floor the ladder is enforced against**, and the reason it is
+    /// recorded rather than inferred from `due`: `due` is a deadline that
+    /// anything may pull forward, so it cannot also be the record of when the
+    /// last tick happened. See [`Attachment::pull_forward`].
+    last_tick: Option<Instant>,
     /// When this connection's last input aimed at this tab was accepted, if
     /// any. `None` is a viewer that has only ever watched — see
     /// [`tick_interval`] for the transition this drives.
@@ -840,6 +848,7 @@ impl Attachment {
             // Due immediately: the first frame is the one the viewer is
             // waiting on before it can draw anything at all.
             due: now,
+            last_tick: None,
             last_input: None,
             keyframe: true,
         }
@@ -848,6 +857,35 @@ impl Attachment {
     /// The interval this attachment is currently ticking at, on `rung`.
     fn interval(&self, rung: Rung, now: Instant, idle: Duration) -> Duration {
         tick_interval(rung, self.last_input.map(|at| now.saturating_duration_since(at)), idle)
+    }
+
+    /// Bring the next tick as far forward as the ladder allows, and no
+    /// further.
+    ///
+    /// **The bound on the whole frame pump, and it lives here because the
+    /// pull-forward does.** [`ClientView::Cadence`]'s own doc records that a
+    /// client-invented interval was *removed* rather than bounded, because it
+    /// was "a way for one viewer to pin the engine's loop at whatever rate it
+    /// liked" (T-05-12-D). It was not removed: it moved to the paths that pull
+    /// this deadline forward — an accepted input, and a re-attach — and until
+    /// this floor existed neither had any bound at all. A viewer writing
+    /// in-bounds `mouse_move` messages in a tight loop made the attachment due
+    /// on every one of them, and each due tick is a `paint()` plus a
+    /// framebuffer readback **on the winit main thread**. At the attachment
+    /// cap that is a browser the local human cannot get a click into —
+    /// including the click that would revoke the token, because the Access
+    /// panel is drawn by the loop being pinned.
+    ///
+    /// So the earliest a tick may be taken is one rung interval after the last
+    /// one. That keeps the responsiveness the pull-forward exists for — an
+    /// honest click does not wait out a passive interval, because after an idle
+    /// stretch the floor is already in the past — while making the rung's
+    /// interval the *rate* ceiling it was always documented to be. The floor is
+    /// the rung's own rather than the passive one on purpose: a viewer is
+    /// entitled to the cadence it asked for, and nothing faster.
+    fn pull_forward(&mut self, rung: Rung, now: Instant) {
+        let floor = self.last_tick.map_or(now, |last| (last + rung.interval()).max(now));
+        self.due = self.due.min(floor);
     }
 }
 
@@ -1101,14 +1139,20 @@ impl ViewSessions {
             return false;
         }
         session.last_applied_input = seq;
+        let rung = session.rung;
         let Some(attachment) = session.attachment_mut(tab) else { return false };
         // The driven cadence starts here, and it starts on *this* tick rather
         // than at the end of the passive interval already in flight: the input
         // has just landed and the next photon is the one being measured. See
         // [`tick_interval`] for the rule that takes it back down again.
+        //
+        // **Through the floor, never straight to `now`.** Without it the rung
+        // ladder bounded only a silent viewer and a driving one set the loop's
+        // rate — see [`Attachment::pull_forward`], which is the whole of that
+        // argument.
         let now = Instant::now();
         attachment.last_input = Some(now);
-        attachment.due = attachment.due.min(now);
+        attachment.pull_forward(rung, now);
         true
     }
 
@@ -1170,14 +1214,20 @@ impl ViewSessions {
         let mut take_hold = false;
         {
             let Some(session) = self.session_mut(connection) else { return };
+            let rung = session.rung;
             match session.attachment_mut(tab) {
                 // A client that lost its own acknowledgement and asked again
                 // is starting from nothing, so it gets a fresh keyframe as
                 // well as the same answer — a delta against a surface it no
                 // longer holds would composite onto an empty texture.
+                //
+                // Through the same floor the input channel goes through: a
+                // re-attach is the *second* way to pull this deadline forward,
+                // and a viewer writing `Attach` in a loop would otherwise pin
+                // the loop exactly as an input flood would.
                 Some(attachment) => {
                     attachment.keyframe = true;
-                    attachment.due = attachment.due.min(now);
+                    attachment.pull_forward(rung, now);
                 },
                 None => {
                     if session.attached.len() >= cap {
@@ -1321,6 +1371,10 @@ impl ViewSessions {
                 // a row, which is how a slow machine turns a missed frame
                 // into a burst.
                 attachment.due = now + interval;
+                // Recorded alongside, because this is the fact
+                // [`Attachment::pull_forward`] measures its floor from and
+                // `due` cannot be it: `due` is what the floor exists to bound.
+                attachment.last_tick = Some(now);
                 let frame_seq = attachment.next_frame_seq;
                 attachment.next_frame_seq += 1;
                 due.push(DueTick {
@@ -2366,16 +2420,24 @@ mod tests {
             "a rung this build knows was answered; it is a request, not a negotiation",
         );
 
-        // Driving, so the rung's own interval is the one in force.
+        // Driving, so the rung's own interval is the one in force — and the
+        // input brings the next tick forward to that interval's floor rather
+        // than to the present moment, so the tick is taken *there* (CR-01).
         assert!(sessions.admit_input(1, 1, 1));
-        let driven = sessions.take_due(Instant::now(), view_idle()).remove(0);
+        let at = sessions.next_tick().expect("an attached connection is due");
+        assert_eq!(
+            at,
+            now + slow.interval(),
+            "an input did not bring the next tick forward to exactly one rung interval",
+        );
+        let driven = sessions.take_due(at, view_idle()).remove(0);
         assert_eq!(driven.scale_denominator, slow.scale_denominator());
-        let too_soon = Instant::now() + slow.interval() - Duration::from_millis(1);
+        let too_soon = at + slow.interval() - Duration::from_millis(1);
         assert!(
             sessions.take_due(too_soon, view_idle()).is_empty(),
             "the tick came earlier than the rung asked for",
         );
-        assert_eq!(sessions.take_due(Instant::now() + slow.interval(), view_idle()).len(), 1);
+        assert_eq!(sessions.take_due(at + slow.interval(), view_idle()).len(), 1);
     }
 
     /// A rung this build does not know gets the one reasonless refusal rather
@@ -2517,31 +2579,114 @@ mod tests {
         assert_eq!((header.tile_width, header.tile_height), (101, 69));
     }
 
-    /// An accepted input puts the attachment on the driven cadence, and puts
-    /// it there *now* rather than at the end of the passive interval already
-    /// in flight.
+    /// An accepted input takes the attachment off the passive interval already
+    /// in flight and puts it on the driven one — and puts it there, rather
+    /// than straight onto the present moment, which is the bound the ladder
+    /// would otherwise not have (CR-01).
     #[test]
     fn an_accepted_input_moves_the_attachment_to_the_driven_cadence() {
         let mut tabs = FakeTabs::with(&[(1, true)]);
         let mut sessions = ViewSessions::default();
         let viewer = connect(&mut sessions, 1, "client-a");
         attach(&mut sessions, &viewer, 1, &mut tabs);
+        let driven = Duration::from_millis(driven_tick_ms());
+        let passive = Duration::from_millis(passive_tick_ms());
+        assert!(driven < passive, "the two cadences are the same, so this asserts nothing");
+
         let now = Instant::now();
         assert_eq!(sessions.take_due(now, view_idle()).len(), 1, "the first frame was not due");
+        assert_eq!(
+            sessions.next_tick(),
+            Some(now + passive),
+            "nothing has driven yet, so the deadline in flight is the passive one",
+        );
 
         assert!(sessions.admit_input(viewer.connection, 1, 1));
-        let after_input = Instant::now();
+        let due = sessions.next_tick().expect("an attachment is attached and therefore due");
         assert!(
-            sessions.next_tick().is_some_and(|due| due <= after_input),
-            "an input did not bring the next frame forward"
+            due < now + passive,
+            "an input did not bring the next frame forward off the passive interval",
         );
-        let taken = sessions.take_due(after_input, view_idle());
-        assert_eq!(taken.len(), 1);
-        // And the interval that follows is the driven one, well inside the
-        // passive interval that was in flight a moment ago.
-        assert!(sessions
-            .next_tick()
-            .is_some_and(|due| due <= after_input + Duration::from_millis(driven_tick_ms())));
+        assert!(
+            due >= now + driven,
+            "an input pulled the deadline inside the rung's own interval, so the ladder \
+             bounds only a silent viewer (CR-01)",
+        );
+
+        // And the interval that follows a painted tick is the driven one, well
+        // inside the passive interval that was in flight a moment ago.
+        let painted = Instant::now().max(due);
+        assert_eq!(sessions.take_due(painted, view_idle()).len(), 1);
+        assert_eq!(sessions.next_tick(), Some(painted + driven));
+    }
+
+    /// CR-01: a viewer sending input as fast as it can does not get to set the
+    /// pump's rate.
+    ///
+    /// The bug this pins: `admit_input` pulled the deadline straight to the
+    /// present moment, so the rung's interval bounded the pump only while the
+    /// viewer was *silent*. Each due tick is a `paint()` plus a framebuffer
+    /// readback on the winit main thread, so a party holding nothing but a
+    /// token could pin the local human's browser — including the Access
+    /// panel's Revoke control, which is drawn by the loop being pinned.
+    #[test]
+    fn a_flood_of_accepted_input_cannot_tick_the_pump_faster_than_its_rung() {
+        let mut tabs = FakeTabs::with(&[(1, true)]);
+        let mut sessions = ViewSessions::default();
+        let viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &mut tabs);
+        let driven = Duration::from_millis(driven_tick_ms());
+
+        let start = Instant::now();
+        assert_eq!(sessions.take_due(start, view_idle()).len(), 1, "the first frame was not due");
+
+        // The attacker's loop: a thousand in-bounds messages with the sequence
+        // climbing, every one of them accepted, all inside one rung interval.
+        let mut ticks = 0;
+        for seq in 1..=1000u64 {
+            assert!(sessions.admit_input(viewer.connection, 1, seq), "input {seq} was refused");
+            ticks += sessions
+                .take_due(start + driven - Duration::from_millis(1), view_idle())
+                .len();
+        }
+        assert_eq!(
+            ticks, 0,
+            "a thousand accepted inputs inside one rung interval ticked the pump {ticks} times",
+        );
+
+        // And the pump is bounded rather than stopped: the interval passes and
+        // the tick the viewer is entitled to arrives.
+        assert_eq!(
+            sessions.take_due(Instant::now() + driven, view_idle()).len(),
+            1,
+            "the floor stopped the pump instead of bounding it",
+        );
+    }
+
+    /// The same bound, on the *other* path that pulls the deadline forward.
+    ///
+    /// A re-attach is answered with a fresh keyframe and brings the next tick
+    /// forward, so a viewer writing `Attach` in a loop is the identical attack
+    /// wearing a control message's shape.
+    #[test]
+    fn a_flood_of_reattaches_cannot_tick_the_pump_faster_than_its_rung() {
+        let mut tabs = FakeTabs::with(&[(1, true)]);
+        let mut sessions = ViewSessions::default();
+        let viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &mut tabs);
+        let driven = Duration::from_millis(driven_tick_ms());
+
+        let start = Instant::now();
+        assert_eq!(sessions.take_due(start, view_idle()).len(), 1, "the first frame was not due");
+
+        let mut ticks = 0;
+        for _ in 0..1000 {
+            attach(&mut sessions, &viewer, 1, &mut tabs);
+            ticks += sessions
+                .take_due(start + driven - Duration::from_millis(1), view_idle())
+                .len();
+        }
+        assert_eq!(ticks, 0, "a thousand re-attaches inside one rung interval ticked the pump");
     }
 
     // ---- the tile comparison -------------------------------------------
