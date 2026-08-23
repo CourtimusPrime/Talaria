@@ -141,6 +141,35 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Added
 
+- **The remote view wire has a named, tested vocabulary.**
+  `crates/talaria-protocol/src/wire.rs` defines the multiplexed envelope a
+  remote viewer speaks: five one-byte channel tags — `0x01` control, `0x02`
+  tabs, `0x03` event, `0x04` input, `0x10` frame — split into a low block of
+  human-readable JSON channels and a high block of binary ones, so a single byte
+  tells a reader which world it is in before it decodes anything. The frame
+  channel carries a fixed 51-byte little-endian header ahead of raw PNG bytes,
+  including the last input sequence the server had applied when it painted:
+  that one field makes input-to-photon latency measurable with no clock shared
+  between the two machines, and lets a client discard a frame that predates its
+  own most recent click. `TabInfo`, `Outcome` and `Event` go onto this wire
+  unchanged rather than being restated.
+
+  **Malformed input is refused, never defaulted.** A tag naming no channel, a
+  slice shorter than the header layout, an unknown format version, an unknown
+  frame kind, a zero scale denominator, a tile with no area, a tile that does
+  not fit inside the frame it declares, a missing JSON field, a coordinate that
+  is not a finite number, and a key naming both or neither a character and a
+  named key each produce nothing at all. A decoder that substituted a plausible
+  zero for a bad coordinate would be a decoder that let a malformed message move
+  a real pointer. Twenty-one tests, one per property.
+
+  **The view channel carries no agent tool vocabulary**, and that is expressed
+  as an absence in the types rather than as a runtime check: a viewer lists,
+  watches, clicks, scrolls and types, and cannot open, navigate, evaluate, close
+  or download. The server's refusal likewise has no field to be informative
+  with, so a client cannot tell "that tab belongs to the human" from "there is
+  no such tab" (`crates/talaria-protocol/src/wire.rs`).
+
 - **You can see every agent that may drive this browser, and take one's access
   away** (AUTH-02). The Access panel now lists one row per authorized agent —
   the identifier Talaria minted for it, the name it asked to be called, and how
@@ -401,6 +430,22 @@ cut a release yet, so everything to date sits under Unreleased.
   application.
 
 ### Changed
+
+- **`talaria-protocol` now says what it is: the shared vocabulary, not the
+  distributed wire.** Three places claimed the crate *was* the distributed
+  protocol — its own module header, `control.rs`'s, and the shape of its public
+  surface, four of whose roughly eleven items were a Unix filesystem path and a
+  raw `getuid` shim that mean nothing to a peer on another machine.
+  `socket_dir`, `socket_path`, `ensure_socket_dir`, `current_uid` and the shim
+  moved verbatim into a new `local` module behind `#[cfg(unix)]`, and are
+  deliberately *not* re-exported from the root — a re-export would have left the
+  surface being corrected exactly as it was. Both callers follow the move by
+  name. `control.rs`'s header now records why that transport stayed local rather
+  than becoming the distributed one: its `Hello` line is self-asserted and is
+  safe only because `SO_PEERCRED` has already vouched that the peer runs as the
+  same OS user, and `SO_PEERCRED` has no TCP equivalent. No behaviour changed
+  (`crates/talaria-protocol/src/lib.rs`, `crates/talaria-protocol/src/local.rs`,
+  `crates/talaria-shell/src/control.rs`, `crates/talaria-mcp/src/socket.rs`).
 
 - **`axum`'s WebSocket support is now available to the shell.** `axum` is
   declared directly in `[workspace.dependencies]` at the `0.8.9` already
