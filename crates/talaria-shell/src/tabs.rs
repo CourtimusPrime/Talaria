@@ -272,7 +272,7 @@ impl TabManager {
     /// disturbs nothing the human sees, because each tab renders into its own
     /// framebuffer (see [`Tab::rendering_context`]).
     pub fn sync_visibility(&self) {
-        let displayed_id = self.displayed().map(|tab| tab.id);
+        let displayed_id = self.displayed_id();
         for tab in &self.tabs {
             match visibility_of(Some(tab.id) == displayed_id, tab.held_for_view) {
                 Visibility::DisplayedAndFocused => {
@@ -383,6 +383,20 @@ impl TabManager {
             ViewMode::Agents => self.active_agent,
         };
         id.and_then(move |id| self.get_mut(id))
+    }
+
+    /// The id of the tab the local human is looking at, if any.
+    ///
+    /// **The one expression that answers [`visibility_of`]'s first argument**,
+    /// and it exists because there is a near-miss standing right next to it:
+    /// [`TabManager::active_id`] answers "active in that view", which is the
+    /// same thing only while the human happens to be *in* that view. The
+    /// screenshot drain asked the near-miss and left a webview shown that
+    /// should have been hidden whenever an agent screenshotted the human's
+    /// active Me tab while the human was in Agents mode (WR-01). Both callers
+    /// now ask this.
+    pub fn displayed_id(&self) -> Option<u64> {
+        self.displayed().map(|tab| tab.id)
     }
 
     pub fn active_id(&self, mode: ViewMode) -> Option<u64> {

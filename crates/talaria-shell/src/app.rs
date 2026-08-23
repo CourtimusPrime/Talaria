@@ -514,15 +514,28 @@ impl Shared {
             //
             // `visibility_of` is the single source of truth for whether a
             // webview should be shown, so ask it rather than re-deriving the
-            // rule here.
+            // rule here — and ask it the **same question** `sync_visibility`
+            // asks. This used to pass "active in its own view"
+            // (`tabs.active_id(tab.owner.view())`), which is not "displayed":
+            // `TabManager::displayed` additionally requires that view to be
+            // the current mode. So a tab that was `active_me` while the human
+            // was looking at Agents scored `DisplayedAndFocused`, was left
+            // shown, and two webviews painted at once — reachable by an agent
+            // taking a routine screenshot of the human's active Me tab. It
+            // self-healed on the next `sync_visibility`, which is precisely
+            // what made it invisible (WR-01).
             let still_wanted = self
                 .tabs
                 .try_borrow()
                 .ok()
                 .and_then(|tabs| {
+                    let displayed_id = tabs.displayed_id();
                     tabs.find_by_webview(&capture.webview).and_then(|id| {
                         tabs.get(id).map(|tab| {
-                            crate::tabs::visibility_of(Some(id) == tabs.active_id(tab.owner.view()), tab.held_for_view)
+                            crate::tabs::visibility_of(
+                                Some(id) == displayed_id,
+                                tab.held_for_view,
+                            )
                         })
                     })
                 })
