@@ -2,14 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
+current_phase: 5
+current_phase_name: v2
 status: executing
-last_updated: "2026-08-23T13:59:03.805Z"
+stopped_at: Completed 05-06-PLAN.md
+last_updated: "2026-08-23T15:10:45.256Z"
 progress:
-  total_phases: 8
+  total_phases: 4
   completed_phases: 3
   total_plans: 34
-  completed_plans: 28
-  percent: 38
+  completed_plans: 29
 ---
 
 # Project State
@@ -24,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 5 of 11 executed (waves 1-3 complete)
+Plan: 6 of 11 executed (waves 1-3 complete)
 Status: Ready to execute
 Next: `/gsd-execute-phase 5`
 
@@ -119,6 +121,7 @@ Phase 5 keeps per-task commits.
 | Phase 05 P03 | 30min | 2 tasks | 6 files |
 | Phase 05 P04 | 48 min | 3 tasks | 7 files |
 | Phase 5 P5 | 54 | 3 tasks | 9 files |
+| Phase 05 P06 | 76min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -223,6 +226,10 @@ Recent decisions affecting current work:
 - [Phase ?]: The /view route authenticates in its own right: the SDK middleware chain is composed only for its own transport handlers, so a merged axum route inherits axum layers and nothing else
 - [Phase ?]: View-socket termination is the stream registry's second half — a WebSocket is not an SDK session, so terminate_matching cannot reach one
 - [Phase ?]: A remote viewer sees every agent's tabs (T-05-10), matching the local Agents view, decided rather than defaulted
+- [Phase ?]: 05-06: input delivery takes a webview and an already-viewport-relative point; the toolbar subtraction lives at the local call site, so applying it remotely is inexpressible
+- [Phase ?]: 05-06: remote_input reaches a webview's input entry point and nothing else — chrome, shortcut handler, interface-action queue, active tab, view mode and window focus are absences asserted by four greps at zero
+- [Phase ?]: 05-06: a remote input message refused downstream still spends its sequence number, because a reusable number is a replayable message once the refusing state changes
+- [Phase ?]: 05-06: an e2e fixture carries a decoy link one toolbar-height above each real one, so the coordinate regression navigates to a named wrong destination instead of to nothing
 
 ### Pending Todos
 
@@ -254,6 +261,8 @@ None yet.
   predicted hosted-runner risks were real: a 42 GB `target/` cannot enter a 10 GB `actions/cache`,
   so the gate moved to a self-hosted runner and the cold hosted build became a weekly canary.
 
+- 05-08 must show the attached webview: a hidden webview answers no hit test, so today a remote click only reaches the tab the local human is displaying
+
 ## Deferred Items
 
 | Category | Item | Status | Deferred At |
@@ -271,6 +280,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T13:58:51.151Z
-Stopped at: Completed 05-05-PLAN.md
+Last session: 2026-08-23T15:10:36.088Z
+Stopped at: Completed 05-06-PLAN.md
 Resume file: None
