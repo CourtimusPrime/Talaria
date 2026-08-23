@@ -86,6 +86,27 @@ rust-mcp-sdk = { version = "1.0.1", default-features = false,
 # same crates.io owner as the rust-mcp-sdk above, named in that SDK's own README as
 # its supported Axum backend.
 rust-mcp-axum = "1.0.1"
+# The WebSocket route this phase's frame channel is built on
+# (`axum::extract::ws`), per 05-CONTEXT.md D-05-05.
+#
+# This line unifies rather than resolves. `axum 0.8.9` is already in this tree
+# through the `rust-mcp-axum` above, and `crates/talaria-shell/src/http.rs`
+# already uses it by name as `rust_mcp_axum::axum::*`. Declaring it directly
+# holds the member on that same crate node and lets `http.rs` write
+# `axum::extract::ws::WebSocketUpgrade` without going through the re-export.
+#
+# The `ws` feature's entire measured cost is **one** added package,
+# `tokio-tungstenite 0.29.0`. Its two other feature edges — `sha1 0.10` and
+# `base64 0.22.1` — are already resolved here, and its sibling
+# `tungstenite 0.29.0` is already in the lock through `servo-net` ->
+# `async-tungstenite`, so Servo's own network stack already links this
+# codebase. That is the legitimacy answer (05-RESEARCH.md, Package Legitimacy
+# Audit: no [SUS], no [SLOP]) and it is a stronger one than a download count.
+#
+# D-05-05 chose this over adding a codec crate: frame encoding reuses the `png`
+# line above at `Compression::Fast` over 64x64 tile diffs, so the WebSocket is
+# the only dependency the whole frame pipeline costs.
+axum = { version = "0.8.9", features = ["ws"] }
 async-trait = "0.1"
 # Token hashing and PKCE S256. Already resolved at 0.11.0 through the servo tree.
 sha2 = "0.11"
