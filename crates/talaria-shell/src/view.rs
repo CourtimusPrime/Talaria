@@ -81,21 +81,6 @@ pub fn tab_list_frame(tabs: Vec<TabInfo>) -> Option<Vec<u8>> {
     serde_json::to_vec(&TabList { tabs }).ok().map(|payload| encode(Channel::Tabs, &payload))
 }
 
-/// The sequence number an input message carries.
-///
-/// A match rather than an accessor on the wire type, because every variant
-/// spells the field itself and the crate that owns them deliberately exposes
-/// no getter — the ordering rule is the shell's to enforce, so reading the
-/// number is the shell's too.
-fn input_seq(message: &InputMessage) -> u64 {
-    match message {
-        InputMessage::MouseMove { seq, .. }
-        | InputMessage::MouseButton { seq, .. }
-        | InputMessage::Wheel { seq, .. }
-        | InputMessage::Key { seq, .. } => *seq,
-    }
-}
-
 /// Split an inbound frame into its channel and its payload.
 ///
 /// `None` for an empty frame or a tag byte that names no channel — a tag this
@@ -205,6 +190,23 @@ impl ViewTabs for TabManager {
     }
 }
 
+/// What one inbound frame asks of [`ViewSessions::message`]'s caller.
+///
+/// A three-way answer rather than a `bool`, because the input channel is the
+/// one thing this module deliberately cannot finish: delivering a keystroke
+/// needs a webview, and handing this module a webview would make it the second
+/// path from the wire to the engine. It hands the message back instead, and
+/// [`crate::remote_input`] stays the only one.
+pub enum Handled {
+    /// Answered here; keep the connection.
+    Done,
+    /// Nothing this module can answer at all: close the connection (T-05-11).
+    Close,
+    /// A structurally sound input message, **delivered nowhere yet**. The
+    /// caller hands it to [`crate::remote_input::apply`].
+    Input(InputMessage),
+}
+
 /// One remote viewer's connection, as the main thread sees it.
 pub struct ViewSession {
     /// The connection's own id, minted by the listener thread. Never a tab id
@@ -228,13 +230,28 @@ pub struct ViewSession {
     /// viewer joining a quiet browser would wait for a tab to open before
     /// learning there are none.
     snapshotted: bool,
-    /// The highest input sequence number seen on this connection.
+    /// The highest input sequence number this connection has had accepted.
     ///
-    /// Stored here and consulted by nothing yet, and the field is on the
-    /// *session* rather than on the attachment because the sequence space is
-    /// per connection: two viewers on one tab must not share one, or either
-    /// could replay or reorder the other's input by choosing numbers.
-    pub last_input_seq: u64,
+    /// **One field, three jobs**, which is why it is one field and not three
+    /// mechanisms: it is the replay resistance inside a connection (a number
+    /// cannot be used twice), it is the ordering rule under coalescing (a late
+    /// message that lost a race is dropped rather than applied out of order),
+    /// and it is what [`talaria_protocol::wire::FrameHeader::last_applied_input`]
+    /// echoes so a client can measure input-to-photon latency off its own
+    /// clock alone, with no clock shared between the two machines.
+    ///
+    /// *Accepted* means the message passed the sequence rule and was handed on
+    /// to [`crate::remote_input`]. A message refused further down — an
+    /// unattached tab, a tab the human owns, a coordinate outside the target's
+    /// viewport — still consumes its number, because a number that could be
+    /// reused is a message that could be replayed later, once the state it was
+    /// refused for has changed (T-05-15).
+    ///
+    /// The field is on the *session* rather than on the attachment because the
+    /// sequence space is per connection: two viewers on one tab must not share
+    /// one, or either could replay or reorder the other's input by choosing
+    /// numbers.
+    pub last_applied_input: u64,
 }
 
 impl ViewSession {
@@ -276,7 +293,7 @@ impl ViewSessions {
             out,
             attached: Vec::new(),
             snapshotted: false,
-            last_input_seq: 0,
+            last_applied_input: 0,
         });
         if let Some(session) = self.sessions.last() {
             log::debug!(
@@ -315,18 +332,18 @@ impl ViewSessions {
     /// and every semantic refusal is [`ServerView::Refused`], which carries no
     /// field to differ in.
     ///
-    /// Returns `false` when the connection should be closed.
-    pub fn message(&mut self, connection: u64, frame: &[u8], tabs: &dyn ViewTabs) -> bool {
+    /// Returns what the caller must do next — see [`Handled`].
+    pub fn message(&mut self, connection: u64, frame: &[u8], tabs: &dyn ViewTabs) -> Handled {
         let Some((channel, payload)) = split_channel(frame) else {
-            return false;
+            return Handled::Close;
         };
         match channel {
             Channel::Control => match decode_control(payload) {
                 Some(message) => {
                     self.control(connection, message, tabs);
-                    true
+                    Handled::Done
                 },
-                None => false,
+                None => Handled::Close,
             },
             // A viewer sends on the control and input channels and on no
             // other. The tabs, event and frame channels are the server's own
@@ -334,40 +351,55 @@ impl ViewSessions {
             // does not understand — closed rather than ignored, because
             // ignoring it would leave the two ends disagreeing about what the
             // connection is for.
-            Channel::Input => self.input(connection, payload),
-            Channel::Tabs | Channel::Event | Channel::Frame => false,
+            Channel::Input => self.input(payload),
+            Channel::Tabs | Channel::Event | Channel::Frame => Handled::Close,
         }
     }
 
-    /// Note one input-channel message. Returns `false` if the connection
-    /// should be closed.
+    /// Decode one input-channel message. **Structural decoding only, and
+    /// nothing is delivered anywhere from here.**
     ///
-    /// **Structural decoding only, and nothing is delivered anywhere.**
     /// [`InputMessage::from_json`] refuses a missing field, an unknown kind, a
     /// coordinate that is not a finite number and a key naming both or neither
     /// — all decidable from the bytes — and a payload it refuses ends the
     /// connection rather than becoming a message with a substituted zero in it
     /// (T-05-11).
     ///
-    /// What is kept is the connection's sequence high-water mark, and only
-    /// when it advanced. The wire's contract is that `seq` is strictly
-    /// increasing *within one connection*, which is what gives ordering under
-    /// coalescing and resistance to replay; enforcing it needs this
-    /// connection's own mark, so the mark is kept here. A message that did not
-    /// advance it is dropped, which is the contract's own word for it, and is
-    /// not a reason to close anything.
-    fn input(&mut self, connection: u64, payload: &[u8]) -> bool {
-        let Some(message) = std::str::from_utf8(payload).ok().and_then(InputMessage::from_json)
-        else {
-            return false;
-        };
-        let seq = input_seq(&message);
-        if let Some(session) = self.session_mut(connection) {
-            if seq > session.last_input_seq {
-                session.last_input_seq = seq;
-            }
+    /// Everything left is semantic and belongs to [`crate::remote_input`],
+    /// which is why the message goes back to the caller rather than onward
+    /// from here.
+    fn input(&mut self, payload: &[u8]) -> Handled {
+        match std::str::from_utf8(payload).ok().and_then(InputMessage::from_json) {
+            Some(message) => Handled::Input(message),
+            None => Handled::Close,
         }
-        true
+    }
+
+    /// Whether `connection` may deliver an input message naming `tab` with
+    /// sequence `seq` — recording the sequence when it may.
+    ///
+    /// The three questions that need this table and no engine, answered in the
+    /// order [`crate::remote_input::apply`] documents:
+    ///
+    /// 1. **The connection exists.** An input message on a connection this
+    ///    table has never heard of answers nothing.
+    /// 2. **The sequence strictly increased.** Equal or lower is dropped — the
+    ///    wire's own word for it — and the accepted value is recorded on
+    ///    *this* connection, never globally (T-05-15).
+    /// 3. **The connection holds a lease on the tab.** An unattached tab is
+    ///    refused even when it is agent-owned, because attachment is what the
+    ///    concurrent-attachment cap is counted against; input that bypassed it
+    ///    would bypass the cap.
+    ///
+    /// Ownership is *not* asked here. It is asked through the agent-only
+    /// lookup, which is the tab table's question rather than this table's.
+    pub fn admit_input(&mut self, connection: u64, tab: u64, seq: u64) -> bool {
+        let Some(session) = self.session_mut(connection) else { return false };
+        if seq <= session.last_applied_input {
+            return false;
+        }
+        session.last_applied_input = seq;
+        session.attached.contains(&tab)
     }
 
     /// Answer one control-channel message.
@@ -494,8 +526,15 @@ impl ViewSessions {
     }
 }
 
+/// Test scaffolding, shared with [`crate::remote_input`]'s own suite.
+///
+/// It lives at module level rather than inside `mod tests` because
+/// `remote_input` decides the *same* questions against the *same* two tables,
+/// and a second fake tab table is a second thing to keep in agreement with the
+/// real one. One fake, read by both suites, is the same argument
+/// [`crate::keyutils`]'s shared key table makes.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
 
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -511,17 +550,17 @@ mod tests {
     /// It carries Me tabs as well as agent ones **on purpose**: a fake that
     /// only held agent tabs could not fail the filter test, and a test that
     /// cannot fail is not evidence.
-    struct FakeTabs {
+    pub(crate) struct FakeTabs {
         /// `(tab_id, is_agent)`, in insertion order.
-        tabs: Vec<(u64, bool)>,
+        pub(crate) tabs: Vec<(u64, bool)>,
     }
 
     impl FakeTabs {
-        fn with(tabs: &[(u64, bool)]) -> Self {
+        pub(crate) fn with(tabs: &[(u64, bool)]) -> Self {
             Self { tabs: tabs.to_vec() }
         }
 
-        fn none() -> Self {
+        pub(crate) fn none() -> Self {
             Self { tabs: Vec::new() }
         }
     }
@@ -552,14 +591,14 @@ mod tests {
     }
 
     /// One connected viewer, plus the read end of its outbound channel.
-    struct Viewer {
-        connection: u64,
+    pub(crate) struct Viewer {
+        pub(crate) connection: u64,
         frames: UnboundedReceiver<Vec<u8>>,
     }
 
     impl Viewer {
         /// Every frame written to this viewer since the last drain.
-        fn drain(&mut self) -> Vec<Vec<u8>> {
+        pub(crate) fn drain(&mut self) -> Vec<Vec<u8>> {
             let mut frames = Vec::new();
             while let Ok(frame) = self.frames.try_recv() {
                 frames.push(frame);
@@ -568,7 +607,7 @@ mod tests {
         }
 
         /// The control-channel messages among them.
-        fn control(&mut self) -> Vec<ServerView> {
+        pub(crate) fn control(&mut self) -> Vec<ServerView> {
             self.drain()
                 .iter()
                 .filter_map(|frame| match split_channel(frame) {
@@ -579,7 +618,7 @@ mod tests {
         }
 
         /// The tab lists among them.
-        fn snapshots(&mut self) -> Vec<Vec<u64>> {
+        pub(crate) fn snapshots(&mut self) -> Vec<Vec<u64>> {
             self.drain()
                 .iter()
                 .filter_map(|frame| match split_channel(frame) {
@@ -593,22 +632,41 @@ mod tests {
         }
     }
 
-    fn connect(sessions: &mut ViewSessions, connection: u64, client_id: &str) -> Viewer {
+    pub(crate) fn connect(
+        sessions: &mut ViewSessions,
+        connection: u64,
+        client_id: &str,
+    ) -> Viewer {
         let (out, frames) = tokio::sync::mpsc::unbounded_channel();
         sessions.opened(connection, client_id.to_owned(), out);
         Viewer { connection, frames }
     }
 
-    fn attach(sessions: &mut ViewSessions, viewer: &Viewer, tab: u64, tabs: &dyn ViewTabs) {
+    pub(crate) fn attach(
+        sessions: &mut ViewSessions,
+        viewer: &Viewer,
+        tab: u64,
+        tabs: &dyn ViewTabs,
+    ) {
         let frame = control_request(&ClientView::Attach { tab });
-        assert!(sessions.message(viewer.connection, &frame, tabs), "the connection was closed");
+        assert!(
+            matches!(sessions.message(viewer.connection, &frame, tabs), Handled::Done),
+            "the connection was closed",
+        );
     }
 
     /// A client-side control frame, composed the way a real viewer composes
     /// one.
-    fn control_request(message: &ClientView) -> Vec<u8> {
+    pub(crate) fn control_request(message: &ClientView) -> Vec<u8> {
         encode(Channel::Control, &serde_json::to_vec(message).expect("serializable"))
     }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
 
     /// `D-05-02`: a tab the human owns never appears in a snapshot, in any
     /// state.
@@ -803,12 +861,15 @@ mod tests {
         let _ = viewer.drain();
 
         let frame = control_request(&ClientView::Detach { tab: 1 });
-        assert!(sessions.message(1, &frame, &tabs));
+        assert!(matches!(sessions.message(1, &frame, &tabs), Handled::Done));
         assert_eq!(viewer.control(), vec![ServerView::Detached { tab: 1 }]);
         assert_eq!(sessions.session_mut(1).expect("the session").attachment_count(), 0);
 
         // And again, holding nothing.
-        assert!(sessions.message(1, &frame, &tabs), "a redundant detach closed the connection");
+        assert!(
+            matches!(sessions.message(1, &frame, &tabs), Handled::Done),
+            "a redundant detach closed the connection",
+        );
         assert_eq!(viewer.control(), vec![ServerView::Detached { tab: 1 }]);
     }
 
@@ -877,10 +938,39 @@ mod tests {
             encode(Channel::Input, br#"{"kind":"mouse_move","tab":1,"seq":1,"x":null,"y":2}"#),
         ] {
             assert!(
-                !sessions.message(viewer.connection, &frame, &tabs),
+                matches!(sessions.message(viewer.connection, &frame, &tabs), Handled::Close),
                 "a frame this server cannot answer left the connection open: {frame:?}"
             );
         }
+    }
+
+    /// A well-formed input message is handed **back** to the caller rather
+    /// than acted on here — this module owns no path to a webview, and that
+    /// absence is the reason `remote_input` can be the only one.
+    #[test]
+    fn a_well_formed_input_message_is_handed_back_and_delivered_nowhere() {
+        let tabs = FakeTabs::with(&[(1, true)]);
+        let mut sessions = ViewSessions::default();
+        let mut viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &tabs);
+        let _ = viewer.drain();
+
+        let frame = encode(
+            Channel::Input,
+            InputMessage::MouseMove { tab: 1, seq: 7, x: 4.0, y: 5.0 }
+                .to_json()
+                .expect("well formed")
+                .as_bytes(),
+        );
+        let handled = sessions.message(viewer.connection, &frame, &tabs);
+        assert!(
+            matches!(handled, Handled::Input(InputMessage::MouseMove { seq: 7, .. })),
+            "a decoded input message was not handed back",
+        );
+        // Nothing was sent and nothing was recorded: admitting the message is
+        // `remote_input`'s call, made through `admit_input`.
+        assert!(viewer.drain().is_empty(), "decoding an input message answered the viewer");
+        assert_eq!(sessions.session_mut(1).expect("the session").last_applied_input, 0);
     }
 
     /// The input channel's sequence high-water mark is per connection, and it
@@ -891,26 +981,21 @@ mod tests {
         let mut sessions = ViewSessions::default();
         let first = connect(&mut sessions, 1, "client-a");
         let second = connect(&mut sessions, 2, "client-b");
+        attach(&mut sessions, &first, 1, &tabs);
+        attach(&mut sessions, &second, 1, &tabs);
 
-        let moved = |seq: u64| {
-            encode(
-                Channel::Input,
-                InputMessage::MouseMove { tab: 1, seq, x: 4.0, y: 5.0 }
-                    .to_json()
-                    .expect("well formed")
-                    .as_bytes(),
-            )
-        };
-        assert!(sessions.message(first.connection, &moved(7), &tabs));
-        assert_eq!(sessions.session_mut(1).expect("first").last_input_seq, 7);
-        // A replay does not move the mark backwards, and is not a reason to
-        // close anything: the wire's own word for it is "dropped".
-        assert!(sessions.message(first.connection, &moved(3), &tabs));
-        assert_eq!(sessions.session_mut(1).expect("first").last_input_seq, 7);
-        // And the other connection's space is its own.
-        assert_eq!(sessions.session_mut(2).expect("second").last_input_seq, 0);
-        assert!(sessions.message(second.connection, &moved(1), &tabs));
-        assert_eq!(sessions.session_mut(2).expect("second").last_input_seq, 1);
+        assert!(sessions.admit_input(first.connection, 1, 7));
+        assert_eq!(sessions.session_mut(1).expect("first").last_applied_input, 7);
+        // A replay does not move the mark backwards, and is dropped: the
+        // wire's own word for it.
+        assert!(!sessions.admit_input(first.connection, 1, 3));
+        assert!(!sessions.admit_input(first.connection, 1, 7));
+        assert_eq!(sessions.session_mut(1).expect("first").last_applied_input, 7);
+        // And the other connection's space is its own: two viewers on one tab
+        // neither share a mark nor starve each other.
+        assert_eq!(sessions.session_mut(2).expect("second").last_applied_input, 0);
+        assert!(sessions.admit_input(second.connection, 1, 1));
+        assert_eq!(sessions.session_mut(2).expect("second").last_applied_input, 1);
     }
 
     /// A resize naming a tab this connection never attached to is refused, and
@@ -924,11 +1009,11 @@ mod tests {
         let _ = viewer.drain();
 
         let held = control_request(&ClientView::Viewport { tab: 1, width: 800, height: 600 });
-        assert!(sessions.message(1, &held, &tabs));
+        assert!(matches!(sessions.message(1, &held, &tabs), Handled::Done));
         assert!(viewer.control().is_empty(), "a resize of an attached tab was answered");
 
         let other = control_request(&ClientView::Viewport { tab: 2, width: 800, height: 600 });
-        assert!(sessions.message(1, &other, &tabs));
+        assert!(matches!(sessions.message(1, &other, &tabs), Handled::Done));
         assert_eq!(viewer.control(), vec![ServerView::Refused]);
     }
 

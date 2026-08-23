@@ -151,13 +151,6 @@ pub fn keyboard_event_from_winit(event: &KeyEvent) -> Option<KeyboardEvent> {
 /// An empty character is refused too: it is a keystroke that types nothing,
 /// and delivering it would be substituting a value for a message that carried
 /// none.
-// `expect` rather than `allow`, and deliberately: the moment `remote_input`
-// calls this, the expectation goes unfulfilled and the compiler says so, which
-// removes this attribute rather than leaving it behind as a stale silence.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the wire keyboard path's only caller is remote_input")
-)]
 pub fn keyboard_event_from_wire(
     state: KeyState,
     character: Option<&str>,

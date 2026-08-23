@@ -11,6 +11,7 @@ mod http;
 mod keyutils;
 mod oauth;
 mod permissions;
+mod remote_input;
 mod settings;
 mod tabs;
 mod vault;

@@ -769,16 +769,28 @@ impl Shared {
 
     /// One frame from a viewer. A frame that could not be answered ends the
     /// connection — the socket task learns that when its channel drops.
+    ///
+    /// The input channel lands in [`crate::remote_input`] and nowhere else:
+    /// this is the one dispatch site, and it deliberately routes *nothing*
+    /// through the window-event arms, the browser-shortcut handler or the
+    /// interface-action queue that a local click travels through (T-05-04).
     pub fn view_message(&self, connection: u64, frame: &[u8]) {
         // Scoped, as every borrow here is: the tab table is read through a
         // shared borrow that is released before the session table is touched
         // again, so a message can never wedge the loop it reports into.
-        let keep = {
+        let handled = {
             let tabs = self.tabs.borrow();
             self.views.borrow_mut().message(connection, frame, &*tabs)
         };
-        if !keep {
-            self.views.borrow_mut().closed(connection);
+        match handled {
+            crate::view::Handled::Done => {},
+            crate::view::Handled::Close => self.views.borrow_mut().closed(connection),
+            crate::view::Handled::Input(message) => {
+                // Whether it was applied is not reported to the peer: every
+                // refusal is silent beyond the fact of not happening, and none
+                // of them says which rule was broken.
+                let _ = crate::remote_input::apply(self, connection, &message);
+            },
         }
     }
 
