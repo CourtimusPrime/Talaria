@@ -2,14 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
+current_phase: 5
+current_phase_name: v2
 status: executing
-last_updated: "2026-08-23T12:21:13.281Z"
+stopped_at: Completed 05-04-PLAN.md
+last_updated: "2026-08-23T13:02:34.114Z"
 progress:
-  total_phases: 8
+  total_phases: 4
   completed_phases: 3
   total_plans: 34
-  completed_plans: 26
-  percent: 38
+  completed_plans: 27
 ---
 
 # Project State
@@ -24,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 3 of 11 executed (wave 1 complete)
+Plan: 4 of 11 executed (wave 1 complete)
 Status: Ready to execute
 Next: `/gsd-execute-phase 5`
 
@@ -117,6 +119,7 @@ Phase 5 keeps per-task commits.
 | Phase 05 P01 | 50min | 3 tasks | 6 files |
 | Phase 05 P02 | 45min | 2 tasks | 2 files |
 | Phase 05 P03 | 30min | 2 tasks | 6 files |
+| Phase 05 P04 | 48 min | 3 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -215,6 +218,9 @@ Recent decisions affecting current work:
 - [Phase ?]: The view wire's channel tags are 0x01 control, 0x02 tabs, 0x03 event, 0x04 input, 0x10 frame — a low JSON block and a high binary block, with the gap deliberate
 - [Phase ?]: The frame header is a fixed 51-byte little-endian layout carrying last_applied_input, which makes input-to-photon latency measurable with no clock shared between the two machines
 - [Phase ?]: talaria-protocol's Unix socket helpers were moved into a cfg(unix) local module and deliberately not re-exported: a re-export would leave the root surface being corrected exactly as it was
+- [Phase 05]: One advertised origin feeds every string this browser publishes; the bind host stays a module constant and Talaria handles no transport identity (D-05-03)
+- [Phase 05]: A validated advertised URL is refused rather than normalised — a normalisation is a second spelling, and RFC 8707 audience validation compares byte for byte
+- [Phase 05]: Standing the Tailscale Serve proxy up is an executable, port-scoped, Funnel-refusing script rather than a recipe in a document
 
 ### Pending Todos
 
@@ -263,6 +269,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T12:21:02.448Z
-Stopped at: Completed 05-03-PLAN.md
+Last session: 2026-08-23T13:02:21.174Z
+Stopped at: Completed 05-04-PLAN.md
 Resume file: None
