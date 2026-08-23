@@ -5,13 +5,13 @@ milestone_name: milestone
 current_phase: 5
 current_phase_name: v2
 status: executing
-stopped_at: Completed 05-09-PLAN.md
-last_updated: "2026-08-23T18:26:03.055Z"
+stopped_at: Completed 05-10-PLAN.md
+last_updated: "2026-08-23T19:56:51.426Z"
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 34
-  completed_plans: 32
+  completed_plans: 34
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 9 of 11 executed (waves 1-5 complete; wave 6 done — 05-09 landed, 05-10 next)
+Plan: 10 of 11 executed (waves 1-6 complete; wave 7 done — 05-10 landed, 05-11 next)
 Status: Ready to execute
 Next: `/gsd-execute-phase 5`
 
@@ -160,6 +160,7 @@ Phase 5 keeps per-task commits.
 | Phase 05 P07 | 96min | 3 tasks | 8 files |
 | Phase 05 P08 | 95min | 3 tasks | 7 files |
 | Phase 05 P09 | 175 | 3 tasks | 9 files |
+| Phase 05 P10 | 70 min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -274,6 +275,16 @@ Recent decisions affecting current work:
 - [Phase ?]: 05-07: the client has no retry loop; every failed state names a human next step and UiAction::Reconnect is a press
 - [Phase 5]: 05-08: a viewport message forces a keyframe and does not resize the webview; server-side scaling stays 05-10's through scale_denominator
 - [Phase 5]: 05-08: the frame encoder is a sibling of encode_screenshot diverging on one line (raw bytes), not three — png 0.17's defaults already match, per the 05-02 correction
+- [Phase 5]: 05-09: the scale denominator composes with the fit, not the upload — a half-resolution frame occupies the same on-screen rectangle as a full one, so the page does not shrink the first time the ladder steps down
+- [Phase 5]: 05-10: the degrade ladder lives in one ordered table both ends read, and its ordering (intervals non-decreasing, denominators non-decreasing) is a walked unit test rather than a convention
+- [Phase 5]: 05-10: the cadence request names an enumerated rung instead of carrying a raw interval — the server's honour-or-clamp decision is removed rather than bounded (T-05-12-D)
+- [Phase 5]: 05-10: the recovery margin is two fifths and is DERIVED from the ladder, not tuned: a sample good enough to step up must never be an overrun on the rung it steps up to, which the plan's seven tenths violates on every doubling step
+- [Phase 5]: 05-10: the ladder moves on raw whole-millisecond samples and the EWMA is only what the human reads — an average carries one spike for a dozen samples and would contradict 'one overrun followed by a good sample moves nothing'
+- [Phase 5]: 05-10: the passive/driven transition is one shared function in talaria-protocol that both ends call, not two implementations with a comment saying they agree
+- [Phase 5]: 05-10: the reduction rounds up and the frame header carries the reduced dimensions plus the denominator, so a client multiplies two declared facts back rather than inferring a scale from a size ratio
+- [Phase 5]: 05-10: the passive rung is half resolution — the ladder's floor is the rung that has to survive the worst link, and 13 Mbit/s carries a 138 KB half-res frame and not a 522 KB full one
+- [Phase 5]: 05-10: SC 2's target stays a two-machine manual claim; the suite asserts the cadence transition, the ladder's response and the reporting, and says in its own docstring that it does not assert the target, because loopback hides transmission
+- [Phase 5]: 05-10: a script-animated page repaints about once a second on a background webview while a CSS-animated one repaints at the pump's own rate — measured three ways, and the reason the latency fixture is declarative
 
 ### Pending Todos
 
@@ -325,6 +336,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T18:26:03.049Z
-Stopped at: Completed 05-09-PLAN.md
+Last session: 2026-08-23T19:56:51.419Z
+Stopped at: Completed 05-10-PLAN.md
 Resume file: None
