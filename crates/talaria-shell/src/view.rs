@@ -1079,15 +1079,40 @@ impl Attachment {
     /// including the click that would revoke the token, because the Access
     /// panel is drawn by the loop being pinned.
     ///
-    /// So the earliest a tick may be taken is one rung interval after the last
-    /// one. That keeps the responsiveness the pull-forward exists for — an
-    /// honest click does not wait out a passive interval, because after an idle
-    /// stretch the floor is already in the past — while making the rung's
-    /// interval the *rate* ceiling it was always documented to be. The floor is
-    /// the rung's own rather than the passive one on purpose: a viewer is
-    /// entitled to the cadence it asked for, and nothing faster.
-    fn pull_forward(&mut self, rung: Rung, now: Instant) {
-        let floor = self.last_tick.map_or(now, |last| (last + rung.interval()).max(now));
+    /// So the earliest a tick may be taken is one [`Rung::FASTEST`] interval
+    /// after the last one: a token bucket of one, refilled at the ladder's own
+    /// ceiling. A viewer driving as hard as it can gets exactly the rate a
+    /// legitimate viewer on the fastest rung gets, and nothing above it —
+    /// which is the number T-05-12-D was about. Multiplied by the total
+    /// attachment cap [`DEFAULT_MAX_TOTAL_ATTACH`], that is the whole of what
+    /// the winit loop can be made to spend, and it is the same worst case the
+    /// design already sanctions.
+    ///
+    /// **The floor is the ladder's ceiling and deliberately not the
+    /// connection's own rung**, which is the version of this that was tried
+    /// first and is wrong twice over. It reads plausibly — "a viewer is
+    /// entitled to the cadence it asked for and nothing faster" — but the rung
+    /// is a *bandwidth* decision and this is a *CPU* bound, and tying the
+    /// second to the first breaks the ladder that made the first:
+    ///
+    /// - Every latency sample would carry up to one rung interval of pure
+    ///   scheduling delay, because an input landing just after a tick would
+    ///   wait out the whole of the next one. The client's controller compares
+    ///   a sample against that same interval, so the delay it is measuring
+    ///   would grow in step with the thing it is measured against.
+    /// - Recovery would become unreachable. `is_comfortable` asks for a sample
+    ///   under **two fifths** of the interval, and scheduling delay alone
+    ///   averages a half of it — so a link that ever overran the fastest rung
+    ///   would walk to the bottom of the ladder and stay there. Observed, on
+    ///   the constrained link `tests/e2e/remote_latency_test.py` shims:
+    ///   `full → slowest` in four steps and never a step back.
+    ///
+    /// At the ladder's ceiling the added delay is at most 30 ms whatever rung
+    /// the viewer is on, so degrading still buys what it is supposed to buy —
+    /// fewer bytes — rather than being cancelled out by a longer wait.
+    fn pull_forward(&mut self, now: Instant) {
+        let floor =
+            self.last_tick.map_or(now, |last| (last + Rung::FASTEST.interval()).max(now));
         self.due = self.due.min(floor);
     }
 }
@@ -1366,7 +1391,6 @@ impl ViewSessions {
             return false;
         }
         session.last_applied_input = seq;
-        let rung = session.rung;
         let Some(attachment) = session.attachment_mut(tab) else { return false };
         // The driven cadence starts here, and it starts on *this* tick rather
         // than at the end of the passive interval already in flight: the input
@@ -1379,7 +1403,7 @@ impl ViewSessions {
         // argument.
         let now = Instant::now();
         attachment.last_input = Some(now);
-        attachment.pull_forward(rung, now);
+        attachment.pull_forward(now);
         true
     }
 
@@ -1470,7 +1494,6 @@ impl ViewSessions {
         let mut take_hold = false;
         {
             let Some(session) = self.session_mut(connection) else { return };
-            let rung = session.rung;
             match session.attachment_mut(tab) {
                 // A client that lost its own acknowledgement and asked again
                 // is starting from nothing, so it gets a fresh keyframe as
@@ -1483,7 +1506,7 @@ impl ViewSessions {
                 // the loop exactly as an input flood would.
                 Some(attachment) => {
                     attachment.keyframe = true;
-                    attachment.pull_forward(rung, now);
+                    attachment.pull_forward(now);
                 },
                 None => {
                     if session.attached.len() >= cap || total >= total_cap {
@@ -2799,14 +2822,17 @@ mod tests {
         );
 
         // Driving, so the rung's own interval is the one in force — and the
-        // input brings the next tick forward to that interval's floor rather
-        // than to the present moment, so the tick is taken *there* (CR-01).
+        // input brings the next tick forward to the *ladder's ceiling*, one
+        // fastest-rung interval after the last tick, rather than to the
+        // present moment (CR-01). Not to one of this rung's own intervals:
+        // see [`Attachment::pull_forward`] for why a CPU bound tied to a
+        // bandwidth request makes the ladder's recovery half unreachable.
         assert!(sessions.admit_input(1, 1, 1));
         let at = sessions.next_tick().expect("an attached connection is due");
         assert_eq!(
             at,
-            now + slow.interval(),
-            "an input did not bring the next tick forward to exactly one rung interval",
+            now + Rung::FASTEST.interval(),
+            "an input did not bring the next tick forward to the ladder's own ceiling",
         );
         let driven = sessions.take_due(at, view_idle()).remove(0);
         assert_eq!(driven.scale_denominator, slow.scale_denominator());
@@ -3090,6 +3116,43 @@ mod tests {
             sessions.take_due(Instant::now() + driven, view_idle()).len(),
             1,
             "the floor stopped the pump instead of bounding it",
+        );
+    }
+
+    /// The floor is the ladder's own ceiling, and not the rung the connection
+    /// happens to be on — which is the version of CR-01's fix that reads
+    /// plausibly and breaks the ladder.
+    ///
+    /// A rung is a **bandwidth** decision; this floor is a **CPU** bound. Tied
+    /// to the rung, every latency sample would carry up to one rung interval
+    /// of pure scheduling delay, measured against that same interval — and
+    /// since `is_comfortable` asks for two fifths of it while the delay alone
+    /// averages a half, a link that ever overran the fastest rung could never
+    /// climb back. `tests/e2e/remote_latency_test.py` observed exactly that:
+    /// four steps down the ladder and never one back up.
+    #[test]
+    fn the_input_floor_is_the_ladder_s_ceiling_and_not_the_rung_s_own_interval() {
+        let slow = Rung::PassiveOnly;
+        assert!(
+            slow.interval() > Rung::FASTEST.interval(),
+            "the ladder has one interval, so this asserts nothing",
+        );
+
+        let mut tabs = FakeTabs::with(&[(1, true)]);
+        let mut sessions = ViewSessions::default();
+        let viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &mut tabs);
+        let request = control_request(&ClientView::Cadence { rung: Some(slow) });
+        assert!(matches!(sessions.message(1, &request, &mut tabs), Handled::Done));
+
+        let now = Instant::now();
+        assert_eq!(sessions.take_due(now, view_idle()).len(), 1, "the first frame was not due");
+        assert!(sessions.admit_input(viewer.connection, 1, 1));
+        assert_eq!(
+            sessions.next_tick(),
+            Some(now + Rung::FASTEST.interval()),
+            "an input on a slow rung waited out that rung's own interval, which is a \
+             scheduling delay the client's controller would measure as link latency",
         );
     }
 
