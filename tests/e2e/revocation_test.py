@@ -22,7 +22,11 @@ Revoke control. What this pins down:
     because the shell's tracking was once keyed on the ``/mcp`` path alone and
     a revoked client's ``/sse`` stream simply kept delivering (CR-02); the two
     live in the same session store under the same client id, so nothing about
-    a passing ``/mcp`` assertion implies the other.
+    a passing ``/mcp`` assertion implies the other. The **third** stream shape
+    is now covered too: the remote view channel's WebSocket, which is not an
+    SDK session at all and so cannot be reached by walking the session
+    directory — it is closed through a registry of its own, and asserting that
+    here is what keeps the two halves of a revoke from drifting apart.
   * Every other client is untouched: a fresh request works and both of its own
     open streams are still delivering.
   * The revocation survives a restart of the shell.
@@ -428,6 +432,7 @@ log = None
 tal = None
 callbacks = []
 streams = []
+views = []
 try:
     log = open(SHELL_LOG, "w")
 
@@ -590,6 +595,23 @@ try:
         "the second client's /sse stream opened but never delivered anything"
     print("STREAMS: four open event streams — two on /mcp, two on /sse, all delivering")
 
+    # --- 4b. and a view socket for each ----------------------------------
+    # The third stream shape, and the one the session directory cannot reach:
+    # a WebSocket is not an SDK session, so `terminate_matching` walks straight
+    # past it. It is closed through a registry of its own, keyed on the same
+    # verified client id, and this is where that half is asserted.
+    first_view = harness.WebSocket("127.0.0.1", port, first_token)
+    views.append(first_view)
+    second_view = harness.WebSocket("127.0.0.1", port, second_token)
+    views.append(second_view)
+    for label, view in (("first", first_view), ("second", second_view)):
+        assert view.handshook(), (label, view.status, view.headers)
+        # The server's hello arrives unprompted, which is what turns "the
+        # socket is open" into a measurement rather than an assumption.
+        assert view.delivering(10.0), \
+            (label, "the view socket opened but never delivered anything")
+    print("VIEW SOCKETS: two open /view WebSockets, both delivering")
+
     # --- 5. the Access panel lists both ----------------------------------
     harness.click_rect("toolbar.access", wid, X)
     rects, _scale = harness.wait_for_rect("access.row.1")
@@ -693,8 +715,15 @@ try:
     assert first_sse.closed_within(CLOSE_WAIT), (
         "the revoked client's open /sse stream is still open — the revoke closed "
         "its /mcp stream and left this one delivering")
-    print(f"STREAM CLOSED: the revoked client's /mcp and /sse streams both ended "
-          f"within {CLOSE_WAIT:.0f}s")
+    # And the third shape. Same assertion, same direction, and it can fail the
+    # same honest way: nothing here opens a fresh socket, so "a new upgrade now
+    # fails" cannot satisfy it. A revoked viewer that kept its socket would be
+    # one still watching the human's agents while the panel showed the row gone.
+    assert first_view.closed_within(CLOSE_WAIT), (
+        "the revoked client's open view socket is still open — its next upgrade "
+        "is refused, but it is still receiving from the browser")
+    print(f"STREAM CLOSED: the revoked client's /mcp, /sse and /view connections "
+          f"all ended within {CLOSE_WAIT:.0f}s")
 
     # --- 10. the other client is untouched -------------------------------
     status, listed, _raw = second.call("tools/list", message_id=7)
@@ -704,13 +733,18 @@ try:
         "revoking one client closed another client's open stream"
     assert second_sse.still_open(), \
         "revoking one client closed another client's open /sse stream"
-    print("UNTOUCHED: the second client still drives the browser and both its "
-          "streams are still open")
+    assert second_view.still_open(), \
+        "revoking one client closed another client's open view socket"
+    print("UNTOUCHED: the second client still drives the browser and all three of "
+          "its connections are still open")
 
     # --- 11. revocation survives a restart -------------------------------
     for stream in streams:
         stream.close()
     streams = []
+    for view in views:
+        view.close()
+    views = []
     stop_shell(tal)
     tal = None
     tal = harness.start_shell("about:blank", log=log, rust_log="info", wait=10,
@@ -781,6 +815,8 @@ try:
 finally:
     for stream in streams:
         stream.close()
+    for view in views:
+        view.close()
     for callback in callbacks:
         callback.stop()
     if tal is not None:

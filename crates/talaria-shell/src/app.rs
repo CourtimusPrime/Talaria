@@ -1101,7 +1101,6 @@ impl ApplicationHandler<AppEvent> for App {
             state.process_pending_captures();
             state.process_pending_evals();
             state.process_pending_history_writes();
-            state.publish_views();
             match event {
                 AppEvent::Wake => {},
                 AppEvent::SessionStarted { session_id, client, events } => {
@@ -1190,6 +1189,10 @@ impl ApplicationHandler<AppEvent> for App {
                     state.view_closed(connection);
                 },
             }
+            // *After* the arm, not before it: an agent command that opened or
+            // closed a tab has to reach a viewer on this turn rather than
+            // waiting for whatever happens next.
+            state.publish_views();
             state.servo.spin_event_loop();
             set_wait(event_loop, state);
         }

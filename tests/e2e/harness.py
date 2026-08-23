@@ -30,8 +30,10 @@ import hashlib
 import http.server
 import json
 import os
+import select
 import signal
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -45,6 +47,10 @@ DISPLAY = os.environ.get("TALARIA_E2E_DISPLAY", ":99")
 # at all. Honour the same variable rather than assuming the default location.
 TARGET = os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
 BINARY = os.path.join(TARGET, "release", "talaria")
+# The remote view client's binary, named beside the shell's rather than in the
+# suite that first needs it: the plan that builds it should not have to reach
+# into this file's constant block from a later wave to add one line.
+CLIENT_BINARY = os.path.join(TARGET, "release", "talaria-client")
 
 
 def socket_path():
@@ -441,3 +447,217 @@ class LoopbackCallback:
 def loopback_callback():
     """A started :class:`LoopbackCallback`. Stop it in a ``finally``."""
     return LoopbackCallback()
+
+
+# --- a standard-library WebSocket client -------------------------------------
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_accept(key):
+    """RFC 6455's handshake proof: base64(sha1(key + GUID))."""
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+
+class WebSocket:
+    """A WebSocket client on a raw socket, standard library only.
+
+    **What it pins down.** The request line and every header are written by
+    hand, which is the point rather than an inconvenience: the origin-refusal
+    and wrong-host assertions are one extra header each, and no library gets
+    to decide what goes on the wire. The handshake proof is **verified** —
+    ``Sec-WebSocket-Accept`` is recomputed from the key that was sent — so a
+    proxy or a server that answered ``101`` without completing the handshake
+    is caught rather than assumed to have worked.
+
+    A non-``101`` answer is a value, not an exception: ``status``, ``headers``
+    and ``body`` are readable, which is how the refusal assertions compare one
+    answer against another byte for byte.
+
+    Read with ``select`` on a bare socket rather than through a buffered
+    reader, the technique ``revocation_test.py``'s ``Stream`` established and
+    for the same reason: a reader that has timed out once refuses every later
+    read, and this class has to be able to say both "nothing yet, still open"
+    and "ended" about the same connection. ``closed_within`` is the assertion
+    a revoked viewer needs, and copying its shape is deliberate — asserting
+    instead that a fresh upgrade now fails would pass whether or not the
+    socket ever closed.
+
+    **Its honest limits.** It does not reassemble fragmented messages (this
+    server sends none), it does not negotiate extensions, and it treats a
+    close frame, an EOF and a reset alike as an ending — which is the honest
+    reading of all three from the read side: the client can no longer receive.
+    """
+
+    def __init__(self, host, port, token=None, path="/view", host_header=None,
+                 headers=(), timeout=10):
+        self.socket = socket.create_connection((host, port), timeout=timeout)
+        self.key = base64.b64encode(os.urandom(16)).decode()
+        lines = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host_header or f'{host}:{port}'}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {self.key}",
+            "Sec-WebSocket-Version: 13",
+        ]
+        if token is not None:
+            lines.append(f"Authorization: Bearer {token}")
+        lines.extend(headers)
+        self.socket.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        self.socket.settimeout(None)
+        self.buf = b""
+        self.messages = []
+        self.ended = False
+        self.framed = False
+        self.body = b""
+        self.status, self.headers = self._read_head()
+        if self.status == 101:
+            self.framed = True
+            self._decode()
+        else:
+            self.ended = True
+            self._read_body()
+
+    # -- handshake ------------------------------------------------------------
+
+    def _read_head(self):
+        deadline = time.monotonic() + 10
+        while b"\r\n\r\n" not in self.buf:
+            if not self._pump(deadline - time.monotonic()):
+                raise AssertionError(f"no response head: {self.buf[:200]!r}")
+        head, _, self.buf = self.buf.partition(b"\r\n\r\n")
+        lines = head.decode(errors="replace").split("\r\n")
+        status = int(lines[0].split()[1])
+        headers = {}
+        for line in lines[1:]:
+            key, _, value = line.partition(":")
+            headers[key.strip().lower()] = value.strip()
+        return status, headers
+
+    def _read_body(self):
+        """A refusal's body, so two refusals can be compared byte for byte."""
+        length = int(self.headers.get("content-length", 0) or 0)
+        deadline = time.monotonic() + 5
+        while len(self.buf) < length and time.monotonic() < deadline:
+            if not self._pump(deadline - time.monotonic()) and self.ended:
+                break
+        self.body, self.buf = self.buf[:length], self.buf[length:]
+
+    def handshook(self):
+        """True once the upgrade completed *and* the proof checks out."""
+        return (self.status == 101
+                and self.headers.get("sec-websocket-accept") == ws_accept(self.key)
+                and self.headers.get("upgrade", "").lower() == "websocket")
+
+    # -- framing --------------------------------------------------------------
+
+    def _decode(self):
+        """Move whatever complete frames have arrived into ``messages``."""
+        if not self.framed:
+            return
+        while True:
+            if len(self.buf) < 2:
+                return
+            opcode = self.buf[0] & 0x0F
+            masked = self.buf[1] & 0x80
+            length = self.buf[1] & 0x7F
+            offset = 2
+            if length == 126:
+                if len(self.buf) < 4:
+                    return
+                length = struct.unpack(">H", self.buf[2:4])[0]
+                offset = 4
+            elif length == 127:
+                if len(self.buf) < 10:
+                    return
+                length = struct.unpack(">Q", self.buf[2:10])[0]
+                offset = 10
+            mask = b""
+            if masked:
+                if len(self.buf) < offset + 4:
+                    return
+                mask = self.buf[offset:offset + 4]
+                offset += 4
+            if len(self.buf) < offset + length:
+                return
+            payload = self.buf[offset:offset + length]
+            self.buf = self.buf[offset + length:]
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:      # close
+                self.ended = True
+                return
+            elif opcode == 0x9:    # ping -> pong, so the server keeps us
+                self.send(payload, opcode=0xA)
+            elif opcode == 0xA:    # pong
+                pass
+            else:                  # text, binary, continuation
+                self.messages.append(payload)
+
+    def send(self, payload, opcode=0x2):
+        """One masked frame. A client must mask; a server must not."""
+        mask = os.urandom(4)
+        length = len(payload)
+        if length < 126:
+            header = bytes([0x80 | opcode, 0x80 | length])
+        elif length < 65536:
+            header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", length)
+        else:
+            header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack(">Q", length)
+        body = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.socket.sendall(header + mask + body)
+
+    # -- reading --------------------------------------------------------------
+
+    def _pump(self, timeout):
+        """One read. False on timeout, False and ``ended`` set on an ending."""
+        if timeout <= 0:
+            return False
+        if not select.select([self.socket], [], [], timeout)[0]:
+            return False
+        try:
+            chunk = self.socket.recv(65536)
+        except (ConnectionResetError, OSError):
+            self.ended = True
+            return False
+        if not chunk:
+            self.ended = True
+            return False
+        self.buf += chunk
+        self._decode()
+        return True
+
+    def next_message(self, timeout=5.0):
+        """The next decoded message, or ``None`` if none arrives in time."""
+        deadline = time.monotonic() + timeout
+        while not self.messages and not self.ended:
+            if not self._pump(deadline - time.monotonic()) and time.monotonic() > deadline:
+                break
+        return self.messages.pop(0) if self.messages else None
+
+    def delivering(self, timeout=5.0):
+        """True once any message has arrived, which makes "open" a measurement."""
+        return self.next_message(timeout) is not None
+
+    def still_open(self, settle=1.0):
+        """False once the read side has seen the connection end."""
+        self._pump(settle)
+        return not self.ended
+
+    def closed_within(self, timeout):
+        """True once the read side sees the connection end within ``timeout``.
+
+        The assertion a revoked viewer needs, made from the side that would
+        notice. Asserting instead that a fresh upgrade now fails would pass
+        whether or not this socket ever closed."""
+        deadline = time.monotonic() + timeout
+        while not self.ended and time.monotonic() < deadline:
+            self._pump(min(0.5, deadline - time.monotonic()))
+        return self.ended
+
+    def close(self):
+        try:
+            self.socket.close()
+        except OSError:
+            pass
