@@ -5,15 +5,15 @@ milestone_name: milestone
 current_phase: 5
 current_phase_name: distributed-mode
 status: ready-to-execute
-stopped_at: Phase 04 closed and verified; Phase 05 planned (11 plans, checker APPROVED)
-last_updated: "2026-08-21T04:56:15.056Z"
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-08-23T11:06:26.595Z"
+progress:
+  total_phases: 4
+  completed_phases: 3
+  total_plans: 34
+  completed_plans: 24
 last_activity: 2026-08-21
 last_activity_desc: Phase 05 planned - 11 plans in 8 waves, plan-checker APPROVED at revision 3
-progress:
-  total_phases: 8
-  completed_phases: 4
-  total_plans: 23
-  completed_plans: 23
 ---
 
 # Project State
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 0 of 11 executed
+Plan: 1 of 11 executed
 Status: Planned and verified — ready to execute
 Next: `/gsd-execute-phase 5`
 
@@ -112,6 +112,7 @@ Phase 5 keeps per-task commits.
 | Phase 04 P06 | 64 min | 3 tasks | 8 files |
 | Phase 04 P07 | 55min | 2 tasks | 3 files |
 | Phase 04 P08 | 85 min | 3 tasks | 10 files |
+| Phase 05 P01 | 50min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -198,6 +199,11 @@ Recent decisions affecting current work:
 - [Phase 04]: Revoking either half of a token pair takes the whole family (RFC 7009 leaves one direction open); the standard /revoke endpoint drops tokens and leaves the registration, while the human's Access-panel revoke removes both.
 - [Phase 04]: A revoked agent's tabs stay open, visible in the Agents view and available for takeover — closing them destroys state the human may want and buys nothing, since the agent can no longer drive them.
 - [Phase 04]: Any arm-then-confirm control acting on one row of a list that can reorder is keyed on the row's identifier, never on its index.
+- [Phase ?]: axum 0.8.9 declared directly with its ws feature — a unification onto the node rust-mcp-axum already resolved, not a new resolution
+- [Phase ?]: A2 CONFIRMED: Tailscale Serve proxies a WebSocket upgrade to loopback and holds it across a 90s idle
+- [Phase ?]: Serve forwards the tailnet Host with the Serve port, so 05-04's advertised base URL is required work and must come from configuration
+- [Phase ?]: 05-07's client TLS costs zero packages on either rustls spelling; rustls-tls-native-roots recommended
+- [Phase ?]: First pairing requiring local access to the server is recorded as an open developer decision, not answered by silence
 
 ### Pending Todos
 
@@ -246,6 +252,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-21T02:13:10.944Z
-Stopped at: Completed 04-08-PLAN.md
+Last session: 2026-08-23T11:06:13.673Z
+Stopped at: Completed 05-01-PLAN.md
 Resume file: None

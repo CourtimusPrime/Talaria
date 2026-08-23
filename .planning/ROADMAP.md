@@ -186,13 +186,15 @@ and an anti-harassment state machine — several times any peer task. It splits 
 
   1. A `talaria-client` on a second machine, connected via Tailscale, can list, watch and drive the
      server's **agent** tabs — Me tabs are refused server-side, not merely hidden (decision D-05-02)
+
   2. Remote takeover latency stays within the ~30–60ms active-takeover target **on a direct
      WireGuard path**, and on a relayed (DERP) path the client degrades the frame rate and tells the
      user rather than silently missing the target or refusing takeover (decision D-05-06)
+
   3. Local mode is provably unaffected — the existing single-process path keeps Phase 1's measured
      latency
 
-**Plans**: 11 plans across 8 waves
+**Plans**: 1/11 plans executed
 
 *Originally one phase covering DIST-01…04. Split during planning: an architectural client/server
 split plus a frame pipeline plus reconnect plus persistence was more than one reviewable phase, and
@@ -211,7 +213,7 @@ obligation went unaddressed until 04-08.*
 
 Plans:
 
-- [ ] 05-01-PLAN.md — Dependency + lockfile landing (`axum` with WebSockets, one added package); spike A2, whether Tailscale Serve proxies an upgrade and what `Host` a proxied request carries; open `deferred-items.md` (wave 1) — DIST-01
+- [x] 05-01-PLAN.md — Dependency + lockfile landing (`axum` with WebSockets, one added package); spike A2, whether Tailscale Serve proxies an upgrade and what `Host` a proxied request carries; open `deferred-items.md` (wave 1) — DIST-01
 - [ ] 05-02-PLAN.md — Spike A1/A8: GL readback cost at cadence under Xvfb and on real hardware, and the tile-diff/PNG figures re-measured against real Servo output (wave 1) — DIST-02
 - [ ] 05-03-PLAN.md — `talaria-protocol`: the `wire` module (envelope, frame header, input and view messages), the Unix-only helpers moved into `local`, and the two module headers that call this crate the distributed wire (wave 1) — DIST-01
 - [ ] 05-04-PLAN.md — Advertised base URL as one source feeding the issuer, the canonical resource, the four endpoint URLs and the Host allowlist; `https` on every published OAuth URL; `BIND_HOST` unchanged; `scripts/tailscale-serve.sh` (wave 2) — DIST-01
@@ -232,6 +234,7 @@ Plans:
 
   1. Killing the Tailscale link mid-agent-task and restoring it does not lose the agent's tab state;
      the client resyncs on reconnect
+
   2. Restarting a crashed distributed-mode server offers to restore the prior session's tabs
 
 **Plans**: TBD
@@ -289,6 +292,6 @@ Phases execute in numeric order: 1 → 2 → 3 (**ship v1**) → 4 → 5 → 6 �
 | 2. Harden the Agent Surface | 11/11 | ✅ Complete | 2026-08-17 |
 | 3. Table-Stakes Browsing | 4/4 | Complete    | 2026-08-20 |
 | 4. Authenticated Remote Transport | 8/8 | Complete    | 2026-08-21 |
-| 5. Distributed Mode | 0/4 | Not started | - |
+| 5. Distributed Mode | 1/11 | In Progress|  |
 | 6. Platform Coverage | 0/2 | Not started | - |
 | 7. Release Readiness | 0/3 | Not started | - |
