@@ -323,3 +323,37 @@ program can carry, and Option 2 cannot be built without making it one.
 
 Cited: `05-RESEARCH.md` § "Exposure and the Certificate Story", Option 2;
 `05-CONTEXT.md` D-05-03; `04-.../deferred-items.md`'s inherited obligation.
+
+---
+
+## The client has no design contract — T-05-07-UI
+
+**What was deferred.** `crates/talaria-client` ships three user-facing surfaces —
+the connection state, the agent tab list with its empty state, and the first-run
+pairing block — and no `UI-SPEC.md` was written for any of them.
+
+**Why.** The interface gate did not fire for Phase 5. It looks for changes to the
+existing chrome, and this client is a *new binary*: nothing in
+`crates/talaria-shell/src/gui.rs` changed, so nothing tripped it. That is a gap
+in the gate's reach rather than a judgement that the surfaces did not need one.
+
+**What was done instead.** The copy follows `04-UI-SPEC.md`'s register verbatim —
+plain sentences, the fact first and the next step second, no exclamation, no
+reassurance, no jargon — and the whole of it is written as a table in
+`crates/talaria-client/src/chrome.rs`'s own module doc comment, so it can be read
+and reviewed *as copy* the way a contract's copy tables are. Every page-supplied
+value goes through the same truncate-sanitise-quote treatment the server's own
+lists give an untrusted claim, and every control's geometry is recorded through
+one helper and emitted on the client's standard output under
+`TALARIA_TEST_HOOKS=1`, so a suite can assert against a real control by name
+rather than a hardcoded coordinate.
+
+**Condition for revisiting.** A client that grows past three surfaces should get
+its own contract **before** it grows a fourth. `05-09` adds a frame surface and
+`05-10` adds a link-quality one; the second of those is the fourth surface, so
+this is due at `05-10` rather than at some vague later date.
+
+**Related:** the pairing constraint this client's first-run copy states is the
+open product question recorded above under *"Open: does first pairing require
+someone at the server machine?"*. A reader who found the copy and wants the
+alternatives should read that entry.
