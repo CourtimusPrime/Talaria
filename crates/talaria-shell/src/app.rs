@@ -502,7 +502,33 @@ impl Shared {
             }
         }
         for capture in due {
-            let outcome = self.capture_now(&capture.webview, &capture.context, true);
+            // A tab a viewer is watching must stay shown. `capture_now`'s
+            // re-hide exists to undo the show this queue performed for a
+            // background tab, and it used to fire unconditionally — which
+            // silently broke remote takeover, because a hidden webview answers
+            // no hit test. The viewer's frames kept arriving (they are read
+            // from the offscreen buffer, which does not need the webview shown)
+            // while its clicks stopped landing, and nothing reported it: the
+            // hold count still read 1 and only `last_applied_input` stopped
+            // advancing. An agent taking a routine screenshot was enough.
+            //
+            // `visibility_of` is the single source of truth for whether a
+            // webview should be shown, so ask it rather than re-deriving the
+            // rule here.
+            let still_wanted = self
+                .tabs
+                .try_borrow()
+                .ok()
+                .and_then(|tabs| {
+                    tabs.find_by_webview(&capture.webview).and_then(|id| {
+                        tabs.get(id).map(|tab| {
+                            crate::tabs::visibility_of(Some(id) == tabs.active_id(tab.owner.view()), tab.held_for_view)
+                        })
+                    })
+                })
+                .unwrap_or(crate::tabs::Visibility::Hidden);
+            let hide_after = matches!(still_wanted, crate::tabs::Visibility::Hidden);
+            let outcome = self.capture_now(&capture.webview, &capture.context, hide_after);
             let _ = capture.reply.send(outcome);
         }
         self.process_pending_loads();

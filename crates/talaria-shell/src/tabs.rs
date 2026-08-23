@@ -428,6 +428,37 @@ impl TabManager {
 
 #[cfg(test)]
 mod tests {
+
+    /// The regression for a bug that silently broke remote takeover.
+    ///
+    /// A background capture shows a tab to paint it, then re-hides it. That
+    /// re-hide used to be unconditional, so an agent's routine `screenshot`
+    /// hid a tab a remote viewer was watching. The failure was invisible: the
+    /// viewer's frames kept arriving, because they are read from the offscreen
+    /// buffer and do not need the webview shown, while its clicks stopped
+    /// landing, because a hidden webview answers no hit test. The hold count
+    /// still read 1; only `last_applied_input` stopped advancing.
+    ///
+    /// This pins the predicate the capture drain now consults. A held tab is
+    /// not `Hidden` even when it is not the displayed one, so `hide_after` is
+    /// false and the capture leaves it shown.
+    #[test]
+    fn a_capture_must_not_re_hide_a_tab_a_viewer_is_holding() {
+        // Not displayed, nobody watching: the capture re-hides, as before.
+        assert_eq!(visibility_of(false, 0), Visibility::Hidden);
+
+        // Not displayed, one viewer attached: it must stay shown.
+        assert_ne!(visibility_of(false, 1), Visibility::Hidden);
+        assert_eq!(visibility_of(false, 1), Visibility::HeldForViewing);
+
+        // Two viewers on one tab, and the first detaching, are the same case.
+        assert_ne!(visibility_of(false, 2), Visibility::Hidden);
+
+        // The displayed tab is never downgraded by a viewer attaching to it.
+        assert_eq!(visibility_of(true, 0), Visibility::DisplayedAndFocused);
+        assert_eq!(visibility_of(true, 3), Visibility::DisplayedAndFocused);
+    }
+
     use super::*;
 
     /// `TabOwner::is_agent` is what the agent-only lookup and both filtered
