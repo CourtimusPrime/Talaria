@@ -82,6 +82,14 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+// The direct `axum` dependency rather than the `rust_mcp_axum` re-export, for
+// the WebSocket extractor alone: `ws` is a feature this workspace enables on
+// its own line and the re-export does not carry it. The same crate either way
+// — cargo unifies them — so `axum::extract::State` here and
+// `rust_mcp_axum::axum::extract::State` elsewhere are one type.
+use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
 use rust_mcp_axum::axum::extract::connect_info::Connected;
 use rust_mcp_axum::axum::serve::IncomingStream;
 use rust_mcp_axum::mcp_routes;
@@ -217,6 +225,18 @@ impl ShutdownHandle {
 /// path rather than a second spelling of it: the canonical resource identifier
 /// is the MCP endpoint's own URL, and it is compared byte for byte.
 pub(crate) const MCP_PATH: &str = "/mcp";
+
+/// The remote view channel's path: a WebSocket upgrade, and the only route on
+/// this listener that is not the SDK's.
+///
+/// **Not in [`PUBLIC_DISCOVERY_PATHS`], and the routing test names it.** It is
+/// origin- and host-checked like everything else, which is what closes
+/// cross-site WebSocket hijacking here (T-05-01): WebSockets are exempt from
+/// the same-origin policy and have no preflight, so origin enforcement is
+/// entirely the server's job — and a browser *always* sends `Origin`, so the
+/// outermost layer makes a browser-based viewer structurally impossible rather
+/// than merely unsupported.
+pub(crate) const VIEW_PATH: &str = "/view";
 
 /// The legacy HTTP-plus-event-stream transport's path.
 ///
@@ -621,6 +641,120 @@ impl Connections {
     }
 }
 
+/// The open `/view` WebSockets, addressable by the client that owns them.
+///
+/// **The stream registry's second half, and it is required rather than
+/// preferred.** [`terminate_matching`] works over the SDK's *session
+/// directory*: it walks the sessions the SDK's own store holds and ends each
+/// one. A view socket is not an SDK session — it never runs `initialize`, it
+/// mints no session id, and it is nowhere in that store — so no amount of
+/// walking that directory reaches it. A revoke that closed only what the
+/// directory can name would leave a revoked viewer watching, which is the
+/// same failure [`StreamRegistry`] already exists for, in a new shape (T-05-07).
+///
+/// A `Vec` rather than a map keyed on the client, because one client may hold
+/// several sockets and the numbers here are small: a handful of viewers, each
+/// one entry, walked only on a revoke or a shutdown.
+///
+/// The close handle is a [`oneshot::Sender`] the socket task selects on, and
+/// it is *taken* out of this table to fire — so a socket cannot be closed
+/// twice and a completed connection leaves nothing behind to close later.
+#[derive(Default)]
+struct ViewSockets {
+    open: Mutex<Vec<ViewSocketHandle>>,
+}
+
+/// One accepted view socket, as the registry sees it.
+struct ViewSocketHandle {
+    /// This connection's own id, unique for the life of the process, and the
+    /// only key [`ViewSockets::remove`] uses. Never a descriptor number and
+    /// never a peer address — see [`PeerConnection`] for why either would be
+    /// a table an unauthenticated peer could confuse.
+    connection: u64,
+    /// The `client_id` the route verified before the socket was accepted. A
+    /// socket whose identity could not be established is never registered,
+    /// because it is never accepted.
+    client_id: String,
+    /// Fires once. The socket task is waiting on the other end, and stops.
+    close: oneshot::Sender<()>,
+}
+
+impl ViewSockets {
+    /// Track an accepted socket. Called once per connection, at accept time,
+    /// before the client is told anything.
+    fn register(&self, connection: u64, client_id: &str, close: oneshot::Sender<()>) {
+        if let Ok(mut open) = self.open.lock() {
+            open.push(ViewSocketHandle {
+                connection,
+                client_id: client_id.to_owned(),
+                close,
+            });
+        }
+    }
+
+    /// Forget a socket that ended on its own. `true` if it was still tracked.
+    ///
+    /// The other half of `register`, and the reason a completed connection
+    /// leaves nothing behind: this table is not a log of connections that
+    /// happened, it is the set of connections that are open.
+    fn remove(&self, connection: u64) -> bool {
+        let Ok(mut open) = self.open.lock() else { return false };
+        let before = open.len();
+        open.retain(|handle| handle.connection != connection);
+        open.len() != before
+    }
+
+    /// Close every socket belonging to `client_id`, and no other client's.
+    /// Returns how many were closed.
+    fn close_client(&self, client_id: &str) -> usize {
+        self.close_matching(Some(client_id))
+    }
+
+    /// Close every open socket, whoever owns it — the listener's way out.
+    fn close_all(&self) -> usize {
+        self.close_matching(None)
+    }
+
+    /// Take the matching handles out and fire each. Taking is what makes a
+    /// second termination of the same socket unrepresentable.
+    fn close_matching(&self, client_id: Option<&str>) -> usize {
+        let taken: Vec<ViewSocketHandle> = match self.open.lock() {
+            Ok(mut open) => {
+                let mut kept = Vec::with_capacity(open.len());
+                let mut taken = Vec::new();
+                for handle in open.drain(..) {
+                    match client_id {
+                        Some(wanted) if handle.client_id != wanted => kept.push(handle),
+                        _ => taken.push(handle),
+                    }
+                }
+                *open = kept;
+                taken
+            },
+            // Degrade, never abort — and the store half of the revoke, which
+            // is what refuses the next upgrade, is untouched either way.
+            Err(_) => {
+                log::error!("the view socket table is poisoned; no view socket was closed");
+                return 0;
+            },
+        };
+        let closed = taken.len();
+        for handle in taken {
+            // A receiver that is already gone means the task is on its way
+            // out under its own power, which is the outcome asked for.
+            let _ = handle.close.send(());
+        }
+        closed
+    }
+
+    /// How many sockets are tracked. Test-only, for the same reason
+    /// [`Connections::tracked`] is.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.open.lock().map(|open| open.len()).unwrap_or_default()
+    }
+}
+
 /// One live MCP session, paired with the client identity that was verified
 /// when it was created.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,6 +839,9 @@ pub struct StreamRegistry {
 #[derive(Clone)]
 struct Live {
     directory: Arc<dyn SessionDirectory>,
+    /// The open view sockets — the half the directory cannot reach, because a
+    /// WebSocket is not an SDK session. See [`ViewSockets`].
+    views: Arc<ViewSockets>,
     /// The listener thread's runtime, so the main thread can hand it work
     /// without blocking on it. Terminating is fire-and-forget: the human's
     /// feedback is the row disappearing, which `apply_ui_actions` has already
@@ -715,9 +852,14 @@ struct Live {
 impl StreamRegistry {
     /// Attach a bound listener's session bookkeeping. Called once, from
     /// [`serve`], after the address is known.
-    fn install(&self, directory: Arc<dyn SessionDirectory>, runtime: tokio::runtime::Handle) {
+    fn install(
+        &self,
+        directory: Arc<dyn SessionDirectory>,
+        views: Arc<ViewSockets>,
+        runtime: tokio::runtime::Handle,
+    ) {
         match self.inner.lock() {
-            Ok(mut inner) => *inner = Some(Live { directory, runtime }),
+            Ok(mut inner) => *inner = Some(Live { directory, views, runtime }),
             // Degrade, never abort. A poisoned lock here costs stream
             // termination, not the browser — and the store half of a revoke,
             // which is the half that stops the next request, is untouched.
@@ -732,12 +874,24 @@ impl StreamRegistry {
         }
     }
 
-    /// Close every stream belonging to `client_id`, and no other client's.
+    /// Close every stream **and every view socket** belonging to `client_id`,
+    /// and no other client's.
     ///
-    /// Returns immediately; the work runs on the listener's own runtime. Safe
-    /// to call from the winit main thread, which is the only caller.
+    /// Both halves in one call, deliberately: a caller that had to remember to
+    /// perform the second one is a caller that will eventually forget, and the
+    /// thing forgotten would be a revoked viewer still watching. The view half
+    /// runs first and synchronously, because it is a channel send rather than
+    /// an engine round trip and there is no reason to make it wait.
+    ///
+    /// Returns immediately; the session work runs on the listener's own
+    /// runtime. Safe to call from the winit main thread, which is the only
+    /// caller.
     pub fn terminate_client(&self, client_id: &str) {
         let Some(live) = self.live() else { return };
+        let views = live.views.close_client(client_id);
+        if views > 0 {
+            log::info!("closed {views} open view socket(s) belonging to client {client_id}");
+        }
         let client_id = client_id.to_owned();
         live.runtime.spawn(async move {
             let closed = terminate_matching(live.directory.as_ref(), Some(&client_id)).await;
@@ -978,11 +1132,25 @@ async fn serve(
     let identity = AdvertisedIdentity::new(&bound, advertised.as_deref());
     let sink = EventLoopSink { proxy: proxy.clone(), session_id: next_session_id() };
     let connections = Arc::new(Connections::default());
-    let (app, directory) =
-        build_router(proxy.clone(), sink, agents, &bound, &identity, Arc::clone(&connections));
+    let views = Arc::new(ViewSockets::default());
+    let (app, directory) = build_router(
+        proxy.clone(),
+        sink,
+        agents,
+        &bound,
+        &identity,
+        Arc::clone(&connections),
+        Arc::clone(&views),
+    );
     // Installed before the first connection is accepted, so there is no window
-    // in which a session exists and a revoke cannot reach it.
-    streams.install(Arc::clone(&directory), tokio::runtime::Handle::current());
+    // in which a session exists and a revoke cannot reach it. Both halves go
+    // in together for the same reason: a view socket accepted in a window
+    // where only the directory was installed would be one a revoke missed.
+    streams.install(
+        Arc::clone(&directory),
+        Arc::clone(&views),
+        tokio::runtime::Handle::current(),
+    );
 
     // The socket, not the advertised identity: this line is a statement about
     // what this process bound, and a log that named an origin the operator
@@ -1008,6 +1176,7 @@ async fn serve(
     // termination a revoke performs, aimed at every client instead of one.
     let (drained_tx, drained_rx) = oneshot::channel::<()>();
     let closing = Arc::clone(&directory);
+    let closing_views = Arc::clone(&views);
     // Each accepted connection's descriptor travels with the connection, in
     // axum's own per-connection value, rather than through a table keyed on
     // the peer address. See [`PeerConnection`] for the two ways the table
@@ -1021,6 +1190,14 @@ async fn serve(
             let closed = terminate_matching(closing.as_ref(), None).await;
             if closed > 0 {
                 log::info!("remote access closed {closed} open stream(s) on its way out");
+            }
+            // The view half, which the directory above cannot reach. A
+            // WebSocket is a connection axum's graceful shutdown waits for,
+            // and a viewer that never lets go would otherwise be exactly the
+            // client the grace period exists to stop hanging on.
+            let sockets = closing_views.close_all();
+            if sockets > 0 {
+                log::info!("remote access closed {sockets} open view socket(s) on its way out");
             }
             let _ = drained_tx.send(());
         })
@@ -1071,6 +1248,7 @@ async fn serve(
 /// Returns the session directory alongside the router, because the state the
 /// router is built from is also the thing a revoke has to reach — see
 /// [`StreamRegistry`].
+#[allow(clippy::too_many_arguments)]
 fn build_router(
     proxy: EventLoopProxy<AppEvent>,
     sink: EventLoopSink,
@@ -1078,7 +1256,13 @@ fn build_router(
     bound: &str,
     identity: &AdvertisedIdentity,
     connections: Arc<Connections>,
+    views: Arc<ViewSockets>,
 ) -> (rust_mcp_axum::axum::Router, Arc<dyn SessionDirectory>) {
+    // Cloned before the consent closure below takes ownership of `proxy`: the
+    // view route needs the same route onto the main thread, for the same
+    // reason and with the same restriction — `Shared` is `Rc`-based, so an
+    // `AppEvent` is the whole of what may travel.
+    let view_proxy = proxy.clone();
     // The real provider. 04-03's interim refuse-everything one was deleted
     // rather than parked beside this line: a struct that refuses every
     // credential is harmless on its own and a footgun one line away from the
@@ -1094,6 +1278,10 @@ fn build_router(
         proxy.send_event(AppEvent::ConsentRequested(request)).map_err(|_| ())
     });
     let auth: Arc<dyn AuthProvider> = Arc::new(TalariaAuth::new(agents, raise, identity));
+    // The **same** provider handle, called directly by the view route. See
+    // [`view_upgrade`] for why a merged axum route cannot inherit the chain
+    // built from it below.
+    let view_auth = Arc::clone(&auth);
     // The two names this server answers to, enumerated once and shared by both
     // layers that check a `Host`. See [`admitted_hosts`].
     let admitted: Arc<[String]> = admitted_hosts(bound, identity).into();
@@ -1178,7 +1366,17 @@ fn build_router(
     // *here* and nowhere further in. It records which connection each
     // standalone stream is riding on and changes nothing about the request.
     let tracking = StreamTracking { connections, state: Arc::clone(&state) };
+    // **Merged before both layers below, so it inherits both**: the
+    // stream-connection note (which ignores it — see [`view_upgrade`]) and,
+    // outermost, the origin-and-host refusal. Do not give this route a layer
+    // of its own and do not reorder the two that exist; a third layer would be
+    // a second place the rule is written, and reordering would put
+    // authentication in front of the refusal that is supposed to run first.
+    let view = rust_mcp_axum::axum::Router::new()
+        .route(VIEW_PATH, rust_mcp_axum::axum::routing::get(view_upgrade))
+        .with_state(ViewRoute { auth: view_auth, views, proxy: view_proxy });
     let router = mcp_routes(state, &mount, http_handler)
+        .merge(view)
         .layer(rust_mcp_axum::axum::middleware::from_fn_with_state(
             tracking,
             note_streaming_connection,
@@ -1315,6 +1513,250 @@ fn page_originated_refusal() -> rust_mcp_axum::axum::response::Response {
         .into_response()
 }
 
+/// Everything the `/view` route needs, as one axum state value.
+#[derive(Clone)]
+struct ViewRoute {
+    /// The **same** `Arc<dyn AuthProvider>` the SDK's chain was built from.
+    /// One provider, so a revocation lands on both surfaces at once.
+    auth: Arc<dyn AuthProvider>,
+    /// Where an accepted socket registers itself for termination.
+    views: Arc<ViewSockets>,
+    /// The only route from this thread onto the winit main thread.
+    proxy: EventLoopProxy<AppEvent>,
+}
+
+/// Connection ids for view sockets, unique for the life of the process.
+///
+/// A counter rather than a descriptor number or a peer address, for the reason
+/// [`PeerConnection`]'s doc gives about both: a recycled number names a
+/// different thing a moment later, and a peer address is chosen by the peer.
+static NEXT_VIEW_CONNECTION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_view_connection() -> u64 {
+    NEXT_VIEW_CONNECTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl ViewRoute {
+    /// The verified `client_id` behind an upgrade request, or `None`.
+    ///
+    /// **This route authenticates in its own right, and that is the whole
+    /// point of this function.** The middleware vector `build_router` composes
+    /// — the origin refusal, the DNS-rebinding protector,
+    /// [`AuthMiddleware`] and the identity note — is handed to
+    /// [`McpHttpHandler`], and the SDK composes it **only for the transport
+    /// handlers it dispatches**. A route merged into the axum router does not
+    /// pass through it. That is not a guess: it is the same sentence
+    /// `build_router` already writes about the origin refusal at the layer
+    /// below — *"Applied here rather than pushed onto `middlewares` because
+    /// that chain is reachable only from the transport handlers"* — and the
+    /// half nobody had written down is that it applies verbatim to
+    /// `AuthMiddleware`. A view route that assumed inheritance would be
+    /// origin-checked and **unauthenticated**, which is the shape of the
+    /// defect Phase 4 shipped as CR-01 and found in review (T-05-02).
+    ///
+    /// **No second audience comparison.** The provider compares the token's
+    /// audience byte for byte against [`crate::oauth::canonical_resource`],
+    /// so a token minted for a different resource server is already refused by
+    /// code this function calls. A comparison here would be a second spelling
+    /// of one rule, which is exactly what `canonical_resource`'s doc argues
+    /// against — two spellings can disagree, and the one that is wrong is the
+    /// one nobody is looking at.
+    ///
+    /// The scope floor *is* checked here, because it is the resource server's
+    /// own rule and `AuthMiddleware` is what would otherwise apply it. Same
+    /// provider, same list, same answer.
+    async fn verified_client(&self, headers: &HeaderMap) -> Option<String> {
+        let presented = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, token)| token.trim().to_owned())?;
+        let identity = self.auth.verify_token(presented).await.ok()?;
+        if let Some(required) = self.auth.required_scopes() {
+            let held = identity.scopes.clone().unwrap_or_default();
+            if !required.iter().all(|scope| held.iter().any(|have| have == scope)) {
+                return None;
+            }
+        }
+        // A socket whose owner cannot be named is one a revoke could never
+        // close, so it is refused rather than accepted as nobody's — the same
+        // rule `SessionOwner::client_id` states, applied one step earlier
+        // because here there is still the option of not accepting at all.
+        identity.client_id
+    }
+
+    /// Serve one accepted socket until it ends, is closed by a revoke, or the
+    /// listener shuts down.
+    ///
+    /// This task owns the socket and closes it by dropping it. **That is why
+    /// [`note_streaming_connection`] does not need to know about this route**:
+    /// its file-descriptor duplication exists because the SDK's handlers
+    /// rebuild a request from a `HeaderMap` and a `Uri` and lose the
+    /// connection, so the only way to end one of their streams is to shut the
+    /// underlying socket down from outside. Nothing here is out of reach, so
+    /// the asymmetry is considered rather than an omission.
+    async fn run(self, mut socket: WebSocket, client_id: String) {
+        let connection = next_view_connection();
+        let (close_tx, mut close_rx) = oneshot::channel::<()>();
+        // Registered before the client is told anything, so there is no window
+        // in which a socket is live and a revoke cannot reach it.
+        self.views.register(connection, &client_id, close_tx);
+        log::info!("view connection {connection} opened by client {client_id}");
+
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let opened = match crate::view::hello_frame() {
+            Some(hello) => socket.send(Message::Binary(Bytes::from(hello))).await.is_ok(),
+            None => false,
+        };
+        if opened {
+            // The main thread learns about the connection only once the hello
+            // is away, so the first thing a client reads is always the wire
+            // version — never a snapshot it has no version to interpret.
+            if self
+                .proxy
+                .send_event(AppEvent::ViewOpened {
+                    connection,
+                    client_id: client_id.clone(),
+                    out: out_tx,
+                })
+                .is_ok()
+            {
+                self.pump(&mut socket, &mut out_rx, &mut close_rx, connection).await;
+            }
+        }
+
+        // Removed here and only here, so a connection that ended on its own
+        // leaves nothing tracked. `remove` is a no-op for a socket a revoke
+        // already took out of the table, which is the ordinary race and not a
+        // failure.
+        self.views.remove(connection);
+        let _ = self.proxy.send_event(AppEvent::ViewClosed { connection });
+        let _ = socket.send(Message::Close(None)).await;
+        log::debug!("view connection {connection} ended");
+    }
+
+    /// The connection's life: outbound frames out, inbound frames onto the
+    /// main thread, and three ways to stop.
+    ///
+    /// The select's futures are dropped at the end of the `let`, which is what
+    /// lets the body below use the socket again — a send inside a select arm
+    /// would be a second mutable borrow of it.
+    async fn pump(
+        &self,
+        socket: &mut WebSocket,
+        out_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        close_rx: &mut oneshot::Receiver<()>,
+        connection: u64,
+    ) {
+        loop {
+            let step = tokio::select! {
+                _ = &mut *close_rx => ViewStep::Terminated,
+                outgoing = out_rx.recv() => match outgoing {
+                    Some(frame) => ViewStep::Send(frame),
+                    // The main thread dropped this connection's channel.
+                    None => ViewStep::Ended,
+                },
+                incoming = socket.recv() => match incoming {
+                    Some(Ok(Message::Binary(frame))) => ViewStep::Received(frame.to_vec()),
+                    // Ping and pong are answered by axum itself; nothing on
+                    // this wire is text, so a text message is a client
+                    // speaking a protocol this server does not, and the
+                    // connection ends rather than being guessed at (T-05-11).
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => ViewStep::Idle,
+                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Close(_))) | None => {
+                        ViewStep::Ended
+                    },
+                    Some(Err(_)) => ViewStep::Ended,
+                },
+            };
+            match step {
+                ViewStep::Idle => {},
+                ViewStep::Send(frame) => {
+                    if socket.send(Message::Binary(Bytes::from(frame))).await.is_err() {
+                        return;
+                    }
+                },
+                ViewStep::Received(frame) => {
+                    if self
+                        .proxy
+                        .send_event(AppEvent::ViewMessage { connection, frame })
+                        .is_err()
+                    {
+                        return;
+                    }
+                },
+                ViewStep::Terminated => {
+                    log::info!("view connection {connection} closed by a revoke or shutdown");
+                    return;
+                },
+                ViewStep::Ended => return,
+            }
+        }
+    }
+}
+
+/// One turn of a view connection's loop, named so the socket's borrow ends
+/// with the `select!` that produced it.
+enum ViewStep {
+    /// Nothing to do; go round again.
+    Idle,
+    /// A frame from the main thread, to be written out.
+    Send(Vec<u8>),
+    /// A frame from the client, to be handed to the main thread.
+    Received(Vec<u8>),
+    /// A revoke or a shutdown fired this connection's close handle.
+    Terminated,
+    /// The connection is over, however it got there.
+    Ended,
+}
+
+/// `GET /view` — the remote view channel's WebSocket upgrade.
+///
+/// Two gates, in this order, and neither is this handler's own invention:
+///
+/// 1. The **outermost axum layer** has already refused the request if it
+///    carried an `Origin` header or named a host this server neither bound nor
+///    advertises. The route is merged inside that layer precisely so it
+///    inherits it — see [`refuse_page_originated`] and [`VIEW_PATH`].
+/// 2. The **bearer token**, checked here by a direct call to the shared
+///    provider, because the SDK's middleware chain does not cover a merged
+///    axum route — see [`ViewRoute::verified_client`], which is the whole
+///    argument.
+///
+/// Every failure produces [`view_refusal`], one expression: an absent
+/// credential, an unknown token, a revoked client, a token minted for another
+/// resource and a token missing the scope floor are indistinguishable from
+/// outside.
+///
+/// `WebSocketUpgrade` extracts last, so a request that is not an upgrade is
+/// turned away by axum's own rejection before this body runs. That costs
+/// nothing here: every credential-bearing shape reaches the check.
+async fn view_upgrade(
+    State(route): State<ViewRoute>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> rust_mcp_axum::axum::response::Response {
+    let Some(client_id) = route.verified_client(&headers).await else {
+        log::debug!("remote access refused an unauthenticated view upgrade");
+        return view_refusal();
+    };
+    upgrade.on_upgrade(move |socket| route.run(socket, client_id))
+}
+
+/// The one body a refused view upgrade ever returns.
+///
+/// One expression, for the reason [`page_originated_refusal`] is one and
+/// `crate::oauth::REFUSAL` is one: two refusals that differ are two bits an
+/// attacker did not have. In particular an upgrade with *no* credential and an
+/// upgrade with a token that was never issued get the same status and the same
+/// bytes, so the endpoint is not an oracle for which tokens exist.
+fn view_refusal() -> rust_mcp_axum::axum::response::Response {
+    use rust_mcp_axum::axum::response::IntoResponse as _;
+    (StatusCode::UNAUTHORIZED, "the presented credential is not accepted").into_response()
+}
+
 /// Note which connection a standalone event stream is riding on.
 ///
 /// Runs on every request and acts on almost none of them. **Two shapes open a
@@ -1331,6 +1773,13 @@ fn page_originated_refusal() -> rust_mcp_axum::axum::response::Response {
 /// Waiting for the response is deliberate in both cases — the head is ready
 /// before the body streams, so the connection is still there to be noted, and
 /// a request that was refused has no stream to close.
+///
+/// [`VIEW_PATH`] is deliberately **not** a third shape, and the two gates
+/// below are exact-path comparisons so it cannot become one by accident. A
+/// view socket needs nothing from this mechanism: the task serving it owns its
+/// own socket and closes it by dropping it, where the SDK's handlers rebuild a
+/// request from a `HeaderMap` and a `Uri` and lose the connection entirely.
+/// See [`ViewRoute::run`].
 ///
 /// **The connection is the listener's own, never the client's word for it.**
 /// It comes from `ConnectInfo`, which axum computes from the accepted socket;
@@ -1779,6 +2228,13 @@ mod tests {
             "/revoke",
             MCP_PATH,
             SSE_PATH,
+            // Named explicitly, not covered by accident. The view channel is
+            // a WebSocket, and a WebSocket is exempt from the same-origin
+            // policy and has no preflight — origin enforcement is entirely
+            // this server's job. Exempting this path would reopen
+            // cross-site WebSocket hijacking (T-05-01), and this line is what
+            // makes such a change fail a test rather than pass silently.
+            VIEW_PATH,
             "/messages",
             "/",
             "/.well-known",
@@ -1845,6 +2301,123 @@ mod tests {
         }
     }
 
+    /// A close handle, and a way to ask whether it fired.
+    fn a_view_socket() -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
+        oneshot::channel()
+    }
+
+    /// Whether a socket's task would have seen its close handle fire.
+    ///
+    /// `try_recv` on a `oneshot` distinguishes the three states this needs:
+    /// a value (closed), empty (still open), and a dropped sender — which
+    /// also means closed, because dropping the handle is what a table that
+    /// forgot the socket would do and the task treats either as an ending.
+    fn was_closed(receiver: &mut oneshot::Receiver<()>) -> bool {
+        !matches!(receiver.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty))
+    }
+
+    /// The registry's second half tracks a socket and lets go of it again.
+    ///
+    /// A completed connection must leave **nothing** behind: this table is the
+    /// set of sockets that are open, not a log of sockets that happened, and
+    /// the difference is a process that also holds the credential vault
+    /// accumulating handles for the life of the browser.
+    #[test]
+    fn a_view_socket_that_ends_normally_leaves_nothing_tracked() {
+        let views = ViewSockets::default();
+        let (close, mut fired) = a_view_socket();
+        views.register(1, "client-a", close);
+        assert_eq!(views.tracked(), 1);
+        assert!(views.remove(1), "the socket was not tracked");
+        assert_eq!(views.tracked(), 0);
+        assert!(!views.remove(1), "a socket that already ended was removed twice");
+        // Removing is not closing: the connection ended under its own power.
+        assert!(was_closed(&mut fired), "the handle outlived the table entry");
+    }
+
+    /// The property a revoke needs: one client's sockets close and no other
+    /// client's does.
+    ///
+    /// This is the half `terminate_matching` cannot reach at all. It walks the
+    /// SDK's session directory, and a WebSocket is not an SDK session — so a
+    /// revoke that only did that would close a client's streams and leave its
+    /// viewer watching (T-05-07).
+    #[test]
+    fn terminating_a_client_closes_its_view_sockets_and_no_others() {
+        let views = ViewSockets::default();
+        let (first, mut first_fired) = a_view_socket();
+        let (second, mut second_fired) = a_view_socket();
+        let (other, mut other_fired) = a_view_socket();
+        views.register(1, "client-a", first);
+        views.register(2, "client-a", second);
+        views.register(3, "client-b", other);
+
+        assert_eq!(views.close_client("client-a"), 2);
+        assert!(was_closed(&mut first_fired));
+        assert!(was_closed(&mut second_fired));
+        assert!(!was_closed(&mut other_fired), "another client's view socket was closed");
+        assert_eq!(views.tracked(), 1, "the surviving socket left the table");
+
+        // And a second revoke of the same client closes nothing, because the
+        // handles were *taken* rather than copied.
+        assert_eq!(views.close_client("client-a"), 0);
+    }
+
+    /// Revoking a client with no view socket is not an error.
+    #[test]
+    fn terminating_a_client_with_no_view_socket_closes_nothing() {
+        let views = ViewSockets::default();
+        let (close, mut fired) = a_view_socket();
+        views.register(1, "client-a", close);
+        assert_eq!(views.close_client("client-z"), 0);
+        assert!(!was_closed(&mut fired));
+        assert_eq!(views.tracked(), 1);
+    }
+
+    /// The listener's way out closes every socket, whoever owns it.
+    #[test]
+    fn shutting_the_listener_down_closes_every_view_socket() {
+        let views = ViewSockets::default();
+        let (first, mut first_fired) = a_view_socket();
+        let (second, mut second_fired) = a_view_socket();
+        views.register(1, "client-a", first);
+        views.register(2, "client-b", second);
+        assert_eq!(views.close_all(), 2);
+        assert!(was_closed(&mut first_fired));
+        assert!(was_closed(&mut second_fired));
+        assert_eq!(views.tracked(), 0);
+    }
+
+    /// A revoke reaches **both** halves through one call, which is what stops
+    /// a caller from performing one and forgetting the other.
+    #[tokio::test]
+    async fn one_revoke_closes_the_clients_streams_and_its_view_sockets() {
+        let directory = FakeSessions::with(&[("s-1", Some("client-a")), ("s-2", Some("client-b"))]);
+        let views = Arc::new(ViewSockets::default());
+        let (close, mut fired) = a_view_socket();
+        let (other, mut other_fired) = a_view_socket();
+        views.register(1, "client-a", close);
+        views.register(2, "client-b", other);
+
+        let registry = StreamRegistry::default();
+        registry.install(
+            directory.clone(),
+            Arc::clone(&views),
+            tokio::runtime::Handle::current(),
+        );
+        registry.terminate_client("client-a");
+        // The view half is synchronous; the session half is spawned.
+        assert!(was_closed(&mut fired), "the revoked client's view socket stayed open");
+        assert!(!was_closed(&mut other_fired));
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+            if !directory.ended().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(directory.ended(), vec!["s-1".to_owned()]);
+    }
+
     #[tokio::test]
     async fn a_revoke_ends_every_stream_of_that_client_and_no_other() {
         let directory = FakeSessions::with(&[
@@ -1904,7 +2477,11 @@ mod tests {
     async fn an_installed_registry_hands_the_work_to_the_listeners_runtime() {
         let directory = FakeSessions::with(&[("s-1", Some("client-a")), ("s-2", Some("client-b"))]);
         let registry = StreamRegistry::default();
-        registry.install(directory.clone(), tokio::runtime::Handle::current());
+        registry.install(
+            directory.clone(),
+            Arc::new(ViewSockets::default()),
+            tokio::runtime::Handle::current(),
+        );
         registry.terminate_client("client-a");
         // Fire and forget: the human's feedback is the row disappearing, which
         // has already happened by the time this is called. Yielding is what
@@ -1928,7 +2505,11 @@ mod tests {
         let registry = StreamRegistry::default();
         registry.terminate_client("client-a");
         let directory = FakeSessions::with(&[("s-1", Some("client-a"))]);
-        registry.install(directory.clone(), tokio::runtime::Handle::current());
+        registry.install(
+            directory.clone(),
+            Arc::new(ViewSockets::default()),
+            tokio::runtime::Handle::current(),
+        );
         registry.clear();
         registry.terminate_client("client-a");
         for _ in 0..8 {

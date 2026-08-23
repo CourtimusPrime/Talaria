@@ -108,6 +108,34 @@ pub enum AppEvent {
     /// [`UiAction::SetPanel`], which refuses this panel outright — see
     /// `apply_ui_actions`.
     ConsentRequested(crate::oauth::ConsentRequest),
+    /// A remote viewer's WebSocket was accepted, raised from the
+    /// `talaria-http` thread once its bearer token verified.
+    ///
+    /// `client_id` is the **verified** client the token names — minted by this
+    /// browser at registration and approved by a human — never a name the peer
+    /// asserted, and it is what a revoke matches on. `out` is this
+    /// connection's outbound frame channel: the main thread pushes onto it and
+    /// the socket task writes it out, which is the whole of what the listener
+    /// thread may hold, because `Shared` is `Rc`-based and cannot cross the
+    /// boundary. It must **never** be used to reach any tab the human owns —
+    /// what may travel down it is decided by [`crate::view`], not here.
+    ViewOpened {
+        connection: u64,
+        client_id: String,
+        out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    },
+    /// One frame arrived from a viewer, still exactly as it was on the wire.
+    ///
+    /// Undecoded on purpose: structural decoding is
+    /// [`talaria_protocol::wire`]'s, and doing it on the listener thread would
+    /// put a second decoder on a hostile peer's path. `connection` is the
+    /// session's own id and is never a tab id — a viewer does not get to name
+    /// which connection it is.
+    ViewMessage { connection: u64, frame: Vec<u8> },
+    /// A viewer's WebSocket ended, however it ended: the client closed it, a
+    /// revoke closed it, or the listener shut down. Every attachment the
+    /// connection held is released here and nowhere else.
+    ViewClosed { connection: u64 },
 }
 
 /// A connected control-socket client: display label + its event channel.
@@ -183,6 +211,16 @@ pub struct Shared {
     /// the half without which "revoked" would be true of the store and false
     /// of an agent still receiving frames.
     pub remote_streams: RefCell<StreamRegistry>,
+    /// The remote viewers currently connected, and what each is attached to —
+    /// see [`crate::view`].
+    ///
+    /// Written only from the three `AppEvent::View*` arms, which are the only
+    /// place the listener thread's route lands. **It must never be used to
+    /// decide what the human sees**: a viewer's presence changes nothing about
+    /// this window, and the tab a viewer is watching is a tab id it named, not
+    /// [`TabManager::displayed`]. Empty whenever remote access is off, because
+    /// then there is no listener and therefore no `/view` route at all.
+    pub views: RefCell<crate::view::ViewSessions>,
     /// The registered agent clients and the digests of the tokens they hold —
     /// see [`crate::agents`].
     ///
@@ -697,6 +735,36 @@ impl Shared {
         }
     }
 
+    /// A remote viewer's socket was accepted. Record the connection.
+    ///
+    /// Nothing about the local window changes: no redraw is requested, no tab
+    /// is shown, focused or switched to, and the view mode is untouched. A
+    /// remote party connecting is not an event the human is supposed to notice
+    /// on screen, and making it one would be the first half of letting a
+    /// viewer move what somebody sitting here is looking at.
+    pub fn view_opened(
+        &self,
+        connection: u64,
+        client_id: String,
+        out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) {
+        self.views.borrow_mut().opened(connection, client_id, out);
+    }
+
+    /// One frame from a viewer. A frame that could not be answered ends the
+    /// connection — the socket task learns that when its channel drops.
+    pub fn view_message(&self, connection: u64, frame: &[u8]) {
+        let keep = self.views.borrow_mut().message(connection, frame);
+        if !keep {
+            self.views.borrow_mut().closed(connection);
+        }
+    }
+
+    /// A viewer's socket ended. Release everything it held.
+    pub fn view_closed(&self, connection: u64) {
+        self.views.borrow_mut().closed(connection);
+    }
+
     /// Queue an unsolicited event for the session that owns the tab it
     /// describes — and for no other.
     ///
@@ -965,6 +1033,7 @@ impl ApplicationHandler<AppEvent> for App {
             remote: RefCell::new(RemoteAccess::default()),
             remote_shutdown: RefCell::new(None),
             remote_streams: RefCell::new(StreamRegistry::default()),
+            views: RefCell::new(crate::view::ViewSessions::default()),
             // Loaded once, here, and shared by clone with the listener thread
             // — never loaded a second time anywhere. See the field's comment.
             agents: Arc::new(Mutex::new(Agents::load())),
@@ -1087,6 +1156,18 @@ impl ApplicationHandler<AppEvent> for App {
                         winit::window::UserAttentionType::Informational,
                     ));
                     state.window.request_redraw();
+                },
+                // The three view arms. Everything they do happens here, on the
+                // main thread, because everything they do reads the tab table
+                // — the listener thread holds none of `Shared`.
+                AppEvent::ViewOpened { connection, client_id, out } => {
+                    state.view_opened(connection, client_id, out);
+                },
+                AppEvent::ViewMessage { connection, frame } => {
+                    state.view_message(connection, &frame);
+                },
+                AppEvent::ViewClosed { connection } => {
+                    state.view_closed(connection);
                 },
             }
             state.servo.spin_event_loop();

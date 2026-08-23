@@ -467,7 +467,17 @@ pub enum ServerView {
     /// misparse the frames that follow.
     Hello { protocol: u32 },
     /// The attach succeeded; frames for `tab` follow.
-    Attached { tab: u64 },
+    ///
+    /// `width` and `height` are the tab's viewport **at the moment of the
+    /// attach**, in device pixels, and they are here so a client can size its
+    /// surface before the first frame arrives rather than after it. Without
+    /// them the only statement of the size is [`FrameHeader::frame_width`],
+    /// which is a fact the client learns one round trip too late — it would
+    /// have to draw a guess, then reflow. They are a *starting* size and never
+    /// a contract: [`ClientView::Viewport`] is how a client asks for a
+    /// different one, and the frame header remains the authority for what any
+    /// particular frame actually is.
+    Attached { tab: u64, width: u32, height: u32 },
     /// The lease on `tab` is released, whether the viewer asked or the server
     /// decided.
     Detached { tab: u64 },
@@ -559,7 +569,7 @@ mod tests {
     fn server_view_messages_round_trip() {
         let messages = [
             ServerView::Hello { protocol: PROTOCOL_VERSION },
-            ServerView::Attached { tab: 7 },
+            ServerView::Attached { tab: 7, width: 1280, height: 736 },
             ServerView::Detached { tab: 7 },
             ServerView::Refused,
         ];

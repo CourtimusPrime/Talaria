@@ -14,6 +14,7 @@ mod permissions;
 mod settings;
 mod tabs;
 mod vault;
+mod view;
 
 use std::error::Error;
 
