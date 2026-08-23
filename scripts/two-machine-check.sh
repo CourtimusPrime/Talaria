@@ -238,11 +238,18 @@ cat <<RECORD
      link.measurement; reading.input_to_photon_ms). Write down N.
 
      >>> THIS NUMBER IS THE EVIDENCE for Success Criterion 2's ~30-60 ms on a
-     direct path. It is computed from the frame header's last_applied_input
+     direct path. It is computed from the frame header's last_delivered_input
      echo, so it needs no clock shared between the two machines and it contains
      the whole chain: transmission, hit test, paint, readback, encode, and the
      client's own presentation. A run that records only a rung and an
      impression has discarded the one figure the claim rests on.
+
+     It counts only inputs that actually reached the page. The server keeps a
+     separate ordering mark that advances on inputs it refused -- a click in
+     the letterboxed margin, on a crashed tab, or on a tab the viewer never
+     attached to -- and this figure is deliberately not computed from that one,
+     because those round trips never included a hit test or a repaint and
+     would bias the number LOW.
 
  (c) THE RUNG THE CLIENT REPORTED (reading.rung, and reading.rung_changes if it
      moved). Rung plus denominator is what the human was actually served.

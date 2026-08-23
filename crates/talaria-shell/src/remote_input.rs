@@ -65,9 +65,11 @@ use crate::view::{ViewSessions, ViewTabs};
 /// 6. The message converts — an unmapped key name and an unrepresentable wheel
 ///    mode are refusals.
 /// 7. The delivery functions are called. **Nothing else.**
+/// 8. What arrived is recorded, so the frame header's latency echo carries
+///    only round trips that happened.
 ///
 /// Steps 1 to 4 are [`admit`], which needs no engine and carries this module's
-/// unit tests. Steps 5 to 7 need a live webview and are proven end to end by
+/// unit tests. Steps 5 to 8 need a live webview and are proven end to end by
 /// `tests/e2e/remote_view_test.py`.
 pub fn apply(state: &Shared, connection: u64, message: &InputMessage) -> bool {
     // Two borrows in one scope, released before a webview is touched — the
@@ -117,7 +119,7 @@ pub fn apply(state: &Shared, connection: u64, message: &InputMessage) -> bool {
     // pointer's, the wire carries coordinates on every pointer message
     // precisely so this path needs none, and sharing it would contaminate the
     // two input sources in both directions (T-05-04-B).
-    match message {
+    let delivered = match message {
         InputMessage::MouseMove { x, y, .. } => app::deliver_mouse_move(&webview, point(*x, *y)),
         InputMessage::MouseButton { x, y, button, action, .. } => app::deliver_mouse_button(
             &webview,
@@ -147,7 +149,21 @@ pub fn apply(state: &Shared, connection: u64, message: &InputMessage) -> bool {
             webview.notify_input_event(InputEvent::Keyboard(event));
             true
         },
+    };
+
+    // (8) The one fact only this line knows: the message reached a page.
+    //
+    // Recorded here rather than in [`admit`], because admission consumes a
+    // sequence number whether or not the delivery then succeeds — deliberately,
+    // so a refused number cannot be replayed later (T-05-15) — and the frame
+    // header's latency echo must carry only what arrived. Echoing the
+    // admission mark reported a round trip for a click in the letterboxed
+    // margin, on a crashed tab, or on a tab this connection never attached to,
+    // biased *low* (WR-10).
+    if delivered {
+        state.views.borrow_mut().delivered_input(connection, sequence_of(message));
     }
+    delivered
 }
 
 /// Steps 1 to 4: the whole of the decision that needs no engine.

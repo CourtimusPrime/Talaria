@@ -380,7 +380,7 @@ fn record_readings(
         reading("reading.input_to_photon_ms", estimate as f32, 0.0);
     }
     reading("reading.frame_seq", present.last_frame_seq() as f32, 0.0);
-    reading("reading.last_applied_input", present.last_applied_input() as f32, 0.0);
+    reading("reading.last_delivered_input", present.last_delivered_input() as f32, 0.0);
     reading("reading.input_seq", sent as f32, 0.0);
     // Every rectangle above is in logical points. A caller converting one to a
     // screen coordinate needs this to finish the job, and it is the client's own

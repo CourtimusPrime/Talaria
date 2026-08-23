@@ -293,9 +293,10 @@ pub struct Presenter {
     attached: Option<u64>,
     /// The picture of it, if a keyframe has arrived.
     held: Option<Held>,
-    /// The last input sequence the server said it had applied when it painted.
-    /// Read by the interface's readings, and by 05-10's controller after it.
-    last_applied_input: u64,
+    /// The highest input sequence the server said had actually reached the
+    /// page when it painted. Read by the interface's readings, and by 05-10's
+    /// controller after it.
+    last_delivered_input: u64,
 }
 
 impl Presenter {
@@ -307,7 +308,7 @@ impl Presenter {
     pub fn attach(&mut self, tab: u64) {
         self.attached = Some(tab);
         self.held = None;
-        self.last_applied_input = 0;
+        self.last_delivered_input = 0;
     }
 
     /// Stop watching, and **clear the surface**.
@@ -319,7 +320,7 @@ impl Presenter {
     pub fn detach(&mut self) {
         self.attached = None;
         self.held = None;
-        self.last_applied_input = 0;
+        self.last_delivered_input = 0;
     }
 
     /// The tab being watched, if any.
@@ -337,15 +338,20 @@ impl Presenter {
         self.held.as_ref().map_or(0, |held| held.last_seq)
     }
 
-    /// The last input sequence the server had applied when it painted the most
-    /// recent frame this client accepted.
+    /// The highest input sequence that had actually reached the page when the
+    /// server painted the most recent frame this client accepted.
     ///
     /// The client's half of the input-to-photon estimate: it knows when it sent
     /// that sequence and when this frame arrived, and both readings come off
     /// **its own** clock, so nothing has to be synchronised across the two
     /// machines.
-    pub fn last_applied_input(&self) -> u64 {
-        self.last_applied_input
+    ///
+    /// **Delivered, not merely accepted.** The server keeps a separate
+    /// ordering mark that advances on inputs it refused — see the wire field's
+    /// own doc — and echoing that one would give this estimate round trips
+    /// that never included a hit test or a repaint, biased low.
+    pub fn last_delivered_input(&self) -> u64 {
+        self.last_delivered_input
     }
 
     /// Apply one frame, or discard it.
@@ -411,7 +417,7 @@ impl Presenter {
                         });
                     },
                 }
-                self.last_applied_input = header.last_applied_input;
+                self.last_delivered_input = header.last_delivered_input;
                 true
             },
             Application::Patch { x, y, width, height } => {
@@ -425,7 +431,7 @@ impl Presenter {
                 let Some(held) = self.held.as_mut() else { return false };
                 held.texture.set_partial([x as usize, y as usize], image, SAMPLING);
                 held.last_seq = header.frame_seq;
-                self.last_applied_input = header.last_applied_input;
+                self.last_delivered_input = header.last_delivered_input;
                 true
             },
         }
@@ -475,7 +481,7 @@ mod tests {
             scale_denominator: 1,
             tab_id: 7,
             frame_seq: seq,
-            last_applied_input: 0,
+            last_delivered_input: 0,
             tile_x: tile.0,
             tile_y: tile.1,
             tile_width: tile.2,

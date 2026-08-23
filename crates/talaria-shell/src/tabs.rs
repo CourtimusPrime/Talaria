@@ -521,7 +521,7 @@ mod tests {
     /// viewer's frames kept arriving, because they are read from the offscreen
     /// buffer and do not need the webview shown, while its clicks stopped
     /// landing, because a hidden webview answers no hit test. The hold count
-    /// still read 1; only `last_applied_input` stopped advancing.
+    /// still read 1; only `last_delivered_input` stopped advancing.
     ///
     /// This pins the predicate the capture drain now consults. A held tab is
     /// not `Hidden` even when it is not the displayed one, so `hide_after` is

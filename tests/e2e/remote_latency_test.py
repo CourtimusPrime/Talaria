@@ -244,7 +244,7 @@ def frame_header(message):
     assert len(body) > FRAME_HEADER_LEN, ("a frame carried no payload", len(body))
     assert body[0] == FRAME_FORMAT_VERSION, ("unknown frame format", body[0])
     fields = struct.unpack_from("<QQQIIIIII", body, 3)
-    header = dict(zip(("tab", "seq", "last_applied", "x", "y",
+    header = dict(zip(("tab", "seq", "last_delivered", "x", "y",
                        "width", "height", "frame_width", "frame_height"),
                       fields))
     header["kind"] = body[1]

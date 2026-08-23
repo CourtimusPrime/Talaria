@@ -719,7 +719,7 @@ mod tests {
             scale_denominator: 1,
             tab_id: 12,
             frame_seq: 44,
-            last_applied_input: 43,
+            last_delivered_input: 43,
             tile_x: 64,
             tile_y: 0,
             tile_width: 64,

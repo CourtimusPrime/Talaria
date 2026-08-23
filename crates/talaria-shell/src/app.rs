@@ -509,7 +509,7 @@ impl Shared {
             // no hit test. The viewer's frames kept arriving (they are read
             // from the offscreen buffer, which does not need the webview shown)
             // while its clicks stopped landing, and nothing reported it: the
-            // hold count still read 1 and only `last_applied_input` stopped
+            // hold count still read 1 and only `last_delivered_input` stopped
             // advancing. An agent taking a routine screenshot was enough.
             //
             // `visibility_of` is the single source of truth for whether a

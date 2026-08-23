@@ -375,7 +375,7 @@ def decode_frame(message):
     scale = body[2]
     assert scale > 0, "a frame declared a zero scale"
     fields = struct.unpack_from("<QQQIIIIII", body, 3)
-    header = dict(zip(("tab", "seq", "last_applied", "x", "y",
+    header = dict(zip(("tab", "seq", "last_delivered", "x", "y",
                        "width", "height", "frame_width", "frame_height"),
                       fields))
     header["kind"] = body[1]
@@ -1246,15 +1246,15 @@ try:
         frame = next_frame(seer, 6.0)
         if frame is None:
             continue
-        carried.append(frame[0]["last_applied"])
-        if frame[0]["last_applied"] >= sent:
+        carried.append(frame[0]["last_delivered"])
+        if frame[0]["last_delivered"] >= sent:
             echoed = frame[0]
             break
     assert echoed is not None, (
         "no frame echoed the input sequence the server had already applied, so "
         "a client cannot tell which of its own inputs a frame postdates",
         sent, carried)
-    print(f"ECHOED: a frame carries last-applied-input {echoed['last_applied']}, "
+    print(f"ECHOED: a frame carries last-delivered-input {echoed['last_delivered']}, "
           f"at or past the {sent} that was sent")
 
     # --- 32. a second viewer on the same tab is independent --------------
@@ -1615,7 +1615,7 @@ try:
                          "`#0${Math.floor(Math.random() * 8)}f`")
         time.sleep(0.6)
         applied_after, _ = client_reading(client, "reading.frame_seq")
-        echoed, _ = client_reading(client, "reading.last_applied_input")
+        echoed, _ = client_reading(client, "reading.last_delivered_input")
         if applied_after > applied_before and echoed >= sent:
             break
     assert applied_after > applied_before, (

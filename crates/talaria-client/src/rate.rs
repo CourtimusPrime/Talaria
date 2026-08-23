@@ -14,8 +14,12 @@
 //! ## The measurement, and why it needs no synchronised clock
 //!
 //! Every input this client sends carries a sequence number, and every frame
-//! header echoes the last input sequence the server had already applied when
-//! it painted ([`talaria_protocol::wire::FrameHeader::last_applied_input`]).
+//! header echoes the highest input sequence that had actually reached the page
+//! when the server painted
+//! ([`talaria_protocol::wire::FrameHeader::last_delivered_input`]) — which is a
+//! different number from the highest it *accepted*, and deliberately so: the
+//! accepted mark advances on refusals, and a sample drawn from it would be a
+//! round trip that never included a hit test.
 //! When a frame arrives echoing sequence *n*, the time since *n* was sent is
 //! an **input-to-photon** sample: both readings come off this machine's own
 //! clock, so nothing has to be agreed between the two machines.

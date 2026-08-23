@@ -708,7 +708,7 @@ struct Frame {
     connection: u64,
     tab: u64,
     frame_seq: u64,
-    last_applied_input: u64,
+    last_delivered_input: u64,
     keyframe: bool,
     /// The divisor the rung this attachment is on implies. The reduction runs
     /// **here**, on the encoder thread, and never on the winit loop.
@@ -856,7 +856,7 @@ fn compose(frame: &Frame, kind: FrameKind, region: Region) -> Option<Vec<u8>> {
         // instrumentation: the client knows when it sent that sequence and
         // when this frame arrived, both off its own clock, so no clock has to
         // be shared between the two machines.
-        last_applied_input: frame.last_applied_input,
+        last_delivered_input: frame.last_delivered_input,
         tile_x: region.x,
         tile_y: region.y,
         tile_width: region.width,
@@ -1099,10 +1099,15 @@ pub struct DueTick {
     pub tab: u64,
     /// The sequence this frame will carry, already consumed.
     pub frame_seq: u64,
-    /// The input sequence this connection had applied when the tick was taken
-    /// — stamped into the header the encoder assembles, and the whole of the
-    /// latency instrumentation.
-    pub last_applied_input: u64,
+    /// The highest input sequence that had actually reached a page on this
+    /// connection when the tick was taken — stamped into the header the
+    /// encoder assembles, and the whole of the latency instrumentation.
+    ///
+    /// **Deliberately not [`ViewSession::last_applied_input`]**, which
+    /// advances on refusals too; see
+    /// [`ViewSession::last_delivered_input`] for why echoing that one
+    /// reported a latency for a round trip that never happened (WR-10).
+    pub last_delivered_input: u64,
     /// Whether this frame must be a keyframe whatever the comparison says.
     pub keyframe: bool,
     /// The divisor this connection's rung implies, carried with the tick so the
@@ -1140,13 +1145,11 @@ pub struct ViewSession {
     snapshotted: bool,
     /// The highest input sequence number this connection has had accepted.
     ///
-    /// **One field, three jobs**, which is why it is one field and not three
-    /// mechanisms: it is the replay resistance inside a connection (a number
-    /// cannot be used twice), it is the ordering rule under coalescing (a late
-    /// message that lost a race is dropped rather than applied out of order),
-    /// and it is what [`talaria_protocol::wire::FrameHeader::last_applied_input`]
-    /// echoes so a client can measure input-to-photon latency off its own
-    /// clock alone, with no clock shared between the two machines.
+    /// **One field, two jobs** — it used to be three, and the third is now
+    /// [`ViewSession::last_delivered_input`]. It is the replay resistance
+    /// inside a connection (a number cannot be used twice), and it is the
+    /// ordering rule under coalescing (a late message that lost a race is
+    /// dropped rather than applied out of order).
     ///
     /// *Accepted* means the message passed the sequence rule and was handed on
     /// to [`crate::remote_input`]. A message refused further down — an
@@ -1160,6 +1163,24 @@ pub struct ViewSession {
     /// one, or either could replay or reorder the other's input by choosing
     /// numbers.
     pub last_applied_input: u64,
+    /// The highest input sequence that actually **reached a page** on this
+    /// connection.
+    ///
+    /// A second field rather than a second use of the first, which is the
+    /// correction WR-10 made. `last_applied_input` advances on refusals, on
+    /// purpose and correctly — but it was also what
+    /// [`talaria_protocol::wire::FrameHeader::last_delivered_input`] echoed,
+    /// and the client turns that echo into `reading.input_to_photon_ms`, which
+    /// `scripts/two-machine-check.sh` names as the phase's headline evidence.
+    /// So a viewer clicking in the letterboxed margin, or on a crashed tab, or
+    /// on a tab it had never attached to, produced a latency figure for a
+    /// round trip that never included a hit test or a repaint — biased *low*,
+    /// in the direction that makes the number look better.
+    ///
+    /// Written only by [`ViewSessions::delivered_input`], from
+    /// [`crate::remote_input::apply`]'s `true` return, which is the one place
+    /// that knows a page was reached.
+    pub last_delivered_input: u64,
     /// The rung of [`talaria_protocol::wire::RUNG_LADDER`] this connection last
     /// asked for.
     ///
@@ -1230,6 +1251,7 @@ impl ViewSessions {
             attached: Vec::new(),
             snapshotted: false,
             last_applied_input: 0,
+            last_delivered_input: 0,
             rung: Rung::FASTEST,
         });
         if let Some(session) = self.sessions.last() {
@@ -1359,6 +1381,28 @@ impl ViewSessions {
         attachment.last_input = Some(now);
         attachment.pull_forward(rung, now);
         true
+    }
+
+    /// Record that input sequence `seq` on `connection` actually reached a
+    /// page.
+    ///
+    /// **The other half of [`ViewSessions::admit_input`], and separate from it
+    /// on purpose** (WR-10). Admission answers "may this be delivered", and it
+    /// consumes the sequence number whether or not the delivery then succeeds,
+    /// because a number that could be reused is a message that could be
+    /// replayed (T-05-15). This answers "did it arrive", which is a different
+    /// fact and the only one a latency figure may be computed from — see
+    /// [`ViewSession::last_delivered_input`].
+    ///
+    /// Called by [`crate::remote_input::apply`] and by nothing else, because
+    /// that is the only code that has a webview's answer. `max` rather than
+    /// assignment so the mark cannot go backwards, which matters not for the
+    /// ordinary path — the sequence rule already made `seq` the highest
+    /// accepted — but so that a later caller cannot lower it by accident.
+    pub fn delivered_input(&mut self, connection: u64, seq: u64) {
+        if let Some(session) = self.session_mut(connection) {
+            session.last_delivered_input = session.last_delivered_input.max(seq);
+        }
     }
 
     /// Answer one control-channel message.
@@ -1571,7 +1615,7 @@ impl ViewSessions {
     pub fn take_due(&mut self, now: Instant, idle: Duration) -> Vec<DueTick> {
         let mut due = Vec::new();
         for session in &mut self.sessions {
-            let last_applied_input = session.last_applied_input;
+            let last_delivered_input = session.last_delivered_input;
             let rung = session.rung;
             // **The one question asked before any pixels are paid for**: is
             // this viewer reading what it already has? See
@@ -1613,7 +1657,7 @@ impl ViewSessions {
                     connection: session.connection,
                     tab: attachment.tab,
                     frame_seq,
-                    last_applied_input,
+                    last_delivered_input,
                     keyframe: std::mem::take(&mut attachment.keyframe),
                     scale_denominator: rung.scale_denominator(),
                     out: session.out.clone(),
@@ -1713,7 +1757,7 @@ impl ViewSessions {
             connection: tick.connection,
             tab: tick.tab,
             frame_seq: tick.frame_seq,
-            last_applied_input: tick.last_applied_input,
+            last_delivered_input: tick.last_delivered_input,
             keyframe: tick.keyframe,
             scale_denominator: tick.scale_denominator,
             surface,
@@ -2307,6 +2351,48 @@ mod tests {
         assert_eq!(sessions.session_mut(1).expect("the session").last_applied_input, 0);
     }
 
+    /// WR-10: the ordering mark and the latency echo are two different facts,
+    /// and the header carries the second.
+    ///
+    /// The bug this pins: one field did both jobs, so the phase's headline
+    /// evidence — `reading.input_to_photon_ms`, which
+    /// `scripts/two-machine-check.sh` calls "THE EVIDENCE for Success
+    /// Criterion 2" — was computed from a counter that advances on *refused*
+    /// inputs. A click in the letterboxed margin, on a crashed tab, or on a
+    /// tab the viewer never attached to produced a latency for a round trip
+    /// that never included a hit test, biased low.
+    #[test]
+    fn a_refused_input_advances_the_ordering_mark_and_not_the_latency_echo() {
+        let mut tabs = FakeTabs::with(&[(1, true), (2, true)]);
+        let mut sessions = ViewSessions::default();
+        let viewer = connect(&mut sessions, 1, "client-a");
+        attach(&mut sessions, &viewer, 1, &mut tabs);
+
+        // Accepted and delivered: both marks move, and the tick echoes it.
+        assert!(sessions.admit_input(viewer.connection, 1, 4));
+        sessions.delivered_input(viewer.connection, 4);
+
+        // Accepted by the sequence rule and refused downstream — tab 2 is
+        // agent-owned and unattached, so `remote_input::apply` never reaches
+        // its delivery call and never records anything.
+        assert!(!sessions.admit_input(viewer.connection, 2, 5));
+
+        let session = sessions.session_mut(1).expect("the session");
+        assert_eq!(
+            session.last_applied_input, 5,
+            "a refused input did not consume its number, so it could be replayed (T-05-15)",
+        );
+        assert_eq!(
+            session.last_delivered_input, 4,
+            "a refused input advanced the number the frame header echoes, so the latency \
+             figure counts a round trip that never included a hit test",
+        );
+
+        // And the tick carries the delivered one.
+        let tick = sessions.take_due(Instant::now(), view_idle()).remove(0);
+        assert_eq!(tick.last_delivered_input, 4);
+    }
+
     /// The input channel's sequence high-water mark is per connection, and it
     /// only ever advances.
     #[test]
@@ -2857,7 +2943,7 @@ mod tests {
             connection: 1,
             tab: 5,
             frame_seq: 2,
-            last_applied_input: 0,
+            last_delivered_input: 0,
             keyframe: true,
             scale_denominator: 2,
             surface,
@@ -3232,7 +3318,7 @@ mod tests {
             connection: 7,
             tab: 42,
             frame_seq: 9,
-            last_applied_input: 1839,
+            last_delivered_input: 1839,
             keyframe: false,
             scale_denominator: Rung::FASTEST.scale_denominator(),
             surface,
@@ -3247,7 +3333,7 @@ mod tests {
         assert_eq!(header.kind, FrameKind::Tile);
         assert_eq!(header.tab_id, 42);
         assert_eq!(header.frame_seq, 9);
-        assert_eq!(header.last_applied_input, 1839, "the latency echo was not stamped");
+        assert_eq!(header.last_delivered_input, 1839, "the latency echo was not stamped");
         assert_eq!((header.tile_x, header.tile_y), (192, 192));
         assert_eq!((header.tile_width, header.tile_height), (8, 8));
         assert_eq!((header.frame_width, header.frame_height), (200, 200));
@@ -3269,7 +3355,7 @@ mod tests {
             connection: 1,
             tab: 1,
             frame_seq: 1,
-            last_applied_input: 0,
+            last_delivered_input: 0,
             keyframe: true,
             scale_denominator: Rung::FASTEST.scale_denominator(),
             surface,
@@ -3315,7 +3401,7 @@ mod tests {
             scale_denominator: Rung::FASTEST.scale_denominator(),
             tab_id: 3,
             frame_seq: 4,
-            last_applied_input: 5,
+            last_delivered_input: 5,
             tile_x: 0,
             tile_y: 0,
             tile_width: 64,

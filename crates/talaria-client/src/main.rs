@@ -553,7 +553,7 @@ impl Running {
                 // a lease that has ended.
                 if self.present.attached() == Some(header.tab_id) {
                     let now = std::time::Instant::now();
-                    if let Some(sample) = self.rate.frame_arrived(header.last_applied_input, now) {
+                    if let Some(sample) = self.rate.frame_arrived(header.last_delivered_input, now) {
                         self.rate.observe(sample);
                         self.sync_cadence();
                     }

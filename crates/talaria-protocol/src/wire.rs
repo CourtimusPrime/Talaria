@@ -177,7 +177,7 @@ impl FrameKind {
 /// | 2  | 1 | scale denominator |
 /// | 3  | 8 | tab id |
 /// | 11 | 8 | frame sequence |
-/// | 19 | 8 | last applied input sequence |
+/// | 19 | 8 | last delivered input sequence |
 /// | 27 | 4 | tile origin x |
 /// | 31 | 4 | tile origin y |
 /// | 35 | 4 | tile width |
@@ -203,8 +203,8 @@ pub struct FrameHeader {
     /// server's; the contract is stated here so the two ends cannot disagree
     /// about it.
     pub frame_seq: u64,
-    /// The input sequence the server had already applied when it painted this
-    /// frame.
+    /// The highest input sequence that had actually **reached a page** on this
+    /// connection when this frame was painted.
     ///
     /// This field is here for two jobs that are not obvious from its name, and
     /// it should not be deleted as redundant with `frame_seq`. First, it makes
@@ -214,7 +214,19 @@ pub struct FrameHeader {
     /// it lets a client drop a frame that predates its own most recent input,
     /// rather than briefly painting a stale page over a click it has already
     /// made.
-    pub last_applied_input: u64,
+    ///
+    /// **"Reached a page" and not "was accepted", which are different numbers
+    /// and this used to echo the wrong one** (WR-10). The server keeps a
+    /// separate ordering high-water mark that advances on *refused* inputs
+    /// too, deliberately, so a sequence number cannot be reused and replayed
+    /// once the state it was refused for has changed (T-05-15). Echoing that
+    /// one reported a latency for a round trip that never included a hit test
+    /// or a repaint — a click in the letterboxed margin, or on a crashed tab,
+    /// or on a tab the viewer had not attached to, produced a figure biased
+    /// *low*, in the direction that makes the number look better. It is this
+    /// field a client turns into its input-to-photon reading, so it carries
+    /// only what was delivered.
+    pub last_delivered_input: u64,
     /// Tile origin in frame coordinates, x.
     pub tile_x: u32,
     /// Tile origin in frame coordinates, y.
@@ -239,7 +251,7 @@ impl FrameHeader {
         bytes[2] = self.scale_denominator;
         bytes[3..11].copy_from_slice(&self.tab_id.to_le_bytes());
         bytes[11..19].copy_from_slice(&self.frame_seq.to_le_bytes());
-        bytes[19..27].copy_from_slice(&self.last_applied_input.to_le_bytes());
+        bytes[19..27].copy_from_slice(&self.last_delivered_input.to_le_bytes());
         bytes[27..31].copy_from_slice(&self.tile_x.to_le_bytes());
         bytes[31..35].copy_from_slice(&self.tile_y.to_le_bytes());
         bytes[35..39].copy_from_slice(&self.tile_width.to_le_bytes());
@@ -276,7 +288,7 @@ impl FrameHeader {
             scale_denominator,
             tab_id: read_u64(bytes, 3)?,
             frame_seq: read_u64(bytes, 11)?,
-            last_applied_input: read_u64(bytes, 19)?,
+            last_delivered_input: read_u64(bytes, 19)?,
             tile_x: read_u32(bytes, 27)?,
             tile_y: read_u32(bytes, 31)?,
             tile_width: read_u32(bytes, 35)?,
@@ -799,7 +811,7 @@ mod tests {
             scale_denominator: 2,
             tab_id: 7,
             frame_seq: 1841,
-            last_applied_input: 1839,
+            last_delivered_input: 1839,
             tile_x: 128,
             tile_y: 64,
             tile_width: 64,
@@ -1178,7 +1190,7 @@ mod tests {
         assert_eq!(back.scale_denominator, 2);
         assert_eq!(back.tab_id, 7);
         assert_eq!(back.frame_seq, 1841);
-        assert_eq!(back.last_applied_input, 1839);
+        assert_eq!(back.last_delivered_input, 1839);
         assert_eq!(back.tile_x, 128);
         assert_eq!(back.tile_y, 64);
         assert_eq!(back.tile_width, 64);
@@ -1194,7 +1206,7 @@ mod tests {
             scale_denominator: u8::MAX,
             tab_id: u64::MAX,
             frame_seq: u64::MAX,
-            last_applied_input: u64::MAX,
+            last_delivered_input: u64::MAX,
             tile_x: 0,
             tile_y: 0,
             tile_width: u32::MAX,
