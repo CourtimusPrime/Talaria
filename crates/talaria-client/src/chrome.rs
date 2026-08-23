@@ -37,6 +37,27 @@
 //!
 //! No count label anywhere, matching the design contract's rule.
 //!
+//! ## The link report
+//!
+//! Drawn only while a tab is being watched, because it is a statement about
+//! frames and there are none otherwise. The copy itself is
+//! [`crate::rate::RateController::report`]'s — written where it is decided, and
+//! reviewable as a table in that module's own header — and this surface's job
+//! is to place it and to name it.
+//!
+//! | Element | Recorded as | When |
+//! |---------|-------------|------|
+//! | The fact | `link.full` | at the ladder's fastest rung |
+//! | The fact | `link.degraded` | at any rung below it |
+//! | The path clause | `link.relayed` | when the overlay network reports this peer's path is relayed rather than direct |
+//! | The next step (`Small`) | — | whenever there is one |
+//! | The measured figure (`Small`) | `link.measurement` | once a round trip has been measured |
+//!
+//! **The recorded name carries the state**, the way the tab rows' Watch and
+//! Stop controls do: an end-to-end suite can then assert *which* report is
+//! being shown without reading a pixel or matching a string of copy that is
+//! free to be reworded.
+//!
 //! ## The pairing block
 //!
 //! | Element | Copy |
@@ -56,6 +77,7 @@ use talaria_protocol::{ChromeRect, TabInfo};
 
 use crate::net::ConnectionState;
 use crate::present::{Fit, Presenter};
+use crate::rate::{LinkPath, Report};
 
 /// How wide the client's own controls are, in logical points.
 ///
@@ -198,6 +220,8 @@ pub struct View<'a> {
     /// input, what their clicks are going into: a viewer attached to nothing
     /// must not look identical to one that is attached.
     pub attached: Option<u64>,
+    /// What the rate controller has to say about the link, already worded.
+    pub link: &'a Report,
 }
 
 /// The client's interface.
@@ -274,6 +298,13 @@ impl Chrome {
                     };
                     let indication = ui.label(watching);
                     record_rect(rects.as_mut(), "attachment.state", None, indication.rect);
+                    // Only while a tab is being watched: the report is about
+                    // frames, and a client attached to nothing is receiving
+                    // none, so drawing it would be a statement about a link
+                    // nothing is currently crossing.
+                    if view.attached.is_some() {
+                        link_surface(ui, view.link, rects.as_mut());
+                    }
                     ui.add_space(8.0);
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         tab_surface(ui, view, rects.as_mut(), &mut actions);
@@ -296,7 +327,7 @@ impl Chrome {
             }
         });
 
-        record_readings(rects.as_mut(), present, sent, ui.ctx().pixels_per_point());
+        record_readings(rects.as_mut(), present, view.link, sent, ui.ctx().pixels_per_point());
 
         if let Some(rects) = rects {
             self.chrome_rects = Some(rects);
@@ -320,6 +351,7 @@ impl Chrome {
 fn record_readings(
     rects: Option<&mut Vec<ChromeRect>>,
     present: &Presenter,
+    link: &Report,
     sent: u64,
     points_per_pixel: f32,
 ) {
@@ -335,6 +367,17 @@ fn record_readings(
         // coordinate is expressed in — not the texture's.
         reading("reading.page_size", size.page_width() as f32, size.page_height() as f32);
         reading("reading.denominator", f32::from(size.denominator), 0.0);
+    }
+    // The ladder, as three numbers. `rung` is the position in
+    // `talaria_protocol::wire::RUNG_LADDER`, counting from the fastest, so a
+    // step *down* is a step *up* in this reading — a suite can assert the
+    // degradation without knowing a rung's name. `rung_changes` is the
+    // anti-oscillation property: a ladder flapping between two rungs shows up
+    // here as a number that keeps climbing on a link that is not changing.
+    reading("reading.rung", link.rung.index() as f32, 0.0);
+    reading("reading.rung_changes", link.changes as f32, 0.0);
+    if let Some(estimate) = link.estimate_ms {
+        reading("reading.input_to_photon_ms", estimate as f32, 0.0);
     }
     reading("reading.frame_seq", present.last_frame_seq() as f32, 0.0);
     reading("reading.last_applied_input", present.last_applied_input() as f32, 0.0);
@@ -438,6 +481,42 @@ fn connection_surface(
         if button.clicked() {
             actions.push(UiAction::Reconnect);
         }
+    }
+}
+
+/// Surface four: what the human is getting, and why.
+///
+/// The copy is [`crate::rate::RateController::report`]'s. What happens here is
+/// placement and naming: the fact is recorded under a name that says which of
+/// the two states it is in, and the path clause — the one that distinguishes
+/// "the browser is slow" from "your connection is relayed rather than direct",
+/// which is a fix rather than a complaint — gets a name of its own so it can be
+/// found without matching copy.
+fn link_surface(ui: &mut egui::Ui, report: &Report, mut rects: Option<&mut Vec<ChromeRect>>) {
+    ui.add_space(6.0);
+    let fact = ui.label(&report.fact);
+    record_rect(
+        rects.as_deref_mut(),
+        match report.degraded {
+            true => "link.degraded",
+            false => "link.full",
+        },
+        None,
+        fact.rect,
+    );
+    // Recorded as its own control **only when the platform actually answered
+    // relayed**. The absence of this rect is therefore "the path is direct, or
+    // could not be looked up" — which is exactly the distinction the copy
+    // itself makes, rather than a second and separately-wrong encoding of it.
+    if report.path == LinkPath::Relayed {
+        record_rect(rects.as_deref_mut(), "link.relayed", None, fact.rect);
+    }
+    if let Some(next_step) = report.next_step.as_deref() {
+        ui.label(egui::RichText::new(next_step).small());
+    }
+    if let Some(measurement) = report.measurement.as_deref() {
+        let measured = ui.label(egui::RichText::new(measurement).small());
+        record_rect(rects, "link.measurement", None, measured.rect);
     }
 }
 

@@ -41,6 +41,7 @@ mod chrome;
 mod input;
 mod net;
 mod present;
+mod rate;
 
 use std::cell::{Cell, RefCell};
 use std::error::Error;
@@ -261,6 +262,9 @@ enum App {
         state: net::ConnectionState,
         tabs: Vec<TabInfo>,
         outbound: net::Outbound,
+        /// The overlay network's verdict on the path, already being asked for
+        /// on its own thread before the window exists.
+        link: rate::Link,
     },
     /// After it. Owns the window, its surface and its interface.
     ///
@@ -311,6 +315,16 @@ struct Running {
     /// The pointer and keyboard, on their way out. Lives for the process rather
     /// than for a connection, so its sequence is never reused after a reconnect.
     capture: input::Capture,
+    /// How often to ask for frames, and what to tell the human about it.
+    ///
+    /// Lives for the process, like the capture and for the same reason: what it
+    /// has learned is a fact about the *link*, and a link does not become a
+    /// different link because an attachment ended.
+    rate: rate::RateController,
+    /// The rung last asked for, so a cadence request goes out when the answer
+    /// changes and never once per frame. `None` after an attach or a reconnect,
+    /// which is what makes the first request of a new attachment unconditional.
+    requested_rung: Option<talaria_protocol::wire::Rung>,
     /// Set by a redraw request and cleared once the frame is drawn, so one
     /// window event produces at most one frame.
     redraw: Cell<bool>,
@@ -330,9 +344,11 @@ impl Running {
         // `self.egui` is: edition 2021 closures capture disjoint fields, so
         // nothing here needs the move-out-and-back the server's chrome does for
         // its own view state.
-        let Running { egui, chrome, window, server, state, tabs, present, capture, .. } = self;
+        let Running { egui, chrome, window, server, state, tabs, present, capture, rate, .. } =
+            self;
         let sent = capture.last_seq();
         let credential_file = net::credential_file();
+        let link = rate.report();
         let mut actions = Vec::new();
         egui.run(window, |ui| {
             actions = chrome.update(
@@ -343,6 +359,7 @@ impl Running {
                     tabs,
                     credential_file: credential_file.as_deref(),
                     attached: present.attached(),
+                    link: &link,
                 },
                 present,
                 sent,
@@ -433,7 +450,38 @@ impl Running {
         // Queued, not written: the write happens on the connection thread. A
         // queue that has nowhere to go answers false, which is the same answer a
         // closed connection gives, and neither is worth a line in the window.
-        let _ = self.outbound.input(&message);
+        if self.outbound.input(&message) {
+            // Timed from here, against the frame that eventually echoes this
+            // sequence. Only a message that was actually queued starts a clock,
+            // because one that was not will never be echoed and would sit in
+            // the controller's table as a measurement that never completes.
+            self.rate.sent(rate::message_seq(&message), std::time::Instant::now());
+            self.sync_cadence();
+        }
+    }
+
+    /// Ask the server for the rung the controller currently wants, if that is
+    /// not already what it was asked for.
+    ///
+    /// **The request is the whole of this client's half of the ladder.** It
+    /// names a rung and never an interval, so there is no number here for the
+    /// server to decide whether to honour.
+    fn sync_cadence(&mut self) {
+        if !matches!(self.state, net::ConnectionState::Connected) {
+            return;
+        }
+        // Nothing is being watched, so there is no cadence to have an opinion
+        // about; the next attach sends one.
+        if self.present.attached().is_none() {
+            return;
+        }
+        let wanted = self.rate.requested(std::time::Instant::now());
+        if self.requested_rung == Some(wanted) {
+            return;
+        }
+        if self.outbound.control(&ClientView::Cadence { rung: Some(wanted) }) {
+            self.requested_rung = Some(wanted);
+        }
     }
 
     /// What may be sent right now, read fresh from the loop's own state.
@@ -456,6 +504,10 @@ impl Running {
                 // picture goes too, for the presenter's stated reason.
                 if !matches!(next, net::ConnectionState::Connected) {
                     self.present.detach();
+                    // What was learned about the link survives; what was
+                    // outstanding against the connection that ended does not.
+                    self.rate.attached();
+                    self.requested_rung = None;
                 }
                 self.state = next;
             },
@@ -472,16 +524,40 @@ impl Running {
                 // on screen for exactly one frame, and a click during it would
                 // land somewhere else.
                 self.present.attach(tab);
+                // A fresh attachment measures fresh: 05-02 recorded the first
+                // frame after a lease is taken at 53-112 ms against a 0.19-5.1
+                // ms steady state, and that outlier is about the attach rather
+                // than about the link.
+                self.rate.attached();
+                self.requested_rung = None;
+                self.sync_cadence();
             },
             net::Update::Detached { tab } => {
                 if self.present.attached() == Some(tab) {
                     self.present.detach();
+                    self.requested_rung = None;
                 }
             },
             // The server says nothing about why, and neither does this: the
             // human sees the page area go back to its placeholder.
-            net::Update::Refused => self.present.detach(),
+            net::Update::Refused => {
+                self.present.detach();
+                self.requested_rung = None;
+            },
             net::Update::Frame(header, payload) => {
+                // The measurement is taken from the header's echo whether or
+                // not the frame is applied: a frame superseded by a later one
+                // still crossed the link, and the round trip it reports
+                // happened. Only frames for the tab being watched count — one
+                // still in flight for a previous attachment is a measurement of
+                // a lease that has ended.
+                if self.present.attached() == Some(header.tab_id) {
+                    let now = std::time::Instant::now();
+                    if let Some(sample) = self.rate.frame_arrived(header.last_applied_input, now) {
+                        self.rate.observe(sample);
+                        self.sync_cadence();
+                    }
+                }
                 self.present.apply(&self.egui.egui_ctx, &header, &payload.0);
             },
         }
@@ -523,7 +599,7 @@ impl Drop for Running {
 
 impl ApplicationHandler<ClientEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let App::Initial { server, endpoint, proxy, state, tabs, outbound } = self else {
+        let App::Initial { server, endpoint, proxy, state, tabs, outbound, link } = self else {
             return;
         };
         let server = std::mem::take(server);
@@ -532,6 +608,7 @@ impl ApplicationHandler<ClientEvent> for App {
         let state = state.clone();
         let tabs = std::mem::take(tabs);
         let outbound = outbound.clone();
+        let link = link.clone();
         let display_handle = event_loop.display_handle().expect("display handle");
         let window = event_loop
             .create_window(
@@ -568,16 +645,36 @@ impl ApplicationHandler<ClientEvent> for App {
             outbound,
             present: present::Presenter::default(),
             capture: input::Capture::default(),
+            rate: rate::RateController::new(link),
+            requested_rung: None,
             redraw: Cell::new(true),
         }));
     }
 
     /// Drain whatever arrived off-loop, then decide how long to sleep.
     ///
-    /// The shell's `new_events` drains its pending queues here and then sets its
-    /// wait; this is the same discipline with nothing yet to drain. `05-09`'s
-    /// frame queue and `05-10`'s cadence deadline are what fill it in.
+    /// The shell's `new_events` drains its pending queues here and then sets
+    /// its wait; this is the same discipline, and the cadence deadline is what
+    /// it now waits on.
+    ///
+    /// **Why the loop needs its own deadline at all.** The driven-to-passive
+    /// transition is a fact about elapsed time, and a page nobody is touching
+    /// sends no frames — so without a wake-up the client would sit driving in
+    /// its own head until something else happened to wake it. The server's own
+    /// idle rule would still take the *delivered* rate down, so this is not a
+    /// correctness bug in the cadence; it is the difference between the client
+    /// reporting what it is asking for and reporting what it asked for a minute
+    /// ago.
     fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        if let App::Running(running) = self {
+            running.sync_cadence();
+            if let Some(deadline) = running.rate.idle_deadline() {
+                if running.rate.driving(std::time::Instant::now()) {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    return;
+                }
+            }
+        }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 
@@ -705,6 +802,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // is already in flight by the time the window draws its first frame.
     let proxy = event_loop.create_proxy();
     let outbound = net::spawn(endpoint.clone(), report_to(proxy.clone()));
+    // Asked for on its own thread and never waited for. The host is the one the
+    // human typed, taken off the parsed address rather than off the endpoint, so
+    // the name asked about is the name they would recognise in the answer.
+    let link = match url::Url::parse(&server).ok().and_then(|parsed| {
+        parsed.host_str().map(|host| host.to_owned())
+    }) {
+        Some(host) => rate::Link::probing(host),
+        None => rate::Link::default(),
+    };
     let mut app = App::Initial {
         server,
         endpoint,
@@ -712,6 +818,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         state: net::ConnectionState::NotStarted,
         tabs: Vec::new(),
         outbound,
+        link,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
