@@ -1546,14 +1546,15 @@ impl ViewRoute {
     /// [`AuthMiddleware`] and the identity note — is handed to
     /// [`McpHttpHandler`], and the SDK composes it **only for the transport
     /// handlers it dispatches**. A route merged into the axum router does not
-    /// pass through it. That is not a guess: it is the same sentence
-    /// `build_router` already writes about the origin refusal at the layer
-    /// below — *"Applied here rather than pushed onto `middlewares` because
-    /// that chain is reachable only from the transport handlers"* — and the
-    /// half nobody had written down is that it applies verbatim to
-    /// `AuthMiddleware`. A view route that assumed inheritance would be
-    /// origin-checked and **unauthenticated**, which is the shape of the
-    /// defect Phase 4 shipped as CR-01 and found in review (T-05-02).
+    /// pass through it. That is not a guess: `build_router` already writes
+    /// the sentence, about the origin refusal, on the outer layer below —
+    /// that it is applied as an axum layer rather than pushed onto the SDK's
+    /// vector *"because that chain is reachable only from the transport
+    /// handlers."* The half nobody had written down is that the same sentence
+    /// applies verbatim to [`AuthMiddleware`]. A view route that assumed
+    /// inheritance would be origin-checked and **unauthenticated**, which is
+    /// the shape of the defect Phase 4 shipped as CR-01 and found in review
+    /// (T-05-02).
     ///
     /// **No second audience comparison.** The provider compares the token's
     /// audience byte for byte against [`crate::oauth::canonical_resource`],

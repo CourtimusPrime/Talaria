@@ -224,6 +224,25 @@ impl TabManager {
         self.tabs.iter().find(|t| t.id == id)
     }
 
+    /// The tab `id` names, **only if an agent owns it**.
+    ///
+    /// This is the whole of the agent-tabs-only filter, and it is a *lookup*
+    /// rather than a check on purpose. `D-05-02` says a remote viewer may
+    /// reach agent tabs and nothing else; a `get` followed by an owner test
+    /// would satisfy that today and stop satisfying it the first time somebody
+    /// adds a second call site and forgets the second half. Resolving through
+    /// this instead makes a human-owned tab **unrepresentable** on the remote
+    /// path — the same structural shape `D-04-04` gives the bind address,
+    /// where the guarantee is in what the program can express rather than in a
+    /// validator that could be relaxed.
+    ///
+    /// The Me tabs are where the human's history rows, bookmarks and
+    /// autofilled credentials live, so the tab a viewer cannot name is exactly
+    /// the tab worth not naming.
+    pub fn agent_tab(&self, id: u64) -> Option<&Tab> {
+        self.tabs.iter().find(|t| t.id == id && t.owner.is_agent())
+    }
+
     pub fn get_mut(&mut self, id: u64) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|t| t.id == id)
     }
@@ -292,5 +311,29 @@ impl TabManager {
     pub fn agent_tabs(&self) -> impl Iterator<Item = &Tab> {
         self.tabs.iter().filter(|t| t.owner.is_agent())
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `TabOwner::is_agent` is what the agent-only lookup and both filtered
+    /// iterators are built on, so it is worth pinning on its own: everything
+    /// `D-05-02` promises a remote viewer reduces to this predicate answering
+    /// `false` for a tab the human owns.
+    ///
+    /// The table itself cannot be exercised without a live engine — every
+    /// `Tab` owns a real `WebView` — so `crate::view` tests the filter's
+    /// *consequences* against a fake tab source instead, and this pins the
+    /// one part that stands alone.
+    #[test]
+    fn only_an_agent_owned_tab_reports_as_an_agents() {
+        assert!(!TabOwner::Me.is_agent());
+        assert!(TabOwner::Agent { session_id: 1, client: "client-a".into() }.is_agent());
+        assert_eq!(TabOwner::Me.view(), ViewMode::Me);
+        assert_eq!(
+            TabOwner::Agent { session_id: 1, client: "client-a".into() }.view(),
+            ViewMode::Agents
+        );
+    }
 }

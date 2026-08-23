@@ -749,15 +749,34 @@ impl Shared {
         out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     ) {
         self.views.borrow_mut().opened(connection, client_id, out);
+        self.publish_views();
     }
 
     /// One frame from a viewer. A frame that could not be answered ends the
     /// connection — the socket task learns that when its channel drops.
     pub fn view_message(&self, connection: u64, frame: &[u8]) {
-        let keep = self.views.borrow_mut().message(connection, frame);
+        // Scoped, as every borrow here is: the tab table is read through a
+        // shared borrow that is released before the session table is touched
+        // again, so a message can never wedge the loop it reports into.
+        let keep = {
+            let tabs = self.tabs.borrow();
+            self.views.borrow_mut().message(connection, frame, &*tabs)
+        };
         if !keep {
             self.views.borrow_mut().closed(connection);
         }
+    }
+
+    /// Publish the agent-tab snapshot to every viewer whose copy is stale.
+    ///
+    /// Run from the event loop rather than from each tab-table mutation, and
+    /// a no-op when nothing changed — see [`crate::view::ViewSessions::publish`].
+    pub fn publish_views(&self) {
+        if self.views.borrow().is_empty() {
+            return;
+        }
+        let tabs = self.tabs.borrow();
+        self.views.borrow_mut().publish(&*tabs);
     }
 
     /// A viewer's socket ended. Release everything it held.
@@ -1082,6 +1101,7 @@ impl ApplicationHandler<AppEvent> for App {
             state.process_pending_captures();
             state.process_pending_evals();
             state.process_pending_history_writes();
+            state.publish_views();
             match event {
                 AppEvent::Wake => {},
                 AppEvent::SessionStarted { session_id, client, events } => {
@@ -1187,6 +1207,10 @@ impl ApplicationHandler<AppEvent> for App {
         state.process_pending_captures();
         state.process_pending_evals();
         state.process_pending_history_writes();
+        // Alongside the other per-turn drains, and for the same reason: a tab
+        // opened, closed or crashed by any path at all reaches a viewer from
+        // one place rather than from every mutation site.
+        state.publish_views();
 
         let over_toolbar = |state: &Shared| {
             state
@@ -2069,7 +2093,11 @@ fn belongs_in_history(owner: &TabOwner, load_started_by_agent: &mut bool) -> boo
 }
 
 /// Agent-facing snapshot of one tab.
-fn tab_info(tabs: &TabManager, tab: &crate::tabs::Tab) -> TabInfo {
+///
+/// `pub(crate)` so [`crate::view`]'s snapshot builds the *same* shape an agent
+/// gets over the control socket rather than a parallel one — a second
+/// spelling of "what a tab looks like" is a second thing to keep in step.
+pub(crate) fn tab_info(tabs: &TabManager, tab: &crate::tabs::Tab) -> TabInfo {
     let focused = tabs.active_id(ViewMode::Me) == Some(tab.id)
         || tabs.active_id(ViewMode::Agents) == Some(tab.id);
     TabInfo {
