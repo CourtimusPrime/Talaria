@@ -141,6 +141,47 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Added
 
+- **You can now watch an agent work from another machine, and take the tab over
+  from there** (DIST-01, DIST-02). This is the phase's headline, and the entries
+  below are its parts.
+
+  **A second program** (DIST-01). `talaria-client` is a new binary that runs on a
+  different computer from the browser and connects to it over your private
+  overlay network. It lists the server's **agent tabs and nothing else** — your
+  own tabs are not in the list because the server will not name them, not because
+  the client hides them, and asking for one gets the same answer as asking for a
+  tab that does not exist. It does **not** link the web engine, so it builds in
+  seconds and runs on a machine that has none of the engine's build
+  prerequisites: a laptop can drive a browser it could not compile.
+
+  Getting there needs no certificate work from you and none from Talaria.
+  Encryption is terminated by the overlay-network daemon in front of the
+  browser's **unchanged loopback listener**; the browser issues, loads and renews
+  no certificate at all, and its bind address did not widen to make any of this
+  possible. `scripts/tailscale-serve.sh` stands the mapping up and takes it down.
+
+  **Watching, and then driving** (DIST-02). Attach to an agent's tab and you see
+  the page; click, scroll and type and you are in the same live session the agent
+  is, not a copy of it. Frames arrive as the tiles that actually changed rather
+  than as whole pictures, a settled page sends nothing at all, and the rate rises
+  while you are driving and falls back when you stop. On a link that cannot carry
+  the target rate, the client steps down and **says so** — naming the rung, and
+  whether your path is direct or relayed — rather than stalling or refusing,
+  because a slower takeover of a login wall still clears the login wall.
+
+  **What stayed the same**, which is the part worth checking. Local browsing is
+  unchanged, including how it feels: the chrome's own module is byte-identical
+  across the whole of this work, and the local end-to-end suites for takeover,
+  panel clicks and keyboard navigation pass unmodified. The agent tool surface
+  gained **nothing** — there is no tool for "click at these coordinates", so a
+  remote click is not something an agent can ask for, and the view channel has no
+  message for opening, navigating, evaluating, closing or downloading. The
+  `screenshot` tool behaves exactly as before, off a code path the frame encoder
+  is a sibling of rather than a modification to. The remote listener is still
+  **off by default** and still binds loopback only. The local control socket keeps
+  its peer-credential check. And the human at the keyboard still wins: a viewer
+  attaching to a tab cannot move, refocus or blank anything on your screen.
+
 - **The frame rate is a named ladder, and a link that cannot carry the target is
   answered rather than silently missed** (DIST-02). `talaria-protocol`'s wire gains
   `RUNG_LADDER`: five rungs, fastest first, each carrying an interval in whole

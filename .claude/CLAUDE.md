@@ -18,11 +18,18 @@ challenge), without either side sacrificing performance.
 
 - **Tech Stack**: Rust throughout — Servo/libservo (rendering engine), egui + winit (shell chrome,
   corrected from an original Tauri+React plan), `rust-mcp-sdk` (MCP server) — established through
-  direct implementation, not just design. Three crates: `talaria-shell`, `talaria-mcp`,
-  `talaria-protocol`.
+  direct implementation, not just design. Four crates: `talaria-shell`, `talaria-mcp`,
+  `talaria-protocol`, and `talaria-client` (the remote view client, which links no web engine).
 
-- **Transport**: MCP is stdio-only today (`crates/talaria-mcp/src/main.rs`), which is both why no
-  auth exists and why auth work must land alongside an HTTP transport.
+- **Transport**: three of them, and `talaria-protocol` is the **shared vocabulary** they carry rather
+  than a wire of its own — it defines no transport, no framing and no connection. (1) the Unix control
+  socket, local and peer-UID authenticated (`crates/talaria-shell/src/control.rs`); (2) the loopback
+  HTTP/MCP listener, off by default and bearer-authenticated (`crates/talaria-shell/src/http.rs`); and
+  (3) the remote view WebSocket for live viewing and takeover
+  (`crates/talaria-protocol/src/wire.rs`). The stdio MCP proxy
+  (`crates/talaria-mcp/src/main.rs`) rides the first. None of them widens the bind: remote reach comes
+  from an overlay-network daemon terminating TLS in front of the unchanged `127.0.0.1` listener, so
+  this browser handles no certificate.
 
 - **Performance**: screenshot capture must stay well under the ~30–60ms active-takeover latency
   target (currently 4–36ms); startup-to-socket-ready ~21ms; page load ~219ms.
@@ -46,7 +53,7 @@ challenge), without either side sacrificing performance.
 
 ## Languages
 
-- Rust (edition 2021) — all shipped code: `crates/talaria-shell/`, `crates/talaria-protocol/`, `crates/talaria-mcp/` (~3,159 lines across `crates/*/src/*.rs`)
+- Rust (edition 2021) — all shipped code: `crates/talaria-shell/`, `crates/talaria-protocol/`, `crates/talaria-mcp/`, `crates/talaria-client/` (the remote view client, which links no web engine)
 - Python 3 (3.14.6 on this machine) — end-to-end test harness only, `tests/e2e/*.py`
 - JavaScript — not authored in-repo, but injected into pages at runtime via the `evaluate` MCP tool (`crates/talaria-mcp/src/tools.rs`)
 
@@ -77,7 +84,7 @@ challenge), without either side sacrificing performance.
 - `servo` 0.4.0 — the entire rendering/JS capability; every architectural constraint flows from it
 - `rustls` 0.23 — TLS for the engine. `rustls::crypto::aws_lc_rs::default_provider().install_default()` must run before anything else in `crates/talaria-shell/src/main.rs`
 - `url` 2.5 — URL parsing and the address-bar/search heuristic (`crates/talaria-shell/src/app.rs`)
-- `talaria-protocol` (path dep) — the newline-delimited-JSON control-socket schema shared by shell and MCP proxy (`crates/talaria-protocol/src/lib.rs`)
+- `talaria-protocol` (path dep) — the shared vocabulary every transport carries, not a wire: command/outcome/event enums plus `wire.rs`'s view envelope, used by the shell, the MCP proxy and the remote client (`crates/talaria-protocol/src/lib.rs`, `wire.rs`, `local.rs`)
 - `chacha20poly1305` 0.10 — at-rest encryption for the credential vault (`crates/talaria-shell/src/vault.rs`)
 - `keyring` 3 (`sync-secret-service`, `apple-native`, `windows-native`) — OS keychain storage of the vault key
 - `rand` 0.8, `hex` 0.4 — key generation and key encoding for the vault
@@ -122,7 +129,7 @@ challenge), without either side sacrificing performance.
 
 ## Conventions
 
-- **Rust** — the workspace crates under `crates/` (`talaria-shell`, `talaria-protocol`, `talaria-mcp`).
+- **Rust** — the workspace crates under `crates/` (`talaria-shell`, `talaria-protocol`, `talaria-mcp`, `talaria-client`).
 - **Python 3** — the e2e harness under `tests/e2e/`, deliberately stdlib-only (no pytest, no third-party deps).
 
 ## Naming Patterns
@@ -188,6 +195,13 @@ challenge), without either side sacrificing performance.
 
 ## Architecture
 
+> **This section is generated** from the crates' own `//!` module headers by the
+> codebase mapper. **The module headers are the source of truth** — if a claim
+> here is wrong, fix `crates/*/src/*.rs`'s header first and this section second,
+> or the next regeneration restores the error. `crates/talaria-protocol/src/lib.rs`
+> and `crates/talaria-shell/src/control.rs` were corrected in 05-03 for exactly
+> this reason, and the corrected text is what belongs below.
+
 ## System Overview
 
 ```text
@@ -209,7 +223,7 @@ challenge), without either side sacrificing performance.
 | `Settings` | `config.json`; the address bar's configurable `SearchEngine` | `crates/talaria-shell/src/settings.rs` |
 | `Downloads` | Completed-download list; records the path actually written | `crates/talaria-shell/src/downloads.rs` |
 | `keyutils` | winit `KeyEvent` → servo keyboard event translation | `crates/talaria-shell/src/keyutils.rs` |
-| `talaria-protocol` | Wire enums (`ClientMessage`, `Command`, `ServerMessage`, `Outcome`, `Event`), `socket_path()` | `crates/talaria-protocol/src/lib.rs` |
+| `talaria-protocol` | The shared vocabulary, not a wire: `ClientMessage`, `Command`, `ServerMessage`, `Outcome`, `Event`; `wire.rs`'s view envelope, `FrameHeader`, `InputMessage`, `RUNG_LADDER`; `local.rs`'s `socket_path()` and `getuid` shim | `crates/talaria-protocol/src/lib.rs`, `wire.rs`, `local.rs` |
 | `TalariaTools` | MCP tool structs + JSON schemas + `dispatch` to `Command` | `crates/talaria-mcp/src/tools.rs` |
 | `ShellConnection` | One lazily-opened, auto-reconnecting socket wire; id-matched round trips | `crates/talaria-mcp/src/socket.rs` |
 
@@ -222,11 +236,15 @@ challenge), without either side sacrificing performance.
 
 ## Layers
 
-- Purpose: the only shared vocabulary between shell and clients; also the intended distributed-mode wire.
-- Location: `crates/talaria-protocol/src/lib.rs`
-- Contains: serde enums with `#[serde(tag = …, flatten)]` envelopes, `TabInfo`, `CredentialEntry`, `Cookie`, `Event`, `socket_path()`.
+- Purpose: the **shared vocabulary** the shell, the stdio proxy, the HTTP transport and the remote view client all speak. It is deliberately **not** a wire and never was — it carries no transport, no framing and no connection. (An earlier version of this line called the crate the distributed mode's wire. That was wrong and is retired; 05-03's corrected `lib.rs` header is the source of truth here.)
+- The three transports that carry the vocabulary, so a reader knows where to look:
+  - **The Unix control socket** — newline-delimited JSON, local only, peer-UID authenticated (`crates/talaria-shell/src/control.rs`; path and `getuid` shim in `crates/talaria-protocol/src/local.rs`, `#[cfg(unix)]` and deliberately not re-exported).
+  - **The loopback HTTP/MCP listener** — off by default, bearer-authenticated, OAuth 2.1 (`crates/talaria-shell/src/http.rs`).
+  - **The remote view WebSocket** — the multiplexed binary/JSON envelope for live viewing and takeover (`crates/talaria-protocol/src/wire.rs`, `crates/talaria-shell/src/view.rs`).
+- Location: `crates/talaria-protocol/src/lib.rs` (vocabulary), `wire.rs` (view envelope), `local.rs` (Unix-socket plumbing)
+- Contains: serde enums with `#[serde(tag = …, flatten)]` envelopes, `TabInfo`, `CredentialEntry`, `Cookie`, `Event`; `wire.rs`'s channel tags, `FrameHeader`, `InputMessage` and `RUNG_LADDER`.
 - Depends on: `serde`, `serde_json` only (deliberately dependency-light).
-- Used by: `talaria-shell`, `talaria-mcp`.
+- Used by: `talaria-shell`, `talaria-mcp`, `talaria-client`.
 - Purpose: stateless translation of MCP tool calls into `Command`s; no browser state of its own.
 - Location: `crates/talaria-mcp/src/`
 - Depends on: `rust-mcp-sdk`, `talaria-protocol`, tokio.

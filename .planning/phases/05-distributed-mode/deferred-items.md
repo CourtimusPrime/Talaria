@@ -465,3 +465,109 @@ assert a remote click still navigates.
 
 **Related:** the same class of bug 05-06 hit and 05-08 closed — a hidden webview answers no hit
 test. This is that bug returning through a second door.
+
+---
+
+*Closing entries, appended by 05-11. Everything above was opened while a plan was
+running; everything below is what the phase leaves behind on purpose.*
+
+## Still open at the phase close: the first-pairing question, restated
+
+**Read this one first.** It is the item a developer picking Phase 5 up will hit
+soonest, and it is the only open item that is a *product* decision rather than an
+engineering one.
+
+Phase 5 shipped against **accepting** it: authorising the first remote client
+requires someone at the server machine, because OAuth consent is a panel in the
+server's own chrome. That is stated fully in "Open: does first pairing require
+someone at the server machine?" above, with the three ways out and their costs.
+`talaria-client`'s first-run copy says so plainly rather than leaving the user to
+discover it at the worst moment.
+
+**Nothing built in this phase forecloses either alternative** — RFC 8628's Device
+Authorization Grant and a bespoke pairing code are both strictly additive — and
+**adopting either is a new plan, not an adjustment**, because both change the
+client's first-run surface and therefore its UI contract.
+
+**The second hat.** `05-CONTEXT.md` records this and the "a remote human at a
+login wall has no address bar" question as **one question**: *what can a remote
+human do that requires being physically at the server machine?* Today the answer
+is: approve the first client, and reach any URL the page itself will not take you
+to. Answering both together will be cheaper than answering them apart.
+
+**Condition for revisiting:** the first time somebody wants to pair a second
+machine without walking to the first, or the first time a remote takeover stalls
+because the flow needed a different URL rather than a different click.
+
+## A viewer sees every agent's tabs, not only its own client's
+
+**A decision, not a default, and not an oversight.** `view::agent_snapshot` lists
+every tab owned by any agent, and any authorised viewer may attach to any of
+them. It is not scoped to the tabs opened by the agent that shares the viewer's
+client identity.
+
+**Why.** The human is the trust root, and a remote human is the trust root at a
+distance. Talaria's whole premise is that a person can take over *whatever* an
+agent got stuck on; a viewer that could only see the work of one particular agent
+would be a viewer that could not clear the login wall the other agent hit. The
+asymmetry that matters is the one that *is* enforced: no agent's tab list ever
+includes a human-owned tab, and no viewer can name one.
+
+**Condition for revisiting:** a deployment where agents belong to parties that
+should not see each other's work. That is a different product from this one — it
+implies per-agent scoping, which `PROJECT.md` lists as deliberately out of scope —
+so the revisit is a product decision before it is a code one.
+
+## Reconnect, resync and the session manifest are Phase 5.1's
+
+Cross-referenced here so the closing register points forward rather than leaving
+DIST-03 and DIST-04 findable only inside a plan nobody re-reads. The full entry is
+"Phase 5.1 inherits DIST-03 and DIST-04" above.
+
+The two design facts this phase established that 5.1 will need:
+
+1. **The frame sequence is per attachment, not per connection**, and the
+   previous-frame buffer is released on detach, on disconnect and on the tab
+   closing. A reconnect therefore starts from no history at all, which makes
+   "send a keyframe" the correct and only resync — but it also means a resync
+   *cannot* be a delta against what the client still has on screen without a new
+   agreement about what the server remembers.
+2. **`tests/e2e/link_shim.py` already has a kill knob**, unused today and built
+   for exactly this: 5.1 can sever a live link mid-frame without privileges and
+   without a second machine.
+
+## What the automated suite does not — and cannot — prove
+
+`05-VALIDATION.md` lists two manual-only verifications. Phase 3 and Phase 4 closed
+their visual items by rendering under the virtual display; the first of these two
+**cannot** be closed that way, and that is the entry a later reader should follow
+when they wonder whether the latency claim was ever confirmed on real hardware.
+
+**Row 1 — a real two-machine run.** Everything automated in this phase runs both
+ends on **one host, under Xvfb, on software rendering**. That proves the protocol,
+the authorisation, the ordering rules, the ladder walk and the degrade-and-report
+behaviour. It proves **nothing** about the network, because loopback hides
+transmission — which is the only variable Success Criterion 2 is about. TLS
+termination by the overlay daemon, the tailnet `Host` a Serve-proxied request
+carries, and real link behaviour are all untested by `tests/e2e/run_all.py`.
+`tests/e2e/remote_latency_test.py` deliberately makes no claim that SC 2's target
+is met, and says so in its own docstring.
+
+**The step that closes it:** `scripts/two-machine-check.sh`. It checks the
+prerequisites it can, **observes and prints the path type** (direct or relayed)
+rather than assuming it, prints the numbered steps a human performs, and asks for
+the client's reported **input-to-photon estimate in milliseconds** as the evidence
+and the "did takeover feel immediate" impression as the product claim — separately,
+because they are not the same kind of thing. It exits non-zero when a prerequisite
+is missing, so a run that could not have proved anything does not read as a pass.
+It deliberately does not drive the second machine: a script that automated a human
+judgement would produce a green result for a question only a human can answer.
+
+**Row 2 — remote keyboard input to a tab the local human is not looking at** was
+**resolved** by 05-09 and is recorded above; it is listed here only so the pair is
+accounted for.
+
+**Condition for revisiting:** whenever SC 2's ~30–60 ms target is cited as
+confirmed. Until somebody runs the script on a direct path and writes the
+millisecond figure down, that target is *designed for and not contradicted*,
+rather than measured across two machines.

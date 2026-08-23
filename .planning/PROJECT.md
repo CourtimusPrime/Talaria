@@ -45,8 +45,8 @@ challenge), without either side sacrificing performance.
 - [ ] Bridge shell tab events (`TabCrashed`, `TabClosed`) into real MCP notifications instead of discarding them in the proxy
 - [ ] Finish the credential vault: a write/capture path, plaintext-import cleanup, and domain-matched autofill in the shell UI
 - [ ] Table-stakes browsing: history, bookmarks, configurable search engine, downloads UI
-- [ ] OAuth 2.1 authorization server (`rust-mcp-sdk`) plus an HTTP/SSE transport — today only stdio exists, which is why there is no auth
-- [ ] Distributed mode: Tailscale client/server split, remote live-viewing and takeover over the designed WebSocket protocol
+- [x] OAuth 2.1 authorization server (`rust-mcp-sdk`) plus an HTTP/SSE transport — shipped in Phase 4; the listener is off by default, loopback-only and bearer-authenticated
+- [x] Distributed mode: Tailscale client/server split, remote live-viewing and takeover over the designed WebSocket protocol — shipped in Phase 5 (DIST-01, DIST-02). Reconnect/resync (DIST-03, DIST-04) are Phase 5.1's
 - [ ] Platform coverage: confirm macOS, then Windows (Linux is the de-facto current baseline)
 - [ ] Release readiness: an update mechanism, manual accessibility verification, landing page live
 - [ ] Continuous integration — there is none, and only three Rust unit tests exist
@@ -92,10 +92,17 @@ challenge), without either side sacrificing performance.
 
 - **Tech Stack**: Rust throughout — Servo/libservo (rendering engine), egui + winit (shell chrome,
   corrected from an original Tauri+React plan), `rust-mcp-sdk` (MCP server) — established through
-  direct implementation, not just design. Three crates: `talaria-shell`, `talaria-mcp`,
-  `talaria-protocol`.
-- **Transport**: MCP is stdio-only today (`crates/talaria-mcp/src/main.rs`), which is both why no
-  auth exists and why auth work must land alongside an HTTP transport.
+  direct implementation, not just design. Four crates: `talaria-shell`, `talaria-mcp`,
+  `talaria-protocol`, and `talaria-client` (the remote view client, which links no web engine).
+- **Transport**: three of them, and `talaria-protocol` is the **shared vocabulary** they carry rather
+  than a wire of its own — it defines no transport, no framing and no connection. (1) the Unix control
+  socket, local and peer-UID authenticated (`crates/talaria-shell/src/control.rs`); (2) the loopback
+  HTTP/MCP listener, off by default and bearer-authenticated (`crates/talaria-shell/src/http.rs`); and
+  (3) the remote view WebSocket for live viewing and takeover
+  (`crates/talaria-protocol/src/wire.rs`). The stdio MCP proxy
+  (`crates/talaria-mcp/src/main.rs`) rides the first. None of them widens the bind: remote reach comes
+  from an overlay-network daemon terminating TLS in front of the unchanged `127.0.0.1` listener, so
+  this browser handles no certificate.
 - **Performance**: screenshot capture must stay well under the ~30–60ms active-takeover latency
   target (currently 4–36ms); startup-to-socket-ready ~21ms; page load ~219ms.
 - **Platform**: Linux is the de-facto current baseline — the e2e harness runs under Xvfb with
@@ -136,14 +143,14 @@ Keep writing SUMMARY.md for everything. The summaries are what later sessions ac
 | Shell: Tauri + Servo-backed WRY, React chrome | Reuse from [[insomniac]]; React was a stated soft preference | Superseded — see next row |
 | Shell: egui-on-winit | `tauri-runtime-verso` found dormant during the Servo-WRY readiness check; egui needs no webview at all, eliminating that dependency entirely rather than just falling back to a native one | ✓ Good — built, verified working |
 | MCP surface: minimal, `evaluate`-centric, not typed click/type/wait tools | Independently validated by ego-lite (2.5× faster) and OpenBrowser (3.2–6× fewer tokens) benchmarks | ✓ Good — built and verified, including async/Promise support |
-| OAuth via `rust-mcp-sdk`, self-hosted auth server | MCP servers are expected to be their own auth server; avoid hand-rolling OAuth | — Pending — not built; blocked on adding an HTTP transport |
+| OAuth via `rust-mcp-sdk`, self-hosted auth server | MCP servers are expected to be their own auth server; avoid hand-rolling OAuth | ✓ Good — built in Phase 4: OAuth 2.1 with PKCE `S256`, refresh rotation, live per-request token lookup |
 | No gatekeeping / rate limiting / audit trail | Browser is infrastructure, not a policy layer — explicit product philosophy | ✓ Good |
 | No budget for rendering-correctness testing | Servo's own WPT conformance is the correctness signal, not something code-based validation can meaningfully check; reactive backstop is takeover/live-viewing | ✓ Good |
 | Naming: OpenBrowser → Charon → Talaria | OpenBrowser collided with an existing project; Talaria better fits the speed/messenger-agent theme | ✓ Good |
 | Licensing: dual MIT OR Apache-2.0 | Standard Rust ecosystem convention; compatible with Servo/SpiderMonkey's MPL 2.0 | ✓ Good — both license files now in repo |
 | Update mechanism: Tauri's updater plugin | Assumed under the original Tauri shell plan | ⚠️ Revisit — shell is no longer Tauri; no replacement chosen (blocks REL-02) |
 | Overnight loops: branch-per-run, no ownership lock | Seemed sufficient at design time | Superseded — a real two-session collision occurred; `.overnight-lock` preflight now ships |
-| OAuth sequenced after daily-driver browsing, before distributed mode | Local stdio transport needs no auth; auth's real driver is remote access, so it belongs immediately before the Tailscale split rather than in the stabilization phase | — Pending |
+| OAuth sequenced after daily-driver browsing, before distributed mode | Local stdio transport needs no auth; auth's real driver is remote access, so it belongs immediately before the Tailscale split rather than in the stabilization phase | ✓ Good — Phase 5's view channel reused Phase 4's token and revocation machinery outright rather than adding a second trust class |
 
 ## Evolution
 
