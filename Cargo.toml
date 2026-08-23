@@ -4,6 +4,7 @@ members = [
     "crates/talaria-shell",
     "crates/talaria-protocol",
     "crates/talaria-mcp",
+    "crates/talaria-client",
 ]
 
 [workspace.package]
@@ -110,6 +111,56 @@ axum = { version = "0.8.9", features = ["ws"] }
 async-trait = "0.1"
 # Token hashing and PKCE S256. Already resolved at 0.11.0 through the servo tree.
 sha2 = "0.11"
+
+# --- `talaria-client` only, below. The three lines the second front end costs. ---
+#
+# The low-level GL context the client's window draws through, so that binary
+# needs no engine to have a surface. `WindowRenderingContext` — the type
+# `crates/talaria-shell/src/gui.rs` builds egui on — is servo-paint-api's
+# wrapper around exactly this crate, at exactly this version, with exactly
+# these features (`servo-paint-api-0.4.0/Cargo.toml`, its `[dependencies.surfman]`
+# block). So this line unifies onto a node the engine already put in the lock
+# rather than resolving a new one, and its measured cost is **zero added
+# packages**. That is also the provenance answer: the graphics stack the client
+# links is the graphics stack the engine in this same workspace already links.
+#
+# `sm-x11` matches servo-paint-api's own spelling; `sm-raw-window-handle-06` is
+# surfman's default and is what lets `Connection::from_display_handle` take the
+# handle `winit` 0.30 hands out, since both sides are `raw-window-handle` 0.6.2.
+surfman = { version = "0.13.0", features = ["sm-x11"] }
+# The client's `wss://` connection to a server's `/view`.
+#
+# `tokio-tungstenite 0.29.0` is already in this lock — the `axum` line above
+# put it there with its `ws` feature — so this line adds no package either. The
+# TLS feature was measured in 05-01 against a throwaway manifest by the same
+# hand-edit-and-resolve procedure: `rustls-tls-native-roots` costs **zero**
+# packages, because `rustls 0.23.43`, `tokio-rustls 0.26.4`,
+# `rustls-pki-types 1.15.1` and `rustls-native-certs 0.8.4` are all already
+# resolved here. The `native-tls` spelling costs 7 packages plus a C dependency
+# on OpenSSL and is deliberately not taken.
+#
+# **Native roots rather than webpki roots**, also per 05-01: the server is
+# fronted by a daemon-managed certificate for a real name, chaining to a public
+# root the platform trust store already carries, and using the platform store is
+# the behaviour a human expects from a client running on their own machine.
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
+# The `Stream` and `Sink` extension traits `tokio-tungstenite`'s socket type is
+# written against — reading a message is `StreamExt::next`, and the trait has to
+# be nameable to be called. Not a third dependency in the sense 05-01 measured:
+# `tokio-tungstenite` already depends on it, so it was in this lock before this
+# line existed and adds nothing. Taken with `default-features = false` so the
+# client links the two pieces it uses rather than the whole toolkit.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# The logging facade, declared here rather than as the version string
+# `crates/talaria-shell/Cargo.toml` carries at its last line. That line is a
+# wart, not a pattern; this is where a workspace dependency belongs.
+log = "0.4"
+# The client's logger. The shell installs none because `servo.setup_logging()`
+# does it (and panics if one is already set); the client has no engine to defer
+# to, so a client without this line would emit through `log::` macros that go
+# nowhere and a connection failure would be invisible outside the window.
+# Already resolved in this tree, so it is another zero-package line.
+env_logger = "0.11"
 
 [profile.release]
 lto = "thin"

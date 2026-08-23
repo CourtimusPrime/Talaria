@@ -1,0 +1,41 @@
+[package]
+name = "talaria-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Talaria remote view client — a second front end for a Talaria server's agent tabs, with no web engine"
+
+[[bin]]
+name = "talaria-client"
+path = "src/main.rs"
+
+# Every line below is `{ workspace = true }`, with no version string anywhere in
+# this file. The shell's manifest ends with one `log = "0.4"`; that is a wart
+# this manifest deliberately does not copy.
+#
+# **The web engine is absent, and its absence is the point of this crate.** A
+# client that linked the engine would take the engine's native build
+# prerequisites with it, and the whole user-facing benefit here is a binary that
+# builds in seconds and runs on a laptop carrying none of them.
+# `cargo tree -p talaria-client` is the assertion; this comment is the reason.
+[dependencies]
+winit = { workspace = true }
+euclid = { workspace = true }
+url = { workspace = true }
+rustls = { workspace = true }
+surfman = { workspace = true }
+
+egui = { workspace = true }
+egui-winit = { workspace = true }
+egui_glow = { workspace = true }
+egui-phosphor = { workspace = true }
+glow = { workspace = true }
+
+talaria-protocol = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "macros", "time"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

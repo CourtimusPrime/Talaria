@@ -8641,6 +8641,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "talaria-client"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "egui",
+ "egui-phosphor",
+ "egui-winit",
+ "egui_glow",
+ "env_logger",
+ "euclid",
+ "futures-util",
+ "glow",
+ "log",
+ "rustls",
+ "serde_json",
+ "surfman",
+ "talaria-protocol",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+ "winit",
+]
+
+[[package]]
 name = "talaria-mcp"
 version = "0.1.0"
 dependencies = [
@@ -9014,7 +9038,11 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
