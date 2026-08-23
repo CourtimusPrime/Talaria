@@ -45,7 +45,7 @@ their detail below; they are simply not v1.
 - [x] **Phase 2: Harden the Agent Surface** — Close the audit's open gaps: scheme allowlist, `evaluate` wedging and the serializing mutex, control-socket peer auth, bounded downloads, real MCP notifications, a usable vault, and CI.
 - [x] **Phase 3: Table-Stakes Browsing** *(v1)* — History, bookmarks, configurable search, and a downloads UI, so Talaria works as a real daily driver. (completed 2026-08-20)
 - [x] **Phase 4: Authenticated Remote Transport** *(v2)* — An HTTP/SSE MCP transport plus the OAuth 2.1 authorization server that becomes possible once it exists. (completed 2026-08-21)
-- [ ] **Phase 5: Distributed Mode** *(v2)* — Client and server split across machines over Tailscale, with remote live-viewing and takeover.
+- [x] **Phase 5: Distributed Mode** *(v2)* — Client and server split across machines over Tailscale, with remote live-viewing and takeover. (completed 2026-08-23)
 - [ ] **Phase 6: Platform Coverage** *(v2)* — Confirm macOS, then Windows.
 - [ ] **Phase 7: Release Readiness** *(v2)* — An update mechanism, manual accessibility verification, and a live landing page.
 
@@ -194,7 +194,7 @@ and an anti-harassment state machine — several times any peer task. It splits 
   3. Local mode is provably unaffected — the existing single-process path keeps Phase 1's measured
      latency
 
-**Plans**: 10/11 plans executed
+**Plans**: 11/11 plans executed — **Phase complete 2026-08-23**
 
 *Originally one phase covering DIST-01…04. Split during planning: an architectural client/server
 split plus a frame pipeline plus reconnect plus persistence was more than one reviewable phase, and
@@ -223,7 +223,7 @@ Plans:
 - [x] 05-08-PLAN.md — Frame pump: the visibility hold, unconditional paint on the tick, off-thread tile diff and `Compression::Fast` encode, keyframes; `encode_screenshot` untouched (wave 5) — DIST-02
 - [x] 05-09-PLAN.md — Client present and capture: keyframes and deltas, frame ordering, one fit transform inverted for the pointer; a real client driven by a real pointer, asserted on the server (wave 6) — DIST-01, DIST-02
 - [x] 05-10-PLAN.md — The rung ladder in one ordered table, the hysteretic controller, the honest report, `link_shim.py` and `remote_latency_test.py` (wave 7) — DIST-02
-- [ ] 05-11-PLAN.md — `SECURITY.md`'s fifth party and the CSWSH-by-construction property, `CHANGELOG.md`, the corrected wire claim, `scripts/two-machine-check.sh`, and Success Criterion 3's collected evidence (wave 8) — DIST-01, DIST-02
+- [x] 05-11-PLAN.md — `SECURITY.md`'s fifth party and the CSWSH-by-construction property, `CHANGELOG.md`, the corrected wire claim, `scripts/two-machine-check.sh`, and Success Criterion 3's collected evidence (wave 8) — DIST-01, DIST-02
 
 ### Phase 5.1: Distributed Resilience *(v2)*
 
@@ -292,6 +292,6 @@ Phases execute in numeric order: 1 → 2 → 3 (**ship v1**) → 4 → 5 → 6 �
 | 2. Harden the Agent Surface | 11/11 | ✅ Complete | 2026-08-17 |
 | 3. Table-Stakes Browsing | 4/4 | Complete    | 2026-08-20 |
 | 4. Authenticated Remote Transport | 8/8 | Complete    | 2026-08-21 |
-| 5. Distributed Mode | 10/11 | In Progress|  |
+| 5. Distributed Mode | 11/11 | Complete   | 2026-08-23 |
 | 6. Platform Coverage | 0/2 | Not started | - |
 | 7. Release Readiness | 0/3 | Not started | - |

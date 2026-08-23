@@ -2,16 +2,17 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
+status: complete
 current_phase: 5
-current_phase_name: v2
-status: executing
-stopped_at: Completed 05-10-PLAN.md
-last_updated: "2026-08-23T19:56:51.426Z"
+current_phase_name: distributed-mode
+stopped_at: "Completed 05-11-PLAN.md — Phase 5 closed"
+last_updated: "2026-08-23T20:36:47.601Z"
 progress:
-  total_phases: 4
-  completed_phases: 3
+  total_phases: 8
+  completed_phases: 5
   total_plans: 34
   completed_plans: 34
+  percent: 63
 ---
 
 # Project State
@@ -26,13 +27,48 @@ See: .planning/PROJECT.md (updated 2026-08-15)
 ## Current Position
 
 Phase: 5 — Distributed Mode *(v2)*
-Plan: 10 of 11 executed (waves 1-6 complete; wave 7 done — 05-10 landed, 05-11 next)
-Status: Ready to execute
-Next: `/gsd-execute-phase 5`
+Plan: 11 of 11 executed — all eight waves complete
+Status: **Phase 5 closed.** DIST-01 and DIST-02 are Complete.
+Next: `/gsd-verify-work 5`, then Phase 6 (Platform Coverage)
 
-Phase 4 is closed. AUTH-01, AUTH-02 and AUTH-03 are Complete; verification passed after four
-code-review blockers were fixed. Phases 1–3 (v1) remain feature-complete. At 05-09's tip the tree
-stands at **486 unit tests** and **e2e 23/23, `failed: none`**.
+Phases 1–4 remain feature-complete. At 05-11's tip the tree stands at **536 unit tests** and
+**e2e 24/24, `failed: none`**, against the phase's entering baselines of 296 and 22.
+
+**05-11 closed the phase by saying publicly what was built.** `SECURITY.md` now describes **five**
+parties rather than four: the remote human sits between the human at the keyboard and the connected
+agent — more trusted than an agent because they are the trust root at a distance, less verifiable
+than the human at the keyboard because their identity is a bearer token rather than physical
+presence, and the first party in this browser's history that sends **raw input** rather than tool
+calls. The CSWSH-by-construction property is written down as a property to keep, with its
+consequence (a browser always sends `Origin`, so a browser-based viewer is structurally impossible
+and the native client is a *result* of that layer) and the shape of its deletion (a diff adding an
+origin allowlist). Tailscale Funnel is refused by name with its reason; the daemon's injected
+`tailscale-user-*` headers are named as a non-boundary; and the superseded "no TLS, no non-loopback
+bind" bullet is **replaced**, not annotated — the bind is permanent, encryption is the daemon's, and
+this browser handles no certificate at all.
+
+Three now-wrong claims were corrected at their source. `talaria-protocol` is no longer called the
+distributed mode's wire in `.claude/CLAUDE.md` or `.planning/PROJECT.md`; it is the shared vocabulary
+three named transports carry, and the generated architecture section now carries a note that the
+module headers are the source of truth, so the next regeneration reproduces 05-03's correction
+rather than restoring the error.
+
+**Success Criterion 3 has evidence, and the honest version of it.** `gui.rs` is byte-identical
+across the phase's whole commit range, and `takeover_test.py`, `panel_click_test.py`,
+`keyboard_nav_test.py`, `http_transport_test.py` and `oauth_flow_test.py` are unmodified and pass.
+But the input forwarders and the tab visibility synchronisation **did** change, behaviour-preservingly,
+and a real bug was fixed mid-phase (`2dd72b5` — a background capture used to re-hide a tab a viewer
+was holding, silently stopping its clicks while its frames carried on). SC 3 is therefore proven by
+*behaviour-preserving change under unmodified suites*, not by an empty diff on the shell.
+
+**Success Criterion 2 is designed for and not contradicted, rather than measured.** Everything
+automated runs both ends on one host under Xvfb, and loopback hides transmission — the only variable
+the criterion is about. `scripts/two-machine-check.sh` is the step that closes it: it observes and
+prints the path type (direct vs relayed), prints the human steps, asks for the client's
+input-to-photon estimate **in milliseconds** as the evidence and the "did it feel immediate"
+impression as the product claim, and exits non-zero when a prerequisite is missing. Until somebody
+runs it on a direct path and writes the number down, the ~30–60 ms target should not be cited as
+confirmed.
 
 **05-09 closed Success Criterion 1's loopback half.** A human at a `talaria-client` can watch an
 agent's tab and take it over: the end-to-end suite starts the real client binary, attaches through
@@ -69,7 +105,7 @@ the page is static. The human's own displayed tab is captured before and after a
 exchange on another tab and is byte-identical, which is the per-tab framebuffer invariant proved
 rather than cited.
 
-**Phase 5 is planned:** 11 plans across 8 waves, plan-checker APPROVED at revision 3. Scope was cut
+**Phase 5 was planned as** 11 plans across 8 waves, plan-checker APPROVED at revision 3. Scope was cut
 from four requirements to two — DIST-03 and DIST-04 moved to a new **Phase 5.1** — because an
 architectural client/server split plus a frame pipeline plus reconnect plus persistence was more
 than one reviewable phase. ROADMAP and REQUIREMENTS reflect the split.
@@ -95,8 +131,15 @@ re-measure is a `VERIFICATION.md` manual item.
 what can a remote human do that requires being at the server machine? First pairing needs someone at
 the server (OAuth consent is a server-chrome panel), and a remote human at a login wall has no
 address bar, since the view channel deliberately carries no `Command` and remote input cannot reach
-the chrome. The second sits against the project's stated core value and should be revisited the
-first time a real takeover dead-ends.
+the chrome. The phase **shipped against accepting** the first and answered neither; both are restated
+in `deferred-items.md`'s closing entries with the condition for revisiting, and adopting either
+alternative (RFC 8628, or a pairing code) is a new plan rather than an adjustment.
+
+**Also on the record at the close:** a viewer sees every agent's tabs, not only its own client's — a
+decision, not a default, because the human is the trust root and a remote human is the trust root at
+a distance. Revisit only for a deployment where agents belong to parties that should not see each
+other's work, which is a different product. DIST-03 and DIST-04 (reconnect, resync, session
+manifest) are Phase 5.1's, cross-referenced forward with the two design facts 5.1 will need.
 
 **Note on history:** the 111 unpushed commits from Phases 3 and 4 were squashed to one commit per
 phase at the user's request; the pre-squash history is preserved on `backup/pre-squash-phases-3-4`.
@@ -161,6 +204,7 @@ Phase 5 keeps per-task commits.
 | Phase 05 P08 | 95min | 3 tasks | 7 files |
 | Phase 05 P09 | 175 | 3 tasks | 9 files |
 | Phase 05 P10 | 70 min | 3 tasks | 9 files |
+| Phase 5 P11 | 40min | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -285,6 +329,9 @@ Recent decisions affecting current work:
 - [Phase 5]: 05-10: the passive rung is half resolution — the ladder's floor is the rung that has to survive the worst link, and 13 Mbit/s carries a 138 KB half-res frame and not a 522 KB full one
 - [Phase 5]: 05-10: SC 2's target stays a two-machine manual claim; the suite asserts the cadence transition, the ladder's response and the reporting, and says in its own docstring that it does not assert the target, because loopback hides transmission
 - [Phase 5]: 05-10: a script-animated page repaints about once a second on a background webview while a CSS-animated one repaints at the pump's own rate — measured three ways, and the reason the latency fixture is declarative
+- [Phase 5]: 05-11: the certificate-absence gate is server-scoped: crates/talaria-client/src/ is a deliberate exception because 05-07 makes certificate verification a stated truth there
+- [Phase 5]: 05-11: Success Criterion 3 stated as behaviour-preserving change under unmodified suites, not as an untouched shell — the input forwarders and the visibility sync did change
+- [Phase 5]: 05-11: the two-machine check does not drive the second machine; it observes the path type and asks for the millisecond figure and the impression separately
 
 ### Pending Todos
 
@@ -327,6 +374,9 @@ None yet.
 | Agent UX | AGENT-05 — per-agent session naming in the Agents view | v2 | 2026-08-15 |
 | Agent UX | AGENT-04 — wire-level `TabOpened` event so adopted popups are not poll-only | v2 | 2026-08-17 |
 | Reliability | `Vault::load()` D-Bus autolaunch hang — needs the keychain lookup off the startup path | Phase 3 | 2026-08-17 |
+| Verification | SC 2's ~30–60 ms target is unconfirmed on real hardware — run `scripts/two-machine-check.sh` on a direct path and record the millisecond figure | Phase 5 | 2026-08-23 |
+| Product | First pairing requires someone at the server machine; Phase 5 shipped against accepting it | Phase 5.1 | 2026-08-23 |
+| Product | A remote human at a login wall has no address bar — the same question as first pairing | Phase 5.1 | 2026-08-23 |
 
 ## Quick Tasks Completed
 
@@ -336,6 +386,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-08-23T19:56:51.419Z
-Stopped at: Completed 05-10-PLAN.md
+Last session: 2026-08-23T20:36:40.620Z
+Stopped at: Completed 05-11-PLAN.md — Phase 5 closed
 Resume file: None
