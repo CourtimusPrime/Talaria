@@ -234,6 +234,14 @@ mod tests {
     /// property that declaration order has to keep true.
     #[test]
     fn chrome_rects_round_trip() {
+        let holds = ClientMessage::Request {
+            id: 5,
+            command: Command::ViewHolds { tab_id: 12 },
+        };
+        let json = serde_json::to_string(&holds).expect("serializable");
+        assert!(json.contains("\"command\":\"view_holds\""), "{json}");
+        assert!(json.contains("\"tab_id\":12"), "{json}");
+
         let request = ClientMessage::Request { id: 4, command: Command::ChromeRects };
         let json = serde_json::to_string(&request).expect("serializable");
         assert!(json.contains("\"command\":\"chrome_rects\""), "{json}");

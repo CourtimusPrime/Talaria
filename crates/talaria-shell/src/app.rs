@@ -136,6 +136,20 @@ pub enum AppEvent {
     /// revoke closed it, or the listener shut down. Every attachment the
     /// connection held is released here and nowhere else.
     ViewClosed { connection: u64 },
+    /// The frame encoder thread could not be started, so no viewer can be
+    /// given frames on this run.
+    ///
+    /// Reported rather than fatal, which is the same posture the listener
+    /// takes when it cannot bind: a browser whose frame encoder could not
+    /// start is still a browser, and the local human loses nothing at all.
+    /// The affected viewers already have their answer — an attach is refused
+    /// with the one refusal rather than accepted into a stream that would
+    /// never produce a frame — and this carries the *reason* to the one thread
+    /// that can log it with the rest of the browser's lifecycle.
+    ///
+    /// Raised at most once per failed encoder: the reason is taken out of the
+    /// handle rather than read from it.
+    FrameEncoderFailed { error: String },
 }
 
 /// A connected control-socket client: display label + its event channel.
@@ -795,6 +809,12 @@ impl Shared {
             let mut tabs = self.tabs.borrow_mut();
             self.views.borrow_mut().message(connection, frame, &mut *tabs)
         };
+        // Raised here because this is where an attach happens, and an attach
+        // is what starts the encoder. Taken rather than read, so a failure is
+        // reported once and not on every message that follows it.
+        if let Some(error) = self.views.borrow_mut().take_encoder_failure() {
+            let _ = self.event_proxy.send_event(AppEvent::FrameEncoderFailed { error });
+        }
         match handled {
             crate::view::Handled::Done => {},
             crate::view::Handled::Close => self.view_closed(connection),
@@ -1290,6 +1310,16 @@ impl ApplicationHandler<AppEvent> for App {
                 },
                 AppEvent::ViewClosed { connection } => {
                     state.view_closed(connection);
+                },
+                // Nothing local changes. The chrome is not told, no panel
+                // opens and no tab moves: this is a remote capability that is
+                // unavailable, which is a fact about the viewers and not about
+                // the browser the human is using.
+                AppEvent::FrameEncoderFailed { error } => {
+                    log::error!(
+                        "the frame encoder is unavailable, so remote viewers cannot be \
+                         sent frames: {error}"
+                    );
                 },
             }
             // *After* the arm, not before it: an agent command that opened or

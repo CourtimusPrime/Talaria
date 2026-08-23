@@ -31,7 +31,10 @@ use std::time::{Duration, Instant};
 use servo::{OffscreenRenderingContext, RenderingContext, WebView};
 use tokio::sync::mpsc::UnboundedSender;
 
-use talaria_protocol::wire::{Channel, ClientView, InputMessage, ServerView, TabList};
+use talaria_protocol::wire::{
+    Channel, ClientView, FrameHeader, FrameKind, InputMessage, ServerView, TabList,
+    FRAME_HEADER_LEN,
+};
 use talaria_protocol::TabInfo;
 
 use crate::tabs::TabManager;
@@ -226,7 +229,6 @@ fn tick_interval(since_last_input: Option<Duration>, idle: Duration) -> Duration
 pub struct Surface {
     pub width: u32,
     pub height: u32,
-    #[expect(dead_code, reason = "read by the tile comparison and the frame encoder")]
     pub pixels: Vec<u8>,
 }
 
@@ -236,6 +238,409 @@ impl Surface {
         let (width, height) = (image.width(), image.height());
         Self { width, height, pixels: image.into_raw() }
     }
+
+    /// Whether two surfaces describe the same geometry. A surface that changed
+    /// size cannot be compared tile by tile with its predecessor, which is why
+    /// this is one of the keyframe triggers rather than a case the comparison
+    /// tries to handle.
+    fn same_size_as(&self, other: &Surface) -> bool {
+        self.width == other.width && self.height == other.height
+    }
+
+    /// One row-slice, `width` pixels wide starting at `(x, y)`. `None` when
+    /// the request runs off the row or off the surface, which is a bug rather
+    /// than a routine case and is therefore refused rather than silently
+    /// clamped — a clamp here would produce a frame that decodes and is wrong.
+    ///
+    /// **The `x` bound is checked against the row's own width and not only
+    /// against the buffer's length**, because a horizontal overrun on any row
+    /// but the last one lands inside the buffer: it would read the beginning
+    /// of the *next* row, which is a silently wrapped scanline rather than an
+    /// out-of-range read anything would catch.
+    fn row(&self, x: u32, y: u32, width: u32) -> Option<&[u8]> {
+        if x.checked_add(width)? > self.width || y >= self.height {
+            return None;
+        }
+        let start = ((y as usize) * (self.width as usize) + x as usize) * 4;
+        let end = start + (width as usize) * 4;
+        self.pixels.get(start..end)
+    }
+
+    /// How many tiles the grid over this surface has, partial edge tiles
+    /// included. The denominator the keyframe threshold is a fraction of.
+    fn tile_count(&self) -> usize {
+        let across = self.width.div_ceil(TILE_SIZE) as usize;
+        let down = self.height.div_ceil(TILE_SIZE) as usize;
+        across * down
+    }
+
+    /// The whole surface as one region.
+    fn whole(&self) -> Region {
+        Region { x: 0, y: 0, width: self.width, height: self.height }
+    }
+}
+
+/// The side of one comparison tile, in pixels.
+///
+/// 64 is what 05-02 measured against real engine output: a whole-frame scan of
+/// the resulting 260-tile grid at 1280×800 costs 0.33 ms on a static page —
+/// the scan's *worst* case, because nothing short-circuits when nothing
+/// changed — and 0.11 ms while scrolling, when almost every tile differs on
+/// its first compared row.
+const TILE_SIZE: u32 = 64;
+
+/// The keyframe threshold, as a fraction of the tile grid: send a whole
+/// keyframe once more than nine twenty-sixths of the tiles have changed.
+///
+/// **Why a threshold exists at all, which is not obvious from the number.** It
+/// is a bandwidth argument before it is a CPU one. Once most of the frame is
+/// dirty the per-tile payloads add up to about what a whole keyframe costs on
+/// the wire — 05-02 measured 260 scroll tiles at ≈517 KB against a 548 KB
+/// keyframe — while the tile path additionally pays one envelope and one
+/// header per tile. Time is what separates them: a 64×64 tile encode costs
+/// ~0.02 ms including its fixed overhead and a whole page-like keyframe costs
+/// 1.5–1.9 ms, and they meet at about 90 of 260 tiles.
+///
+/// **A fraction and not the literal 90**, so a viewport resize does not
+/// silently re-tune the threshold: nine twenty-sixths is exactly 90/260 at
+/// 1280×800 and stays a third of the grid at any other size.
+const KEYFRAME_DIRTY_NUMERATOR: usize = 9;
+/// The denominator of [`KEYFRAME_DIRTY_NUMERATOR`].
+const KEYFRAME_DIRTY_DENOMINATOR: usize = 26;
+
+/// The divisor this plan applies to a tab's real size before painting it.
+///
+/// One, always: every frame here is full resolution. It is carried in the
+/// header rather than left implicit because 05-10's degrade ladder sends
+/// halved frames, and a client that inferred the scale by dividing the tile
+/// size by the frame size would guess wrong on an odd-sized viewport.
+const FULL_SCALE_DENOMINATOR: u8 = 1;
+
+/// A rectangle of a surface, in that surface's own pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Region {
+    /// Whether this region is the whole of `surface`.
+    fn covers(&self, surface: &Surface) -> bool {
+        self.x == 0 && self.y == 0 && self.width == surface.width && self.height == surface.height
+    }
+}
+
+/// Every tile of `current` that differs from `previous`, by tile origin.
+///
+/// Row slices with a short-circuit on the first differing row, which is why a
+/// mostly-static frame is cheap and why a scrolling one is *cheaper still* —
+/// almost every tile differs on its first row.
+///
+/// **Partial tiles at the right and bottom edges are the part worth getting
+/// right.** The grid does not divide a viewport evenly in general, so the last
+/// column and the last row are narrower or shorter than the rest; comparing
+/// them at the full tile size would run off the buffer, and rounding them away
+/// would leave a strip of the frame never compared and therefore never sent —
+/// a stripe of stale pixels that reads as a rendering bug rather than as a
+/// protocol error.
+///
+/// Both surfaces must be the same size; the caller decides that, because a
+/// size change is a keyframe rather than a comparison.
+fn dirty_tiles(previous: &Surface, current: &Surface) -> Vec<(u32, u32)> {
+    let mut dirty = Vec::new();
+    let mut tile_y = 0;
+    while tile_y < current.height {
+        let tile_height = TILE_SIZE.min(current.height - tile_y);
+        let mut tile_x = 0;
+        while tile_x < current.width {
+            let tile_width = TILE_SIZE.min(current.width - tile_x);
+            let changed = (tile_y..tile_y + tile_height).any(|y| {
+                current.row(tile_x, y, tile_width) != previous.row(tile_x, y, tile_width)
+            });
+            if changed {
+                dirty.push((tile_x, tile_y));
+            }
+            tile_x += TILE_SIZE;
+        }
+        tile_y += TILE_SIZE;
+    }
+    dirty
+}
+
+/// The smallest rectangle covering every dirty tile.
+///
+/// One message covering the bounding region rather than one message per tile:
+/// a caret and a word of typing are a handful of adjacent tiles, and paying
+/// one header and one envelope for the group beats paying several for pixels
+/// that were going to travel together anyway.
+fn bounding_region(tiles: &[(u32, u32)], surface: &Surface) -> Option<Region> {
+    let (first_x, first_y) = *tiles.first()?;
+    let (mut min_x, mut min_y) = (first_x, first_y);
+    let (mut max_x, mut max_y) = (0, 0);
+    for (x, y) in tiles {
+        min_x = min_x.min(*x);
+        min_y = min_y.min(*y);
+        max_x = max_x.max(x + TILE_SIZE.min(surface.width.saturating_sub(*x)));
+        max_y = max_y.max(y + TILE_SIZE.min(surface.height.saturating_sub(*y)));
+    }
+    Some(Region {
+        x: min_x,
+        y: min_y,
+        width: max_x.saturating_sub(min_x),
+        height: max_y.saturating_sub(min_y),
+    })
+}
+
+/// What to send for one tick, or `None` for a tick with nothing to say.
+///
+/// The four keyframe triggers, in the order they are cheapest to decide: the
+/// caller asked for one (an attach, a re-attach, or a viewport change), there
+/// is no previous frame to diff against, the surface changed size, or more of
+/// the grid changed than [`KEYFRAME_DIRTY_NUMERATOR`] allows. `None` is the
+/// common case and the delta model's whole payoff: a page nobody is touching
+/// costs one readback and one comparison per tick and sends nothing at all.
+pub fn select_frame(
+    previous: Option<&Surface>,
+    current: &Surface,
+    keyframe: bool,
+) -> Option<(FrameKind, Region)> {
+    // A surface with no area cannot be described by a header the wire will
+    // accept — `FrameHeader::from_bytes` refuses a zero-sized tile — so it is
+    // refused here rather than composed and rejected at the far end.
+    if current.width == 0 || current.height == 0 {
+        return None;
+    }
+    let whole = (FrameKind::Keyframe, current.whole());
+    if keyframe {
+        return Some(whole);
+    }
+    let Some(previous) = previous else { return Some(whole) };
+    if !current.same_size_as(previous) {
+        return Some(whole);
+    }
+    let dirty = dirty_tiles(previous, current);
+    if dirty.is_empty() {
+        return None;
+    }
+    if dirty.len() * KEYFRAME_DIRTY_DENOMINATOR
+        > current.tile_count() * KEYFRAME_DIRTY_NUMERATOR
+    {
+        return Some(whole);
+    }
+    bounding_region(&dirty, current).map(|region| (FrameKind::Tile, region))
+}
+
+/// One region of a surface as a contiguous RGBA buffer.
+fn crop(surface: &Surface, region: Region) -> Option<Vec<u8>> {
+    let mut out =
+        Vec::with_capacity((region.width as usize) * (region.height as usize) * 4);
+    for y in region.y..region.y.checked_add(region.height)? {
+        out.extend_from_slice(surface.row(region.x, y, region.width)?);
+    }
+    Some(out)
+}
+
+/// The frame path's PNG encoder.
+///
+/// **A sibling of the shell's screenshot encoder, not a modification of it and
+/// not a call into it** — `D-05-05`. The two do different jobs and each is
+/// right for its own: a one-shot agent screenshot is a whole surface delivered
+/// once inside a JSON reply, and a frame is a rectangle delivered thirty times
+/// a second down a binary channel. Sharing one function would make one of them
+/// wrong, so the structure is copied and the divergence is deliberate.
+///
+/// The divergence is **one line**, and that is worth stating because the plan
+/// this landed under was written expecting three. 05-02 read `png 0.17.16`'s
+/// own `Info::default()` and found that the compression level and the filter
+/// set explicitly below are already what an unconfigured encoder uses — it
+/// proved it by encoding one real frame both ways and getting byte-identical
+/// output. They are set here anyway, because a default that happens to agree
+/// today is not the same thing as a choice, and this path's choice is a
+/// measured one. What actually differs is the last line: raw bytes, because
+/// this channel is binary, where the screenshot path's JSON reply forces a
+/// text encoding that costs a third again in size and a measurable slice of
+/// the budget.
+fn encode_frame(pixels: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let mut png_data = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_data, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::FilterType::Sub);
+        let Ok(mut writer) = encoder.write_header() else {
+            return None;
+        };
+        if writer.write_image_data(pixels).is_err() {
+            return None;
+        }
+    }
+    Some(png_data)
+}
+
+/// One frame-channel message: the tag byte, the fixed header, then the encoded
+/// pixels.
+///
+/// Sized from [`FRAME_HEADER_LEN`] rather than from a second literal, so the
+/// writer here and the reader on the far side take the number from one place.
+fn frame_message(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    body.extend_from_slice(&header.to_bytes());
+    body.extend_from_slice(payload);
+    encode(Channel::Frame, &body)
+}
+
+/// One tick's pixels and everything the encoder needs to describe them.
+struct Frame {
+    connection: u64,
+    tab: u64,
+    frame_seq: u64,
+    last_applied_input: u64,
+    keyframe: bool,
+    surface: Surface,
+    out: UnboundedSender<Vec<u8>>,
+}
+
+/// What the main thread asks of the encoder thread.
+enum Job {
+    /// Compare, encode and send one frame.
+    Frame(Frame),
+    /// An attachment ended: drop the previous-frame buffer it owned. **This is
+    /// the memory bound**, and it is a message rather than a timeout because
+    /// nothing else knows when a lease ends.
+    Release { connection: u64, tab: u64 },
+}
+
+/// The frame encoder thread's handle.
+///
+/// **Degrades rather than aborting**, following the listener's spawn shape: a
+/// checked spawn, a recorded reason, and a browser that keeps working. A
+/// browser whose frame encoder could not start is still a browser — the local
+/// human loses nothing, and a viewer is refused with the one refusal rather
+/// than left attached to a stream that will never produce a frame.
+#[derive(Default)]
+pub struct FrameEncoder {
+    /// The way onto the thread, absent when the thread could not be started.
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
+    /// Why it could not be started, taken once by the loop so the failure is
+    /// reported and not repeated.
+    failure: Option<String>,
+}
+
+impl FrameEncoder {
+    /// Start the thread, or record why it could not start.
+    fn start() -> Self {
+        let (jobs, inbox) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("talaria-frames".into())
+            .spawn(move || encode_frames(inbox))
+        {
+            Ok(_) => Self { jobs: Some(jobs), failure: None },
+            Err(error) => {
+                log::error!("the frame encoder thread could not be spawned: {error}");
+                Self { jobs: None, failure: Some(error.to_string()) }
+            },
+        }
+    }
+
+    /// Whether frames can be encoded at all.
+    fn running(&self) -> bool {
+        self.jobs.is_some()
+    }
+
+    fn send(&self, job: Job) {
+        let Some(jobs) = self.jobs.as_ref() else { return };
+        // A closed channel means the thread has ended, which the log line
+        // above already reported if it was ever going to be reported. Frames
+        // stop; the browser does not.
+        let _ = jobs.send(job);
+    }
+}
+
+/// The encoder thread: compare, encode, and write onto each connection's own
+/// outbound channel.
+///
+/// **What it owns, and the bound on it.** One previous-frame buffer per live
+/// *attachment* — not per tab, because two viewers on one tab have their own
+/// sequences and may be at different cadences, so one shared buffer would give
+/// whichever of them ticked second a delta against the other's frame. Each
+/// buffer is one full surface, and the total is bounded by the concurrent
+/// attachment cap 05-05 set times the number of connections, released on
+/// detach, on disconnect and on the tab closing.
+///
+/// Ends when the last sender is dropped, which is when the browser is exiting.
+fn encode_frames(inbox: std::sync::mpsc::Receiver<Job>) {
+    let mut previous: std::collections::BTreeMap<(u64, u64), Surface> =
+        std::collections::BTreeMap::new();
+    while let Ok(job) = inbox.recv() {
+        match job {
+            Job::Release { connection, tab } => {
+                previous.remove(&(connection, tab));
+            },
+            Job::Frame(frame) => {
+                let key = (frame.connection, frame.tab);
+                let selected =
+                    select_frame(previous.get(&key), &frame.surface, frame.keyframe);
+                let delivered = match selected {
+                    // Nothing changed. The buffer already held is still an
+                    // accurate picture of what the client has.
+                    None => true,
+                    Some((kind, region)) => match compose(&frame, kind, region) {
+                        Some(message) => {
+                            let _ = frame.out.send(message);
+                            true
+                        },
+                        None => {
+                            log::warn!(
+                                "frame {} for tab {} on view connection {} could not be \
+                                 encoded; the viewer keeps the frame it has",
+                                frame.frame_seq,
+                                frame.tab,
+                                frame.connection
+                            );
+                            false
+                        },
+                    },
+                };
+                // Only what the client actually holds becomes the reference.
+                // Recording a frame that was never delivered would make every
+                // later delta a diff against pixels nobody has.
+                if delivered {
+                    previous.insert(key, frame.surface);
+                }
+            },
+        }
+    }
+}
+
+/// One frame, header and payload, ready for the wire.
+fn compose(frame: &Frame, kind: FrameKind, region: Region) -> Option<Vec<u8>> {
+    let surface = &frame.surface;
+    let payload = match region.covers(surface) {
+        true => encode_frame(&surface.pixels, region.width, region.height)?,
+        false => encode_frame(&crop(surface, region)?, region.width, region.height)?,
+    };
+    let header = FrameHeader {
+        kind,
+        scale_denominator: FULL_SCALE_DENOMINATOR,
+        tab_id: frame.tab,
+        frame_seq: frame.frame_seq,
+        // Stamped from the value the input path recorded on this connection,
+        // read at the moment the tick painted. It is the whole of the latency
+        // instrumentation: the client knows when it sent that sequence and
+        // when this frame arrived, both off its own clock, so no clock has to
+        // be shared between the two machines.
+        last_applied_input: frame.last_applied_input,
+        tile_x: region.x,
+        tile_y: region.y,
+        tile_width: region.width,
+        tile_height: region.height,
+        frame_width: surface.width,
+        frame_height: surface.height,
+    };
+    Some(frame_message(&header, &payload))
 }
 
 /// What one tick of the pump got from the engine.
@@ -427,13 +832,11 @@ pub struct DueTick {
     /// The input sequence this connection had applied when the tick was taken
     /// — stamped into the header the encoder assembles, and the whole of the
     /// latency instrumentation.
-    #[expect(dead_code, reason = "stamped into the frame header by the encoder")]
     pub last_applied_input: u64,
     /// Whether this frame must be a keyframe whatever the comparison says.
     pub keyframe: bool,
     /// This connection's outbound frames, cloned so the encoder thread can
     /// write onto it without reaching back into the main thread's tables.
-    #[expect(dead_code, reason = "written by the encoder thread")]
     pub out: UnboundedSender<Vec<u8>>,
 }
 
@@ -522,6 +925,9 @@ pub struct ViewSessions {
     /// The last snapshot published, encoded. Kept so an unchanged tab table
     /// costs nothing per turn; see [`ViewSessions::publish`].
     published: Option<Vec<u8>>,
+    /// The encoder thread, started on the first attach and never before it: a
+    /// browser nobody is watching spawns no thread and holds no buffers.
+    encoder: Option<FrameEncoder>,
 }
 
 impl ViewSessions {
@@ -560,8 +966,10 @@ impl ViewSessions {
             return;
         };
         let session = self.sessions.remove(index);
-        for attachment in &session.attached {
-            tabs.release_view_hold(attachment.tab);
+        let released: Vec<u64> = session.attached.iter().map(|a| a.tab).collect();
+        for tab in released {
+            tabs.release_view_hold(tab);
+            self.release_frames(connection, tab);
         }
     }
 
@@ -694,6 +1102,15 @@ impl ViewSessions {
             self.refuse(connection);
             return;
         };
+        // **An attachment that cannot be encoded is refused rather than
+        // accepted and left silent.** A lease whose frames will never be
+        // produced holds a webview shown for nobody and gives the viewer a
+        // stream that never starts — the failure it would learn about only by
+        // waiting. It is the one refusal, as every refusal here is.
+        if !self.encoder().running() {
+            self.refuse(connection);
+            return;
+        }
         let cap = max_attachments();
         let now = Instant::now();
         let mut take_hold = false;
@@ -778,6 +1195,7 @@ impl ViewSessions {
             // was never taken would decrement a count two other viewers are
             // relying on.
             tabs.release_view_hold(tab);
+            self.release_frames(connection, tab);
         }
         if let Some(session) = self.session_mut(connection) {
             session.send(control_frame(&ServerView::Detached { tab }));
@@ -872,6 +1290,7 @@ impl ViewSessions {
         let live: Vec<u64> = snapshot.iter().map(|tab| tab.tab_id).collect();
         let Some(frame) = tab_list_frame(snapshot) else { return };
         let changed = self.published.as_deref() != Some(frame.as_slice());
+        let mut gone_frames: Vec<(u64, u64)> = Vec::new();
         for session in &mut self.sessions {
             let gone: Vec<u64> = session
                 .attached
@@ -880,12 +1299,16 @@ impl ViewSessions {
                 .filter(|tab| !live.contains(tab))
                 .collect();
             for tab in gone {
-                // Nothing is released back to the tab table here, and that is
-                // not an omission: a tab absent from the snapshot has been
+                // Nothing is released back to the *tab table* here, and that
+                // is not an omission: a tab absent from the snapshot has been
                 // removed from the table entirely, so its hold count went with
-                // it and there is no visibility left to restore.
+                // it and there is no visibility left to restore. The encoder's
+                // buffer is a different matter — it lives on another thread
+                // and outlives the tab unless it is told, which is what the
+                // release below is.
                 session.attached.retain(|attachment| attachment.tab != tab);
                 session.send(control_frame(&ServerView::Detached { tab }));
+                gone_frames.push((session.connection, tab));
             }
             if changed || !session.snapshotted {
                 session.send(Some(frame.clone()));
@@ -893,18 +1316,54 @@ impl ViewSessions {
             }
         }
         self.published = Some(frame);
+        for (connection, tab) in gone_frames {
+            self.release_frames(connection, tab);
+        }
     }
 
-    /// One tick's pixels, off the loop.
+    /// The encoder thread, started on first use.
+    ///
+    /// Lazy rather than eager because the cost of a viewer should be paid by
+    /// a viewer: a browser nobody has attached to spawns no thread. A spawn
+    /// that failed is remembered as a failure and not retried — this is an
+    /// operating system refusing a thread, not a transient.
+    fn encoder(&mut self) -> &FrameEncoder {
+        self.encoder.get_or_insert_with(FrameEncoder::start)
+    }
+
+    /// Why the encoder thread could not start, if it could not, taken once.
+    ///
+    /// Taken rather than read so the loop reports it exactly once. The viewer
+    /// already has its answer — the attach was refused — and this is the other
+    /// half: the fact reaching the main thread as an event rather than only a
+    /// log line.
+    pub fn take_encoder_failure(&mut self) -> Option<String> {
+        self.encoder.as_mut().and_then(|encoder| encoder.failure.take())
+    }
+
+    /// One tick's pixels, handed off the loop.
+    ///
+    /// **Everything after this line happens on the encoder thread**: the tile
+    /// comparison, the keyframe decision, the encode and the write. The loop
+    /// has already spent its readback and is done.
     pub fn frame_captured(&mut self, tick: &DueTick, surface: Surface) {
-        log::trace!(
-            "view connection {} tab {} frame {} painted {}x{}",
-            tick.connection,
-            tick.tab,
-            tick.frame_seq,
-            surface.width,
-            surface.height
-        );
+        self.encoder().send(Job::Frame(Frame {
+            connection: tick.connection,
+            tab: tick.tab,
+            frame_seq: tick.frame_seq,
+            last_applied_input: tick.last_applied_input,
+            keyframe: tick.keyframe,
+            surface,
+            out: tick.out.clone(),
+        }));
+    }
+
+    /// Tell the encoder an attachment has ended, so it drops the full-surface
+    /// buffer that attachment owned.
+    fn release_frames(&mut self, connection: u64, tab: u64) {
+        if let Some(encoder) = self.encoder.as_ref() {
+            encoder.send(Job::Release { connection, tab });
+        }
     }
 
     /// Put back a keyframe a tick consumed but could not deliver.
@@ -1806,6 +2265,301 @@ mod tests {
         assert!(sessions
             .next_tick()
             .is_some_and(|due| due <= after_input + Duration::from_millis(DRIVEN_TICK_MS)));
+    }
+
+    // ---- the tile comparison -------------------------------------------
+
+    /// A surface of a solid colour, so a changed pixel is unambiguous.
+    fn flat(width: u32, height: u32, value: u8) -> Surface {
+        Surface {
+            width,
+            height,
+            pixels: vec![value; (width as usize) * (height as usize) * 4],
+        }
+    }
+
+    /// The same surface with one pixel made different.
+    fn with_pixel(base: &Surface, x: u32, y: u32) -> Surface {
+        let mut pixels = base.pixels.clone();
+        let at = ((y as usize) * (base.width as usize) + x as usize) * 4;
+        pixels[at] = pixels[at].wrapping_add(0x40);
+        Surface { width: base.width, height: base.height, pixels }
+    }
+
+    /// A single-pixel change in the interior is found, and found in exactly
+    /// one tile.
+    #[test]
+    fn a_single_pixel_change_in_the_interior_dirties_exactly_its_tile() {
+        let before = flat(256, 192, 0x20);
+        let after = with_pixel(&before, 70, 70);
+        assert_eq!(dirty_tiles(&before, &after), vec![(64, 64)]);
+    }
+
+    /// The right edge, where the tiles are **partial**: 200 is not a multiple
+    /// of 64, so the last column is 8 pixels wide and an off-by-one here would
+    /// either run off the buffer or leave a strip never compared.
+    #[test]
+    fn a_change_at_the_right_edge_is_found_in_the_partial_tile() {
+        let before = flat(200, 192, 0x20);
+        let after = with_pixel(&before, 199, 10);
+        assert_eq!(dirty_tiles(&before, &after), vec![(192, 0)]);
+    }
+
+    /// The bottom edge, where the last row of tiles is partial for the same
+    /// reason.
+    #[test]
+    fn a_change_at_the_bottom_edge_is_found_in_the_partial_tile() {
+        let before = flat(192, 200, 0x20);
+        let after = with_pixel(&before, 10, 199);
+        assert_eq!(dirty_tiles(&before, &after), vec![(0, 192)]);
+    }
+
+    /// The bottom-right corner, where the tile is partial in **both**
+    /// directions — the one pixel that two separate off-by-ones both reach.
+    #[test]
+    fn a_change_at_the_bottom_right_corner_is_found() {
+        let before = flat(200, 200, 0x20);
+        let after = with_pixel(&before, 199, 199);
+        assert_eq!(dirty_tiles(&before, &after), vec![(192, 192)]);
+        // And the region for it stops at the surface rather than at the tile
+        // grid: a region running past the frame is refused on decode.
+        let region = bounding_region(&dirty_tiles(&before, &after), &after).expect("a region");
+        assert_eq!(region, Region { x: 192, y: 192, width: 8, height: 8 });
+    }
+
+    /// Every pixel of a partial edge tile is compared. A comparison that
+    /// walked only whole tiles would miss all of these.
+    #[test]
+    fn every_pixel_of_a_partial_edge_tile_is_compared() {
+        let before = flat(72, 72, 0x20);
+        for (x, y) in [(64, 0), (71, 0), (0, 64), (0, 71), (64, 64), (71, 71)] {
+            let after = with_pixel(&before, x, y);
+            assert!(
+                !dirty_tiles(&before, &after).is_empty(),
+                "a change at ({x}, {y}) was never compared"
+            );
+        }
+    }
+
+    /// An unchanged frame is silent — the delta model's whole payoff, and the
+    /// assertion a pump built on the screenshot path would fail.
+    #[test]
+    fn an_unchanged_frame_yields_no_dirty_tiles_and_no_message() {
+        let before = flat(256, 192, 0x20);
+        let after = flat(256, 192, 0x20);
+        assert!(dirty_tiles(&before, &after).is_empty());
+        assert!(
+            select_frame(Some(&before), &after, false).is_none(),
+            "a page nobody touched produced a message"
+        );
+    }
+
+    /// Several adjacent tiles become **one** delta over their bounding region,
+    /// not one message per tile.
+    #[test]
+    fn adjacent_changed_tiles_become_one_bounding_region() {
+        let before = flat(256, 192, 0x20);
+        let mut after = with_pixel(&before, 70, 70);
+        for (x, y) in [(130, 70), (70, 130), (130, 130)] {
+            after = with_pixel(&after, x, y);
+        }
+        assert_eq!(dirty_tiles(&before, &after).len(), 4);
+        let (kind, region) = select_frame(Some(&before), &after, false).expect("a delta");
+        assert_eq!(kind, FrameKind::Tile);
+        assert_eq!(region, Region { x: 64, y: 64, width: 128, height: 128 });
+    }
+
+    // ---- keyframe selection --------------------------------------------
+
+    /// No previous frame at all is a keyframe: a client holds nothing to
+    /// composite a delta onto.
+    #[test]
+    fn the_first_frame_of_an_attachment_selects_a_keyframe() {
+        let current = flat(256, 192, 0x20);
+        let (kind, region) = select_frame(None, &current, false).expect("a keyframe");
+        assert_eq!(kind, FrameKind::Keyframe);
+        assert_eq!(region, current.whole());
+    }
+
+    /// A surface that changed size is a keyframe rather than a comparison —
+    /// the client's texture is a different shape and every tile it holds is
+    /// meaningless.
+    #[test]
+    fn a_surface_that_changed_size_selects_a_keyframe() {
+        let before = flat(256, 192, 0x20);
+        let after = flat(320, 240, 0x20);
+        let (kind, region) = select_frame(Some(&before), &after, false).expect("a keyframe");
+        assert_eq!(kind, FrameKind::Keyframe);
+        assert_eq!(region, after.whole(), "the keyframe did not declare the new size");
+        assert_eq!((region.width, region.height), (320, 240));
+    }
+
+    /// Below the threshold a delta; above it a keyframe. Asserted at the
+    /// boundary rather than at a comfortable distance from it.
+    #[test]
+    fn the_dirty_tile_threshold_selects_a_keyframe_above_a_third_of_the_grid() {
+        // A 16x16 grid of tiles: 1024x1024, 256 tiles, threshold 9/26 of that.
+        let before = flat(1024, 1024, 0x20);
+        let total = before.tile_count();
+        assert_eq!(total, 256);
+        let limit = total * KEYFRAME_DIRTY_NUMERATOR / KEYFRAME_DIRTY_DENOMINATOR;
+        assert_eq!(limit, 88, "the measured threshold moved without the comment moving");
+
+        let dirty_up_to = |count: usize| {
+            let mut after = before.pixels.clone();
+            for tile in 0..count {
+                let x = (tile % 16) * 64;
+                let y = (tile / 16) * 64;
+                let at = (y * 1024 + x) * 4;
+                after[at] = after[at].wrapping_add(0x40);
+            }
+            Surface { width: 1024, height: 1024, pixels: after }
+        };
+
+        let under = dirty_up_to(limit);
+        assert_eq!(dirty_tiles(&before, &under).len(), limit);
+        assert_eq!(
+            select_frame(Some(&before), &under, false).map(|(kind, _)| kind),
+            Some(FrameKind::Tile),
+            "the threshold itself was already a keyframe, so 'exceeds' meant 'reaches'"
+        );
+
+        let over = dirty_up_to(limit + 1);
+        assert_eq!(
+            select_frame(Some(&before), &over, false).map(|(kind, _)| kind),
+            Some(FrameKind::Keyframe),
+            "a scroll-sized change was sent as hundreds of tiles"
+        );
+    }
+
+    /// A forced keyframe wins over everything the comparison would have said,
+    /// including "nothing changed".
+    #[test]
+    fn a_forced_keyframe_overrides_an_unchanged_frame() {
+        let before = flat(256, 192, 0x20);
+        let after = flat(256, 192, 0x20);
+        let (kind, region) = select_frame(Some(&before), &after, true).expect("a keyframe");
+        assert_eq!(kind, FrameKind::Keyframe);
+        assert_eq!(region, after.whole());
+    }
+
+    /// A surface with no area produces nothing at all, because a zero-sized
+    /// tile is refused on decode and a message the far end must reject is
+    /// worse than a message not sent.
+    #[test]
+    fn a_surface_with_no_area_produces_no_frame() {
+        assert!(select_frame(None, &flat(0, 0, 0), true).is_none());
+        assert!(select_frame(None, &flat(64, 0, 0), true).is_none());
+        assert!(select_frame(None, &flat(0, 64, 0), true).is_none());
+    }
+
+    // ---- the encoder and the header ------------------------------------
+
+    /// The sibling encoder produces a PNG, and one the wire's own decoder can
+    /// pair with a header it accepts. This is the round trip that proves the
+    /// assembly rather than describing it.
+    #[test]
+    fn a_composed_frame_carries_a_header_the_wire_accepts() {
+        let (out, _frames) = tokio::sync::mpsc::unbounded_channel();
+        let surface = flat(200, 200, 0x30);
+        let frame = Frame {
+            connection: 7,
+            tab: 42,
+            frame_seq: 9,
+            last_applied_input: 1839,
+            keyframe: false,
+            surface,
+            out,
+        };
+        let region = Region { x: 192, y: 192, width: 8, height: 8 };
+        let message = compose(&frame, FrameKind::Tile, region).expect("a frame message");
+
+        let (channel, body) = split_channel(&message).expect("a framed message");
+        assert_eq!(channel, Channel::Frame);
+        let header = FrameHeader::from_bytes(body).expect("a header the wire accepts");
+        assert_eq!(header.kind, FrameKind::Tile);
+        assert_eq!(header.tab_id, 42);
+        assert_eq!(header.frame_seq, 9);
+        assert_eq!(header.last_applied_input, 1839, "the latency echo was not stamped");
+        assert_eq!((header.tile_x, header.tile_y), (192, 192));
+        assert_eq!((header.tile_width, header.tile_height), (8, 8));
+        assert_eq!((header.frame_width, header.frame_height), (200, 200));
+        assert_eq!(header.scale_denominator, FULL_SCALE_DENOMINATOR);
+        // And the payload is the PNG, sized from the wire's own constant.
+        assert!(body.len() > FRAME_HEADER_LEN, "the message carried no payload");
+        assert_eq!(&body[FRAME_HEADER_LEN..FRAME_HEADER_LEN + 8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    /// A keyframe's region is the whole surface, which is the case the header
+    /// is most easily assembled wrongly for — a tile that runs one pixel past
+    /// its own frame is refused on decode.
+    #[test]
+    fn a_keyframe_covers_its_whole_surface_and_still_decodes() {
+        let (out, _frames) = tokio::sync::mpsc::unbounded_channel();
+        let surface = flat(200, 136, 0x30);
+        let whole = surface.whole();
+        let frame = Frame {
+            connection: 1,
+            tab: 1,
+            frame_seq: 1,
+            last_applied_input: 0,
+            keyframe: true,
+            surface,
+            out,
+        };
+        let message = compose(&frame, FrameKind::Keyframe, whole).expect("a frame message");
+        let (_, body) = split_channel(&message).expect("a framed message");
+        let header = FrameHeader::from_bytes(body).expect("a header the wire accepts");
+        assert_eq!(header.kind, FrameKind::Keyframe);
+        assert_eq!((header.tile_width, header.tile_height), (200, 136));
+        assert_eq!((header.frame_width, header.frame_height), (200, 136));
+    }
+
+    /// The crop is the region's pixels and nothing else, at every edge.
+    #[test]
+    fn a_cropped_region_is_exactly_its_own_pixels() {
+        let surface = flat(200, 200, 0x11);
+        let corner = crop(&surface, Region { x: 192, y: 192, width: 8, height: 8 })
+            .expect("a crop");
+        assert_eq!(corner.len(), 8 * 8 * 4);
+        assert!(corner.iter().all(|byte| *byte == 0x11));
+        // A region running off the surface is refused rather than clamped: a
+        // clamp would produce a frame that decodes and is wrong.
+        assert!(crop(&surface, Region { x: 196, y: 0, width: 8, height: 8 }).is_none());
+        assert!(crop(&surface, Region { x: 0, y: 196, width: 8, height: 8 }).is_none());
+    }
+
+    /// The encoder refuses a buffer that does not match the geometry it was
+    /// given, rather than writing a truncated image.
+    #[test]
+    fn the_frame_encoder_refuses_a_buffer_that_does_not_match_its_geometry() {
+        assert!(encode_frame(&vec![0u8; 64 * 64 * 4], 64, 64).is_some());
+        assert!(encode_frame(&[0u8; 4], 64, 64).is_none());
+        assert!(encode_frame(&[], 0, 0).is_none());
+    }
+
+    /// The frame channel is binary: the tag byte, the fixed header, then the
+    /// payload, with nothing between them.
+    #[test]
+    fn a_frame_message_is_the_tag_then_the_header_then_the_payload() {
+        let header = FrameHeader {
+            kind: FrameKind::Tile,
+            scale_denominator: FULL_SCALE_DENOMINATOR,
+            tab_id: 3,
+            frame_seq: 4,
+            last_applied_input: 5,
+            tile_x: 0,
+            tile_y: 0,
+            tile_width: 64,
+            tile_height: 64,
+            frame_width: 128,
+            frame_height: 128,
+        };
+        let message = frame_message(&header, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(message.len(), 1 + FRAME_HEADER_LEN + 3);
+        assert_eq!(message[0], Channel::Frame.tag());
+        assert_eq!(&message[1..1 + FRAME_HEADER_LEN], &header.to_bytes());
+        assert_eq!(&message[1 + FRAME_HEADER_LEN..], &[0xAA, 0xBB, 0xCC]);
     }
 
     /// The idle threshold's override lands on the default for anything it
