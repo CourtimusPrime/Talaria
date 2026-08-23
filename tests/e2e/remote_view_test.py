@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The remote view channel, end to end: DIST-01's transport half.
+"""The remote view channel, end to end: DIST-01's transport half and DIST-02's
+input half.
 
 What this pins down, in the order it pins it:
 
@@ -31,10 +32,48 @@ What this pins down, in the order it pins it:
   * Two viewers may watch one tab; a tab closing underneath them detaches both;
     and a client cannot pin more tabs than the cap allows.
 
+And then the input half, DIST-02:
+
+  * **A remote click lands on the element it was aimed at**, proven in both
+    directions on a fixture whose links sit at known, well-separated positions
+    — and with a *decoy* link one toolbar-height above each of them, so a
+    coordinate wrongly shifted by the local window's chrome offset navigates to
+    a **named** wrong destination rather than merely to nothing. An assertion
+    that only checked "a navigation occurred" would pass with that bug in
+    place; this one names the destination it got.
+  * **Keystrokes reach the page**, and a key naming something this build does
+    not know types nothing rather than something else.
+  * **A replayed input message does nothing.** The sequence is strictly
+    increasing per connection; a verbatim resend of an accepted message changes
+    no page state, and the next greater sequence does.
+  * **A tab the human owns refuses remote input** — with the tab *displayed on
+    screen*, so the refusal is the server's and not an accident of the page not
+    being painted — indistinguishably from a tab id that never existed, and
+    without dropping the connection.
+  * **Remote input cannot reach the chrome.** A pointer press is aimed at the
+    credentials control's *real* rectangle, read from the chrome-geometry test
+    hook, and at the history control's, and no panel opens. The history control
+    is the discriminating one — a local click there provably *does* open a
+    panel in this same run — and it is the one a refactor routing remote input
+    through the local window-event path would trip.
+  * **A viewer sending input is not a viewer choosing what the human sees:** the
+    window's title and the set of focused tabs are unchanged across the whole
+    remote input sequence.
+
 **Its honest limits.** Everything here runs on loopback. That proves the
 protocol and the authorisation and proves **nothing** about the network: TLS
 termination, the tailnet `Host`, relay latency and the two-machine case are
 05-10's and the manual verification's, not this suite's.
+
+The input assertions drive a tab that is **on screen**, because until the frame
+plan lands an attachment does not show a webview and a hidden one has no hit
+test to answer a click. The suite switches the local view to Agents itself, the
+way a human would, and says so at the step that does it.
+
+The credentials panel draws no named rectangle while the vault is empty, so
+"no panel opened" is measured on the history panel's rows — a probe this suite
+proves discriminating before it relies on it. The credentials control is still
+the coordinate aimed at, because it is the one whose reachability matters most.
 
 Every assertion about what the *browser* did goes over the control socket, not
 over the channel under test, so a bug in the transport cannot also be the thing
@@ -42,12 +81,16 @@ reporting success.
 
 Preconditions: a release build of ``talaria`` and an Xvfb display.
 """
+import http.server
 import json
 import os
 import shutil
 import socket
+import socketserver
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 T = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +102,7 @@ import harness
 # on the far side of the wire, and writing the tags out is what makes it one.
 CHANNEL_CONTROL = 0x01
 CHANNEL_TABS = 0x02
+CHANNEL_INPUT = 0x04
 
 # The wire version the server announces. A mismatch here means the shell and
 # this suite were built against different wires, which is worth failing on.
@@ -68,6 +112,55 @@ PROTOCOL_VERSION = 1
 # reached with three tabs instead of nine — the property under test is that
 # there *is* a ceiling and that crossing it is refused, not what the number is.
 MAX_ATTACH = 2
+
+# The fixture, and every number in it is load-bearing.
+#
+# Two destinations at **known, well-separated** vertical positions, so hitting
+# the wrong one is detectable rather than indistinguishable from hitting the
+# right one — and above each of them a *decoy* band roughly one toolbar-height
+# tall. The decoys are the regression assertion for the coordinate trap: the
+# local window subtracts its chrome height from a pointer coordinate before
+# handing it to a webview, and a remote path that reused that subtraction would
+# land every click some forty pixels high. Without the decoys such a click hits
+# nothing and the failure reads as "the click did not work"; with them it
+# navigates to `/decoy-lower.html`, which names the bug.
+#
+# Nothing sits in the top 100 px, because the toolbar is drawn *over* the
+# webview rather than beside it — so the chrome assertion's coordinate lands in
+# a genuinely empty part of the page, and "the URL did not change" means the
+# click reached neither a panel nor a link.
+FIXTURE = b"""<!doctype html><html><head><meta charset="utf-8"><title>fixture</title>
+<style>
+  body { margin: 0; font: 16px sans-serif; }
+  a { display: block; position: absolute; left: 40px; width: 420px; }
+  #decoy-upper { top: 105px;  height: 80px; background: #fee; }
+  #upper       { top: 200px;  height: 24px; background: #cfc; }
+  #decoy-lower { top: 405px;  height: 80px; background: #fee; }
+  #lower       { top: 500px;  height: 24px; background: #ccf; }
+  #field       { position: absolute; top: 620px; left: 40px;
+                 width: 300px; height: 30px; }
+</style></head><body>
+<a id="decoy-upper" href="/decoy-upper.html">DECOY ABOVE THE UPPER LINK</a>
+<a id="upper" href="/upper.html">UPPER LINK</a>
+<a id="decoy-lower" href="/decoy-lower.html">DECOY ABOVE THE LOWER LINK</a>
+<a id="lower" href="/lower.html">LOWER LINK</a>
+<input id="field" type="text">
+</body></html>"""
+
+
+class Fixture(http.server.BaseHTTPRequestHandler):
+    """Every path serves the same page, so a navigation is identified by its
+    URL alone and the suite never has to parse a body to know where it went."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(FIXTURE)))
+        self.end_headers()
+        self.wfile.write(FIXTURE)
+
+    def log_message(self, *args):
+        pass
 
 tmp = tempfile.mkdtemp(prefix="talaria-view-e2e-")
 config = os.path.join(tmp, ".config")
@@ -177,13 +270,147 @@ def tabs_owned_by(owner):
     return [tab["tab_id"] for tab in tabs if tab["owner"] == owner]
 
 
+def tab_url(tab_id):
+    return next(tab["url"] for tab in rpc("tabs_list")["result"]["tabs"]
+                if tab["tab_id"] == tab_id)
+
+
+def focused_tabs():
+    """The tab ids the shell considers active, in either view.
+
+    The observable half of "a viewer did not change what the human sees": this
+    is `active_me` and `active_agent` together, read over the control socket."""
+    return sorted(tab["tab_id"] for tab in rpc("tabs_list")["result"]["tabs"]
+                  if tab["focused"])
+
+
+def wait_for_url(tab_id, want, timeout=12.0):
+    """Poll until the tab's URL contains `want`, then return whatever it is.
+
+    Returns the *current* URL either way, so the caller's assertion names the
+    destination that was actually reached rather than only failing on a
+    timeout — which is the whole point of the decoy links."""
+    deadline = time.monotonic() + timeout
+    url = tab_url(tab_id)
+    while time.monotonic() < deadline:
+        if want in url:
+            return url
+        time.sleep(0.3)
+        url = tab_url(tab_id)
+    return url
+
+
+def settle_url(tab_id, seconds=3.0):
+    """The tab's URL after `seconds` of nothing happening.
+
+    For the refusals: a navigation that was going to happen has had time to,
+    so an unchanged URL is evidence rather than a race won."""
+    time.sleep(seconds)
+    return tab_url(tab_id)
+
+
+def evaluate(tab_id, script):
+    reply = rpc("evaluate", tab_id=tab_id, script=script)
+    assert reply["outcome"] == "ok", (script, reply)
+    return reply["result"]["value"]
+
+
+class Input:
+    """A viewer's input channel: the sequence counter, and the frames.
+
+    The counter is the client's half of the wire's contract — `seq` is strictly
+    increasing within one connection — and keeping it here means the replay
+    assertions have to *reach past* it to resend a number, which is what makes
+    them deliberate rather than accidental."""
+
+    def __init__(self, ws, tab):
+        self.ws = ws
+        self.tab = tab
+        self.seq = 0
+
+    def raw(self, message):
+        """One input frame exactly as given — no sequence assigned."""
+        self.ws.send(bytes([CHANNEL_INPUT]) + json.dumps(message).encode())
+        time.sleep(0.15)
+        return message
+
+    def send(self, kind, **fields):
+        self.seq += 1
+        return self.raw({"kind": kind, "tab": self.tab, "seq": self.seq,
+                         **fields})
+
+    def click(self, point, tab=None):
+        """Move, press and release at `point` — a whole human click.
+
+        Three messages and not one: the wire has no "click", because a client
+        that could send one could not express a drag, and the local path has no
+        such primitive either."""
+        x, y = point
+        target = self.tab if tab is None else tab
+        for kind, extra in (("mouse_move", {}),
+                            ("mouse_button", {"button": "left",
+                                              "action": "down"}),
+                            ("mouse_button", {"button": "left",
+                                              "action": "up"})):
+            self.seq += 1
+            self.raw({"kind": kind, "tab": target, "seq": self.seq,
+                      "x": float(x), "y": float(y), **extra})
+
+    def type_character(self, character):
+        last = self.send("key", state="down", key=character)
+        self.send("key", state="up", key=character)
+        return last
+
+
+def centres(tab_id, scale):
+    """Each fixture element's centre in the tab's own device pixels.
+
+    `getBoundingClientRect` is CSS pixels with the page's top-left as the
+    origin; the wire is device pixels with the same origin, so the conversion
+    is the window's scale factor and **nothing else**. In particular there is
+    no toolbar term: a remote client draws no server toolbar, and adding one
+    here would be writing the bug this fixture exists to catch."""
+    script = ("const c = id => { const r = document.getElementById(id)"
+              ".getBoundingClientRect(); return [r.x + r.width / 2, "
+              "r.y + r.height / 2]; };"
+              "[c('upper'), c('lower'), c('decoy-upper'), c('decoy-lower'), "
+              "c('field')]")
+    names = ("upper", "lower", "decoy-upper", "decoy-lower", "field")
+    return {name: (x * scale, y * scale)
+            for name, (x, y) in zip(names, evaluate(tab_id, script))}
+
+
+def find_window(env, attempts=20):
+    for _ in range(attempts):
+        found = subprocess.run(["xdotool", "search", "--name", "Talaria"],
+                               env=env, capture_output=True,
+                               text=True).stdout.split()
+        if found:
+            return found[0]
+        time.sleep(1)
+    raise AssertionError("the Talaria window never appeared")
+
+
+def window_title(wid, env):
+    return subprocess.run(["xdotool", "getwindowname", wid], env=env,
+                          capture_output=True, text=True).stdout.strip()
+
+
 xvfb = harness.start_xvfb()
+X = harness.x_env()
 log = None
 tal = None
+fixture = None
 sockets = []
 try:
     log = open(SHELL_LOG, "w")
     port = harness.free_port()
+
+    # The page the input half drives, served from this process on loopback.
+    fixture_port = harness.free_port()
+    fixture = socketserver.TCPServer(("127.0.0.1", fixture_port), Fixture)
+    threading.Thread(target=fixture.serve_forever, daemon=True).start()
+    BASE = f"http://127.0.0.1:{fixture_port}"
 
     # --- 1. remote access off: no listener, so no route ------------------
     tal = harness.start_shell("about:blank", log=log, rust_log="info", wait=10,
@@ -200,9 +427,13 @@ try:
     harness.write_config(talaria, remote_access={"enabled": True, "port": port})
     harness.write_agents(talaria, CLIENT_ID, "The Viewer", TOKEN,
                          audience=f"http://127.0.0.1:{port}/mcp")
+    # `TALARIA_TEST_HOOKS=1` is what makes `chrome_rects` answer, and the
+    # chrome assertion needs it: aiming at a *guessed* toolbar coordinate would
+    # prove nothing when the toolbar gains a button.
     tal = harness.start_shell("about:blank", log=log, rust_log="info", wait=10,
                               HOME=tmp, XDG_CONFIG_HOME=config,
-                              TALARIA_VIEW_MAX_ATTACH=str(MAX_ATTACH))
+                              TALARIA_VIEW_MAX_ATTACH=str(MAX_ATTACH),
+                              TALARIA_TEST_HOOKS="1")
     assert wait_until_accepting("127.0.0.1", port), f"the listener never bound {port}"
     print(f"BOUND: the listener accepts 127.0.0.1:{port}")
 
@@ -369,10 +600,219 @@ try:
     print(f"CAPPED: {MAX_ATTACH} attachments were accepted and the next was refused "
           f"with the same refusal as everything else")
 
+    # ======================================================================
+    # DIST-02: the input half. Everything below drives a real page.
+    # ======================================================================
+
+    # --- 14. a fixture page, in an agent tab and in one of the human's ---
+    driven = rpc("tabs_open", client="agent-input", url=f"{BASE}/index.html")
+    assert driven["outcome"] == "ok", driven
+    driven = driven["result"]["tab"]["tab_id"]
+    mine = rpc("open_for_user", url=f"{BASE}/index.html")
+    assert mine["outcome"] == "ok", mine
+    mine = max(tabs_owned_by("me"))
+    assert wait_for_url(driven, "/index.html").endswith("/index.html"), \
+        ("the agent tab never reached the fixture", tab_url(driven))
+    assert wait_for_url(mine, "/index.html").endswith("/index.html"), \
+        ("the human's tab never reached the fixture", tab_url(mine))
+
+    # --- 15. put the agent's tab on screen, the way a human would ---------
+    # Until the frame plan lands, an attachment does not show a webview, and a
+    # hidden webview has no hit test to answer a click with. So the *local*
+    # human switches to the Agents view — a real click on the real toggle —
+    # and the suite then measures that the remote input reached the page.
+    # Nothing below this line switches anything: that is the point of doing it
+    # here, before the measurement starts.
+    wid = find_window(X)
+    rpc("tabs_focus", tab_id=driven)
+    harness.click_rect("toolbar.agents", wid, X)
+    time.sleep(1.5)
+    assert window_title(wid, X).startswith("fixture"), \
+        ("the agent's fixture tab is not the one on screen", window_title(wid, X))
+    print(f"ON SCREEN: the local human switched to the Agents view and tab "
+          f"{driven} is displayed")
+
+    # --- 16. a viewer attached to it -------------------------------------
+    viewer = connect(port)
+    sockets.append(viewer)
+    viewer.send(view({"view": "attach", "tab": driven}))
+    ack = read(viewer, CHANNEL_CONTROL)
+    assert ack is not None and ack.get("view") == "attached", ack
+    _, scale = harness.chrome_rects()
+    where = centres(driven, scale)
+    keys = Input(viewer, driven)
+
+    # --- 17. a remote click lands on the LOWER link ----------------------
+    # The regression assertion, and the reason the fixture carries decoys: an
+    # assertion that merely checked "a navigation occurred" would pass with the
+    # local toolbar offset wrongly applied. This one names what it hit.
+    keys.click(where["lower"])
+    landed = wait_for_url(driven, "/lower.html")
+    assert landed.endswith("/lower.html"), (
+        "a remote click aimed at the lower link did not reach it", landed,
+        where["lower"])
+    assert "/decoy-lower.html" not in landed, (
+        "the click landed one toolbar-height high — the local window's chrome "
+        "offset was applied to a remote coordinate", landed)
+    assert "/upper.html" not in landed, ("the click hit the upper link", landed)
+    print(f"AIMED LOWER: a remote click at {where['lower']} reached "
+          f"{landed.rsplit('/', 1)[-1]}, not the decoy above it")
+
+    # The decoy is *reachable*, which is what stops the assertion above being
+    # vacuous: aimed at deliberately, it navigates. So "not the decoy" is a
+    # statement about where the click went, not about a link that never worked.
+    assert rpc("navigate", tab_id=driven, url=f"{BASE}/index.html")["outcome"] == "ok"
+    wait_for_url(driven, "/index.html")
+    keys.click(where["decoy-lower"])
+    landed = wait_for_url(driven, "/decoy-lower.html")
+    assert landed.endswith("/decoy-lower.html"), (
+        "the decoy band is not clickable, so 'not the decoy' proves nothing",
+        landed)
+    print("DECOY REACHABLE: aimed at the band one toolbar-height above the "
+          "lower link, a remote click lands on it — so the offset regression "
+          "would be named rather than merely missed")
+
+    # --- 18. and the other direction, at the UPPER link ------------------
+    # Two assertions in opposite directions is what makes the coordinate
+    # mapping proven rather than coincidental.
+    assert rpc("navigate", tab_id=driven, url=f"{BASE}/index.html")["outcome"] == "ok"
+    wait_for_url(driven, "/index.html")
+    keys.click(where["upper"])
+    landed = wait_for_url(driven, "/upper.html")
+    assert landed.endswith("/upper.html"), (
+        "a remote click aimed at the upper link did not reach it", landed,
+        where["upper"])
+    assert "/decoy-upper.html" not in landed, (
+        "the click landed one toolbar-height high", landed)
+    assert "/lower.html" not in landed, ("the click hit the lower link", landed)
+    print(f"AIMED UPPER: a remote click at {where['upper']} reached "
+          f"{landed.rsplit('/', 1)[-1]}, not the decoy above it")
+
+    # --- 19. keystrokes reach the page, and an unknown key types nothing --
+    assert rpc("navigate", tab_id=driven, url=f"{BASE}/index.html")["outcome"] == "ok"
+    wait_for_url(driven, "/index.html")
+    where = centres(driven, scale)
+    keys.click(where["field"])
+    time.sleep(0.5)
+    for character in "hey":
+        keys.type_character(character)
+    # A key naming something this build does not carry: refused, and not
+    # substituted with the nearest thing it might have meant.
+    keys.send("key", state="down", named="Warp")
+    keys.send("key", state="up", named="Warp")
+    time.sleep(1.0)
+    typed = evaluate(driven, "document.getElementById('field').value")
+    assert typed == "hey", ("the remote keystrokes did not arrive intact", typed)
+    print(f"TYPED: the field reads {typed!r}, and the unmapped key name added "
+          f"nothing")
+
+    # --- 20. a replayed input message does nothing -----------------------
+    replayed = keys.type_character("!")
+    time.sleep(0.8)
+    grown = evaluate(driven, "document.getElementById('field').value")
+    assert grown == "hey!", grown
+    keys.raw(replayed)          # verbatim, sequence and all
+    keys.raw(replayed)
+    time.sleep(1.0)
+    after = evaluate(driven, "document.getElementById('field').value")
+    assert after == "hey!", ("a replayed input message was applied a second "
+                             "time", after)
+    keys.type_character("?")    # the next greater sequence, which does apply
+    time.sleep(1.0)
+    after = evaluate(driven, "document.getElementById('field').value")
+    assert after == "hey!?", ("a message with a greater sequence was dropped",
+                              after)
+    assert viewer.still_open(), "a replayed message closed the connection"
+    print("REPLAY: resending an accepted input message verbatim changed "
+          "nothing, and the next greater sequence did")
+
+    # --- 21. remote input cannot reach the chrome ------------------------
+    # The chrome is where the credentials control, the bookmark star and a
+    # downloads row's open control live — the surfaces `ChromeRect`'s own doc
+    # comment refused to expose to agents, for exactly this reason. This is the
+    # assertion a future refactor routing remote input through the local
+    # window-event path would trip.
+    #
+    # The probe is the history panel's rows, because the credentials panel
+    # draws no named rectangle while the vault is empty. It is proved
+    # discriminating first, with a *local* click on the same control.
+    before_title = window_title(wid, X)
+    before_focused = focused_tabs()
+    before_url = tab_url(driven)
+
+    harness.click_rect("toolbar.history", wid, X)
+    harness.wait_for_rect("history.row.0")
+    harness.click_rect("toolbar.history", wid, X)
+    harness.wait_for_rect("history.row.0", present=False)
+    print("PROBE: a local click on the history control opens the panel and a "
+          "second one closes it, so its rows are a probe that discriminates")
+
+    rects, scale = harness.chrome_rects()
+    for control in ("toolbar.credentials", "toolbar.history"):
+        x, y, width, height = rects[control]
+        # The same rectangle `click_rect` converts through the *window's*
+        # origin for a local click. A remote message has no window and no
+        # chrome strip above the page, so these numbers land in the page's own
+        # empty top band — which is the whole of why the chrome is out of
+        # reach.
+        keys.click(((x + width / 2) * scale, (y + height / 2) * scale))
+    time.sleep(1.5)
+    harness.wait_for_rect("history.row.0", present=False, timeout=3.0)
+    assert tab_url(driven) == before_url, (
+        "a remote click at a toolbar coordinate navigated the page",
+        before_url, tab_url(driven))
+    print("CHROME: remote clicks at the credentials control's and the history "
+          "control's real coordinates opened no panel and navigated nothing")
+
+    # --- 22. and none of it moved what the human is looking at -----------
+    assert window_title(wid, X) == before_title, (
+        "remote input changed the displayed tab or the view mode",
+        before_title, window_title(wid, X))
+    assert focused_tabs() == before_focused, (
+        "remote input changed an active tab", before_focused, focused_tabs())
+    print(f"UNMOVED: the window still reads {before_title!r} and the focused "
+          f"tabs are still {before_focused}")
+
+    # --- 23. a tab the human owns refuses, with that tab on screen -------
+    # On screen deliberately: a refusal measured against a hidden webview would
+    # be indistinguishable from a click that simply had nothing to hit. The
+    # human's own tab is displayed, the coordinates are the ones that provably
+    # worked on the agent's copy of the same page, and nothing happens.
+    rpc("tabs_focus", tab_id=mine)
+    harness.click_rect("toolbar.me", wid, X)
+    time.sleep(1.5)
+    assert window_title(wid, X).startswith("fixture"), \
+        ("the human's fixture tab is not the one on screen",
+         window_title(wid, X))
+
+    viewer.send(view({"view": "attach", "tab": mine}))
+    refused_mine = read(viewer, CHANNEL_CONTROL)
+    viewer.send(view({"view": "attach", "tab": 424242}))
+    refused_absent = read(viewer, CHANNEL_CONTROL)
+    assert refused_mine == {"view": "refused"}, refused_mine
+    assert refused_mine == refused_absent, (
+        "a tab the human owns is distinguishable from one that never existed",
+        refused_mine, refused_absent)
+
+    mine_before = tab_url(mine)
+    keys.click(where["lower"], tab=mine)
+    keys.click(where["lower"], tab=424242)
+    assert settle_url(mine, 3.0) == mine_before, (
+        "remote input reached a tab the human owns", mine_before,
+        tab_url(mine))
+    assert viewer.still_open(), \
+        "naming the human's tab dropped the connection instead of refusing"
+    print(f"HUMAN'S TAB: input aimed at the displayed Me tab {mine} did "
+          f"nothing, indistinguishably from a tab id that never existed, and "
+          f"the connection stayed open")
+
     print("REMOTE VIEW CHECKS PASSED")
 finally:
     for ws in sockets:
         ws.close()
+    if fixture is not None:
+        fixture.shutdown()
+        fixture.server_close()
     if tal is not None:
         tal.terminate()
         time.sleep(1)
