@@ -365,6 +365,27 @@ impl Running {
                 sent,
             );
         });
+        // **The interface's own repaint request, which nothing else delivers.**
+        // `EguiGlow::run` forwards a viewport's *commands* and drops the rest of
+        // its output, so the repaint delay egui returns to ask for another frame
+        // never reaches this loop (`egui_glow-0.34.3/src/winit.rs`). Everywhere
+        // else that is invisible, because a shell with an engine behind it is
+        // redrawing anyway; this client links no engine, so a frame nobody asks
+        // for is a frame that never happens.
+        //
+        // What that cost was a stalled animation: egui fades a widget's hover
+        // over ~83 ms and needs frames to do it, so the sidebar's controls got
+        // the first frame of a fade and then waited for the next window event to
+        // advance. Moving the pointer supplies those events at whatever rate the
+        // pointer moves, which is why the symptom was a sidebar that flickered
+        // while the cursor moved and froze mid-fade when it stopped.
+        //
+        // Asked *after* the frame is built, because that is when the interface
+        // knows whether it wants another; the request settles on its own once
+        // the animation finishes, so this does not spin.
+        if egui.egui_ctx.has_requested_repaint() {
+            window.request_redraw();
+        }
         self.surface.prepare_for_rendering();
         self.egui.paint(&self.window);
         self.surface.present();

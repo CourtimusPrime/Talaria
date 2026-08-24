@@ -8,6 +8,26 @@ cut a release yet, so everything to date sits under Unreleased.
 
 ### Fixed
 
+- **The remote view client's sidebar no longer flickers while the pointer
+  moves.** Found on the first real two-machine run — a MacBook Air driving this
+  ThinkPad's agent tabs over Tailscale — which is precisely the check no suite
+  in this repository can perform, since every automated assertion runs both ends
+  on one host under Xvfb.
+
+  `EguiGlow::run` forwards a viewport's commands and drops the rest of the
+  interface's output, so the repaint egui asks for to finish an animation never
+  reached the client's loop. Nothing else covered for it: the shell redraws
+  continuously because an engine is delivering frames behind it, and this client
+  links no engine, so a frame nobody asks for is a frame that never happens. The
+  sidebar's controls got the first frame of an ~83 ms hover fade and then waited
+  for the next window event to advance one more step, which made pointer motion
+  the thing driving the animation — a stutter while the cursor moved, and a
+  fade frozen part-way when it stopped.
+
+  The client now asks the interface whether it wants another frame, after
+  building one, and requests a redraw when it does. The request settles by
+  itself once the animation finishes, so an idle client still draws nothing.
+
 - **A remote viewer can no longer make the browser stop responding to the person
   sitting at it.** Three separate ways it could, all reachable by a party whose
   only qualification is holding an accepted token, and all of them ending with a
